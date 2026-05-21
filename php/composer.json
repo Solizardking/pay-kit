@@ -1,0 +1,50 @@
+{
+  "name": "solana-foundation/mpp-sdk-php",
+  "description": "Server-side PHP helpers for the MPP protocol.",
+  "type": "library",
+  "license": "MIT",
+  "repositories": [
+    {
+      "type": "vcs",
+      "url": "https://github.com/SolDapper/solana-php"
+    }
+  ],
+  "require": {
+    "php": "^8.1",
+    "solana-php/solana-sdk": "dev-master"
+  },
+  "require-dev": {
+    "friendsofphp/php-cs-fixer": "^3.89",
+    "phpstan/phpstan": "^2.1",
+    "phpunit/phpunit": "^10.0 || ^11.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "SolanaMpp\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "SolanaMpp\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "format:check": "php-cs-fixer fix --dry-run --diff --using-cache=no --sequential",
+    "lint:syntax": "find src tests examples ../tests/interop/php-server -name '*.php' -print0 | xargs -0 -n1 php -l",
+    "lint:static": "phpstan analyse --level=max --debug --memory-limit=1G src tests examples ../tests/interop/php-server",
+    "lint": [
+      "@lint:syntax",
+      "@format:check",
+      "@lint:static"
+    ],
+    "test": "phpunit",
+    "test:coverage": "phpunit --coverage-clover build/coverage/clover.xml --coverage-text && php scripts/check_coverage.php build/coverage/clover.xml 90"
+  },
+  "config": {
+    "platform": {
+      "php": "8.3.31"
+    },
+    "sort-packages": true
+  },
+  "minimum-stability": "stable"
+}
