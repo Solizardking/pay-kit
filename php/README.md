@@ -42,18 +42,22 @@ header('www-authenticate: ' . $server->createChallengeHeader($request));
 http_response_code(402);
 ```
 
-## Quick start — client (auto-402)
+## Quick start
 
-PHP is server-side only for the current MPP roadmap. Use a client SDK or the
-`pay` CLI to complete the 402 challenge/credential flow.
+Launch server from `./example`:
+
+```bash
+# Install dependencies
+composer install
+
+# Launch server
+php -S 127.0.0.1:4567 examples/charge-server.php
+```
+
+In another terminal, send requests using `curl` and  `pay`:
 
 ```bash
 brew install pay
-
-# start the example server
-cd php
-composer install
-php -S 127.0.0.1:4567 examples/charge-server.php
 
 # payment required
 curl http://localhost:4567/paid
@@ -63,6 +67,8 @@ pay curl http://localhost:4567/paid
 ```
 
 ## Client compatibility matrix
+
+PHP is server-side only for the current MPP roadmap. 
 
 | Intent | Status |
 |---|:---:|
