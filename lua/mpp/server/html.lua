@@ -51,7 +51,7 @@ function M.challenge_to_html(challenge, rpc_url)
 
   -- Decode the base64url request field to extract network from methodDetails.
   local network = 'mainnet-beta'
-  local decoded_payload, decode_err = base64url.decode(plain.request)
+  local decoded_payload, _decode_err = base64url.decode(plain.request)
   if decoded_payload then
     local ok, request_data = pcall(json.decode, decoded_payload)
     if ok and type(request_data) == 'table' then
@@ -93,7 +93,11 @@ function M.challenge_to_html(challenge, rpc_url)
     -- JSON inside <script type="application/json"> is not parsed as HTML.
     -- json.encode already escapes special chars in string values.
     '<script type="application/json" id="__MPP_DATA__">' .. embedded_json .. '</script>',
-    '<script>' .. assets.payment_ui_js .. '</script>',
+    -- The generated payment-UI JS bundle is produced by `html/` and copied in
+    -- via the html-assets workflow artifact. Render the page even when the
+    -- bundle is absent (e.g. local dev without `npm run build`) so the test
+    -- and example flows can still exercise the HTML response shape.
+    '<script>' .. (assets.payment_ui_js or '') .. '</script>',
     '</body>',
     '</html>',
   }
