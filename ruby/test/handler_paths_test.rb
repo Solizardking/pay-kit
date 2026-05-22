@@ -13,7 +13,7 @@ class HandlerPathsTest < Minitest::Test
       account_keys: [pubkey(1), request.recipient, PROGRAMS::SYSTEM_PROGRAM],
       instructions: [compiled_instruction(2, [0, 1], u32(2) + u64(1000))]
     ))
-    credential = SolanaMpp::Core::Credential.new(
+    credential = Mpp::Core::Credential.new(
       challenge: challenges.create_challenge(request).to_echo,
       payload: {"transaction" => transaction}
     )
@@ -33,7 +33,7 @@ class HandlerPathsTest < Minitest::Test
       account_keys: [pubkey(1), request.recipient, PROGRAMS::SYSTEM_PROGRAM],
       instructions: [compiled_instruction(2, [0, 1], u32(2) + u64(1000))]
     ))
-    credential = SolanaMpp::Core::Credential.new(challenge: challenges.create_challenge(request).to_echo, payload: {"transaction" => transaction})
+    credential = Mpp::Core::Credential.new(challenge: challenges.create_challenge(request).to_echo, payload: {"transaction" => transaction})
 
     response = handler.handle(credential.to_authorization_header, request)
 
@@ -44,8 +44,8 @@ class HandlerPathsTest < Minitest::Test
   def test_pull_rejects_wrong_surfpool_network
     handler = handler_with(FakeRpc.new, network: "devnet")
 
-    error = assert_raises(SolanaMpp::VerificationError) do
-      handler.send(:check_network_blockhash, SolanaMpp::Server::ChargeHandler::SURFPOOL_BLOCKHASH_PREFIX + "abc")
+    error = assert_raises(Mpp::VerificationError) do
+      handler.send(:check_network_blockhash, Mpp::Internal::Handler::SURFPOOL_BLOCKHASH_PREFIX + "abc")
     end
     assert_match(/Signed against localnet/, error.message)
   end
@@ -53,7 +53,7 @@ class HandlerPathsTest < Minitest::Test
   def test_push_fetch_timeout_and_failed_meta
     request = charge_request
     timeout = handler_with(FakeRpc.new(transaction_response: nil), attempts: 1)
-    credential = SolanaMpp::Core::Credential.new(challenge: challenges.create_challenge(request).to_echo, payload: {"signature" => valid_signature})
+    credential = Mpp::Core::Credential.new(challenge: challenges.create_challenge(request).to_echo, payload: {"signature" => valid_signature})
     response = timeout.handle(credential.to_authorization_header, request)
 
     assert_equal 402, response.status
@@ -68,7 +68,7 @@ class HandlerPathsTest < Minitest::Test
 
   def test_push_rejects_missing_transaction_metadata_and_wire
     request = charge_request
-    credential = SolanaMpp::Core::Credential.new(challenge: challenges.create_challenge(request).to_echo, payload: {"signature" => valid_signature})
+    credential = Mpp::Core::Credential.new(challenge: challenges.create_challenge(request).to_echo, payload: {"signature" => valid_signature})
 
     missing_meta = handler_with(FakeRpc.new(transaction_response: {"transaction" => ["tx", "base64"]}))
     response = missing_meta.handle(credential.to_authorization_header, request)
@@ -81,32 +81,17 @@ class HandlerPathsTest < Minitest::Test
     assert_match(/missing base64 transaction/, response.body["message"])
   end
 
-  def test_rack_middleware_protects_only_configured_path
-    request = charge_request
-    handler = handler_with(FakeRpc.new)
-    app = ->(_env) { [200, {"content-type" => "text/plain"}, ["open"]] }
-    middleware = SolanaMpp::Server::RackMiddleware.new(app, handler: handler, request: request, path: "/paid")
-
-    status, _headers, body = middleware.call("PATH_INFO" => "/open")
-    assert_equal 200, status
-    assert_equal ["open"], body
-
-    status, headers, _body = middleware.call("PATH_INFO" => "/paid")
-    assert_equal 402, status
-    assert headers.key?(SolanaMpp::Core::Headers::WWW_AUTHENTICATE)
-  end
-
   private
 
   def challenges
-    @challenges ||= SolanaMpp::Server::ChargeServer.new(secret_key: "secret", realm: "api")
+    @challenges ||= Mpp::Internal::ChallengeStore.new(secret_key: "secret", realm: "api")
   end
 
   def handler_with(rpc, network: "localnet", attempts: 40)
-    SolanaMpp::Server::ChargeHandler.new(
+    Mpp::Internal::Handler.new(
       challenges: challenges,
       rpc: rpc,
-      replay_store: SolanaMpp::MemoryStore.new,
+      replay_store: Mpp::MemoryStore.new,
       network: network,
       confirmation_attempts: attempts,
       confirmation_delay: 0
@@ -114,6 +99,6 @@ class HandlerPathsTest < Minitest::Test
   end
 
   def valid_signature
-    SolanaMpp::Solana::Base58.encode(("b" * 64).b)
+    Mpp::Methods::Solana::Base58.encode(("b" * 64).b)
   end
 end
