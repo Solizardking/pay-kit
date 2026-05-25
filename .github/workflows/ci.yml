@@ -167,11 +167,13 @@ jobs:
         working-directory: rust
         env:
           SURFPOOL_REPORT: "1"
-        # Lock to library scope: exclude bin entrypoints (interop harness),
-        # on-chain program crates under src/program/, and the multi_delegate
-        # client which only drives the on-chain program. Reported coverage
-        # reflects the SDK surface downstream users link against.
-        run: cargo llvm-cov --ignore-filename-regex 'src/bin/|src/program/|client/multi_delegate' --json --output-path coverage.json
+        # Lock to library scope: solana-mpp only (x402 has its own
+        # coverage budget tracked separately), exclude bin entrypoints
+        # (interop harness), on-chain program crates under src/program/,
+        # and the multi_delegate client which only drives the on-chain
+        # program. Reported coverage reflects the SDK surface downstream
+        # users link against.
+        run: cargo llvm-cov -p solana-mpp --ignore-filename-regex 'src/bin/|src/program/|client/multi_delegate' --json --output-path coverage.json
 
       - name: Enforce Rust coverage floor (>=90 cross-SDK baseline)
         working-directory: rust
@@ -447,7 +449,7 @@ jobs:
         run: pnpm --filter @solana/mpp build
       - name: Build Rust interop adapters
         working-directory: rust
-        run: cargo build --bin interop_client --bin interop_server
+        run: cargo build -p solana-mpp --bin interop_client --bin interop_server
       - name: Install interop harness
         working-directory: tests/interop
         run: pnpm install --frozen-lockfile
