@@ -271,3 +271,151 @@ class TestReceipt:
         bad = encode(b"not json")
         with pytest.raises(ParseError):
             parse_receipt(bad)
+
+
+class TestCRLFRejection:
+    """L11 lock: header parameter values MUST reject CR or LF.
+
+    Mirrors the Ruby fix from PR #96 (where ``escape`` silently passed CRLF
+    through, opening a response-splitting injection) and the Lua fix that
+    landed alongside Lua's adapter. Python already rejects CRLF in
+    ``_escape_quoted_value``; these tests pin the behavior so a future
+    refactor cannot silently re-introduce the vulnerability.
+    """
+
+    def test_realm_with_cr_rejected(self):
+        challenge = PaymentChallenge(
+            id="ok",
+            realm="api\rX-Injected: 1",
+            method="solana",
+            intent="charge",
+            request=encode_json({"amount": "1"}),
+        )
+        with pytest.raises(ParseError, match="CRLF"):
+            format_www_authenticate(challenge)
+
+    def test_realm_with_lf_rejected(self):
+        challenge = PaymentChallenge(
+            id="ok",
+            realm="api\nX-Injected: 1",
+            method="solana",
+            intent="charge",
+            request=encode_json({"amount": "1"}),
+        )
+        with pytest.raises(ParseError, match="CRLF"):
+            format_www_authenticate(challenge)
+
+    def test_id_with_crlf_rejected(self):
+        challenge = PaymentChallenge(
+            id="abc\r\nX: 1",
+            realm="api",
+            method="solana",
+            intent="charge",
+            request=encode_json({"amount": "1"}),
+        )
+        with pytest.raises(ParseError, match="CRLF"):
+            format_www_authenticate(challenge)
+
+    def test_description_safe_field_with_lf_rejected(self):
+        challenge = PaymentChallenge(
+            id="ok",
+            realm="api",
+            method="solana",
+            intent="charge",
+            request=encode_json({"amount": "1"}),
+            opaque="x\ny",
+        )
+        with pytest.raises(ParseError, match="CRLF"):
+            format_www_authenticate(challenge)
+
+
+class TestAuthParamTokenForm:
+    """F1 lock: parse_www_authenticate MUST accept both quoted-string and
+    token-form auth-param values per RFC 7235 section 2.1.
+
+    Ruby rejected token form before PR #99 (see ruby state report F1);
+    Python already accepts it via the unquoted branch in _parse_auth_params.
+    These tests pin the cross-SDK contract.
+    """
+
+    def test_accepts_quoted_form(self):
+        request_b64 = encode_json({"amount": "1"})
+        header = f'Payment id="abc", realm="api", method="solana", intent="charge", request="{request_b64}"'
+        parsed = parse_www_authenticate(header)
+        assert parsed.id == "abc"
+        assert parsed.realm == "api"
+
+    def test_accepts_token_form(self):
+        request_b64 = encode_json({"amount": "1"})
+        # All values unquoted (RFC 7235 token form).
+        header = f"Payment id=abc, realm=api, method=solana, intent=charge, request={request_b64}"
+        parsed = parse_www_authenticate(header)
+        assert parsed.id == "abc"
+        assert parsed.realm == "api"
+        assert parsed.method == "solana"
+        assert parsed.intent == "charge"
+
+    def test_accepts_mixed_form(self):
+        request_b64 = encode_json({"amount": "1"})
+        # Mixed: some quoted, some token. RFC 7235 allows this; CDNs and
+        # hand-rolled clients sometimes emit it.
+        header = f'Payment id=abc, realm="api", method=solana, intent="charge", request="{request_b64}"'
+        parsed = parse_www_authenticate(header)
+        assert parsed.id == "abc"
+        assert parsed.realm == "api"
+
+
+class TestMultiChallenge:
+    """F5 lock: parse_www_authenticate_all MUST split multi-challenge
+    WWW-Authenticate headers with quote awareness per RFC 7235 section 4.1.
+
+    A server can emit two Payment challenges in one header value (the spec
+    permits this for negotiation across schemes). Naive comma-splitting
+    corrupts the value when a realm or other quoted-string parameter
+    contains a literal comma. Python's _find_challenge_starts uses a
+    quote-aware walker.
+    """
+
+    def _build_challenge_header(self, realm: str, request_b64: str) -> str:
+        return f'Payment id="abc", realm="{realm}", method="solana", intent="charge", request="{request_b64}"'
+
+    def test_two_challenges_in_one_header(self):
+        request_b64 = encode_json({"amount": "1"})
+        first = self._build_challenge_header("api-one", request_b64)
+        second = self._build_challenge_header("api-two", request_b64)
+        challenges = parse_www_authenticate_all([f"{first}, {second}"])
+        assert len(challenges) == 2
+        assert {c.realm for c in challenges} == {"api-one", "api-two"}
+
+    def test_two_headers_each_with_one_challenge(self):
+        request_b64 = encode_json({"amount": "1"})
+        first = self._build_challenge_header("api-one", request_b64)
+        second = self._build_challenge_header("api-two", request_b64)
+        challenges = parse_www_authenticate_all([first, second])
+        assert len(challenges) == 2
+
+    def test_quoted_comma_in_realm_does_not_split(self):
+        """Naive comma splitting on the inter-challenge separator would
+        truncate a realm containing a literal comma. The quote-aware
+        walker must treat the comma as part of the value."""
+        request_b64 = encode_json({"amount": "1"})
+        # Realm literally contains a comma; serialize manually to bypass
+        # _escape_quoted_value behavior so the comma stays raw inside quotes.
+        header = (
+            f'Payment id="abc", realm="api, with, commas", method="solana", intent="charge", request="{request_b64}"'
+        )
+        challenges = parse_www_authenticate_all([header])
+        assert len(challenges) == 1
+        assert challenges[0].realm == "api, with, commas"
+
+    def test_ignores_non_payment_schemes(self):
+        request_b64 = encode_json({"amount": "1"})
+        payment = self._build_challenge_header("api", request_b64)
+        header = f'Bearer realm="x", {payment}'
+        challenges = parse_www_authenticate_all([header])
+        assert len(challenges) == 1
+        assert challenges[0].realm == "api"
+
+    def test_empty_input_returns_empty(self):
+        assert parse_www_authenticate_all([]) == []
+        assert parse_www_authenticate_all([""]) == []

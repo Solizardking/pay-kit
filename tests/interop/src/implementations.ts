@@ -142,4 +142,16 @@ export const serverImplementations: ImplementationDefinition[] = [
     // Codex PR #103 review (P2).
     enabled: isEnabled("lua", "MPP_INTEROP_SERVERS", false),
   },
+  {
+    id: "python",
+    label: "Python HTTP server",
+    role: "server",
+    // Default OFF to match the other newly-landed adapters (PHP, Ruby, Go).
+    // The default interop matrix should not require a Python toolchain on
+    // every contributor's machine; opt-in via
+    // ``MPP_INTEROP_SERVERS=python`` (or the dedicated focused-matrix CI
+    // jobs in .github/workflows/python.yml).
+    command: ["python3", "python-server/main.py"],
+    enabled: isEnabled("python", "MPP_INTEROP_SERVERS", false),
+  },
 ];
