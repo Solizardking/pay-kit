@@ -42,6 +42,7 @@ expected request.
 
 local json = require('mpp.util.json')
 local network_check = require('mpp.server.network_check')
+local error_codes = require('mpp.protocol.core.error_codes')
 
 local M = {}
 
@@ -75,8 +76,14 @@ local function default_sleep(seconds)
   while monotonic_seconds() < target do end
 end
 
-local function verifier_error(message)
-  error({ code = 'verification-error', message = message })
+-- All settlement-side rejections funnel through `verifier_error` so the
+-- response builder can map each to a canonical L6 error code. The default
+-- code is PAYMENT_INVALID (the transaction's on-chain shape failed one of
+-- the verifier's structural checks); callers pass an explicit override
+-- for the network-mismatch and signature-consumed paths so the response
+-- carries the right machine-readable code.
+local function verifier_error(message, code)
+  error({ code = code or error_codes.PAYMENT_INVALID, message = message })
 end
 
 --- Construct a new charge handler.
@@ -139,7 +146,7 @@ local function consume_replay(self, signature)
   local key = CONSUMED_PREFIX .. signature
   local inserted = self.replay_store:put_if_absent(key, true)
   if not inserted then
-    verifier_error('Transaction signature already consumed')
+    verifier_error('Transaction signature already consumed', error_codes.SIGNATURE_CONSUMED)
   end
 end
 
@@ -153,10 +160,16 @@ function Handler:settle_pull(transaction_base64, request)
   end
 
   -- Stage 1: shape verification. Failing here means we never touch the RPC.
+  -- Preserve a canonical L6 code if the verifier hook raised one; the
+  -- bundled verifier always raises PAYMENT_INVALID, but a third-party
+  -- transaction_verifier might pick a different canonical code (e.g.
+  -- WRONG_NETWORK) and we don't want the handler's rewrap to drop it.
   local ok, verify_err = pcall(self.transaction_verifier, transaction_base64, request)
   if not ok then
     local message = type(verify_err) == 'table' and verify_err.message or tostring(verify_err)
-    verifier_error(message)
+    local hook_code = (type(verify_err) == 'table'
+      and error_codes.ALL[verify_err.code] and verify_err.code) or nil
+    verifier_error(message, hook_code)
   end
 
   -- Stage 2: network-blockhash gate. Done after shape verification because
@@ -166,7 +179,7 @@ function Handler:settle_pull(transaction_base64, request)
     if type(blockhash) == 'string' and blockhash ~= '' then
       local err = network_check.check_network_blockhash(self.network, blockhash)
       if err then
-        verifier_error(err.message)
+        verifier_error(err.message, error_codes.WRONG_NETWORK)
       end
     end
   end
@@ -248,7 +261,12 @@ function Handler:settle_push(signature, request)
   local ok, verify_err = pcall(self.transaction_verifier, transaction_base64, request)
   if not ok then
     local message = type(verify_err) == 'table' and verify_err.message or tostring(verify_err)
-    verifier_error(message)
+    -- Same canonical-code passthrough as settle_pull: a third-party
+    -- verifier may raise a non-payment-invalid canonical code and we
+    -- want the response builder to see it intact.
+    local hook_code = (type(verify_err) == 'table'
+      and error_codes.ALL[verify_err.code] and verify_err.code) or nil
+    verifier_error(message, hook_code)
   end
 
   consume_replay(self, signature)
@@ -270,11 +288,17 @@ function Handler:settle(payload, request)
 end
 
 --- Build a `verify_payment` callback compatible with `mpp.server.new`. The
--- callback consumes the replay store inside the handler, so the server's
--- own `put_if_absent` call in `_finalize_verification` is a no-op for the
--- same reference. `options.replay_key_prefix` controls the prefix the
--- server-level consume uses; the suffix is always the on-chain signature
--- so each settlement still gets a distinct server-level key.
+-- callback consumes the replay store inside the handler (in `settle_pull`
+-- between broadcast and await; in `settle_push` after on-chain shape
+-- verification) and reports back with `consumed = true` so the outer
+-- `Server:_finalize_verification` skips its own `put_if_absent` call.
+-- This is the contract that lets the Kong / OpenResty wiring share a
+-- single replay store between `charge_handler.new({ replay_store })` and
+-- `mpp.server.new({ store })` without the second consume colliding with
+-- the first and rejecting a valid first payment as `signature_consumed`.
+-- `options.replay_key_prefix` is retained for backward compatibility and
+-- still surfaces the namespaced server-level key in the returned table
+-- even though the outer consume is now a no-op.
 function Handler:as_callback(options)
   options = options or {}
   local prefix = options.replay_key_prefix or 'solana-charge:server-noop:'
@@ -283,11 +307,11 @@ function Handler:as_callback(options)
     local signature = handler:settle(context.payload, context.request)
     return {
       reference = signature,
-      -- Build the server-level replay_key as prefix + signature so the
-      -- key is unique per settlement. The handler already consumed the
-      -- real signature in the replay store; this server-level key only
-      -- needs to be distinct from earlier settlements.
       replay_key = prefix .. signature,
+      -- Signals to `Server:_finalize_verification` that the durable
+      -- replay marker is already in place; the outer put_if_absent is
+      -- skipped so we do not re-assert against the same shared store.
+      consumed = true,
     }
   end
 end

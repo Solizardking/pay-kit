@@ -1,10 +1,12 @@
 local challenge = require('mpp.protocol.core.challenge')
+local error_codes = require('mpp.protocol.core.error_codes')
 local html_module = require('mpp.server.html')
 local intents = require('mpp.protocol.intents.charge')
 local protocol = require('mpp.protocol.solana')
 local solana_verify = require('mpp.server.solana_verify')
 local store = require('mpp.store')
 local types = require('mpp.protocol.core.types')
+local uint = require('mpp.util.uint')
 
 local M = {}
 
@@ -68,6 +70,31 @@ end
 function Server:charge_with_options(amount, options)
   options = options or {}
   local base_units = intents.parse_units(amount, self.decimals)
+  -- Tier-0 splits guard. The on-chain primary delta is `amount - sum(splits)`
+  -- and the verifier rejects any settled transaction where this drops to
+  -- zero or below. Rejecting at challenge issuance time mirrors the Rust /
+  -- TypeScript server fixtures and surfaces a canonical 402 with code
+  -- `payment_invalid` before any HMAC is computed, so a misconfigured route
+  -- (or an interop scenario whose splits sum to the full amount) gets the
+  -- same machine-readable code from every SDK.
+  if type(options.splits) == 'table' and #options.splits > 0 then
+    if #options.splits > 8 then
+      error_codes.raise(error_codes.PAYMENT_INVALID, 'too many splits')
+    end
+    local split_total = '0'
+    for i = 1, #options.splits do
+      local split_amount = options.splits[i] and options.splits[i].amount
+      if type(split_amount) ~= 'string' or not split_amount:match('^%d+$') then
+        error_codes.raise(error_codes.PAYMENT_INVALID,
+          'split.amount must be an integer string')
+      end
+      split_total = uint.add(split_total, split_amount)
+    end
+    if uint.compare(base_units, split_total) <= 0 then
+      error_codes.raise(error_codes.PAYMENT_INVALID,
+        'split amounts exceed total amount')
+    end
+  end
   local method_details = {
     network = self.network,
   }
@@ -141,23 +168,42 @@ function Server:verify_credential_with_expected(credential_value, expected, now_
   end
   local cred_request, _method_details, payload = self:_verify_challenge_and_decode(credential_value, now_epoch)
 
+  -- The three pinned fields are the route's contract with the client:
+  -- the same credential issued for a cheaper / different route must not
+  -- settle here, even if its HMAC verifies. All three rejections share
+  -- the canonical `charge_request_mismatch` code.
   if cred_request.amount ~= expected.amount then
-    error(string.format(
+    error_codes.raise(error_codes.CHARGE_REQUEST_MISMATCH, string.format(
       'amount mismatch: credential has %s but endpoint expects %s',
       tostring(cred_request.amount), tostring(expected.amount)
     ))
   end
   if cred_request.currency ~= expected.currency then
-    error(string.format(
+    error_codes.raise(error_codes.CHARGE_REQUEST_MISMATCH, string.format(
       'currency mismatch: credential has %s but endpoint expects %s',
       tostring(cred_request.currency), tostring(expected.currency)
     ))
   end
   if cred_request.recipient ~= expected.recipient then
-    error('recipient mismatch: credential was issued for a different recipient')
+    error_codes.raise(error_codes.CHARGE_REQUEST_MISMATCH,
+      'recipient mismatch: credential was issued for a different recipient')
   end
 
-  return self:_finalize_verification(credential_value, expected, payload)
+  -- Settlement runs against a hybrid request: the pinned route fields
+  -- come from `expected` (so a credential issued for a cheaper route
+  -- cannot settle here), but the on-chain shape parameters
+  -- (`methodDetails`: splits, feePayer, decimals, tokenProgram, etc.) and
+  -- the externalId come from the credential. The credential's HMAC and
+  -- pinned-field checks above already authenticate those secondary fields.
+  local settlement_request = {
+    amount = expected.amount,
+    currency = expected.currency,
+    recipient = expected.recipient,
+    methodDetails = cred_request.methodDetails,
+    externalId = cred_request.externalId,
+    description = cred_request.description,
+  }
+  return self:_finalize_verification(credential_value, settlement_request, payload)
 end
 
 --- Tier-1 (HMAC + expiry) and Tier-2 (pinned-field) checks.
@@ -178,15 +224,16 @@ function Server:_verify_challenge_and_decode(credential_value, now_epoch)
   })
 
   if not challenge_value:verify(self.secret_key) then
-    error('challenge ID mismatch')
+    error_codes.raise(error_codes.CHALLENGE_VERIFICATION_FAILED, 'challenge ID mismatch')
   end
   if challenge_value:is_expired(now_epoch or os.time()) then
-    error('challenge expired at ' .. tostring(challenge_value.expires))
+    error_codes.raise(error_codes.CHALLENGE_EXPIRED,
+      'challenge expired at ' .. tostring(challenge_value.expires))
   end
 
   local request, decode_err = challenge_value.request:decode()
   if not request then
-    error(decode_err)
+    error_codes.raise(error_codes.CHALLENGE_VERIFICATION_FAILED, tostring(decode_err))
   end
 
   -- Tier-2: pinned-field backstop.
@@ -196,7 +243,7 @@ function Server:_verify_challenge_and_decode(credential_value, now_epoch)
   local payload = challenge.payload_as(credential_value) or {}
   local payload_type = payload.type
   if payload_type ~= 'transaction' and payload_type ~= 'signature' then
-    error('missing or invalid payload type')
+    error_codes.raise(error_codes.PAYMENT_INVALID, 'missing or invalid payload type')
   end
   if payload_type == 'signature' and method_details.feePayer then
     -- B34: keep this message byte-identical to the verifier-layer B34
@@ -211,32 +258,40 @@ function Server:_verify_challenge_and_decode(credential_value, now_epoch)
 end
 
 function Server:_verify_pinned_fields(echoed, request)
+  -- Tier-2 cross-route checks. method/intent/realm mismatches are
+  -- canonically `challenge_route_mismatch` (the credential was issued
+  -- under a different routing identity). currency/recipient mismatches
+  -- here are also a route-level rejection (same realm but the server's
+  -- configured currency or recipient differs); they share the same code
+  -- because the route is what changed, not the credential's contents.
   local method_name = 'solana'
   if echoed.method ~= method_name then
-    error(string.format(
+    error_codes.raise(error_codes.CHALLENGE_ROUTE_MISMATCH, string.format(
       "credential method '%s' does not match this server (expected '%s')",
       tostring(echoed.method), method_name
     ))
   end
   if not types.is_charge_intent(echoed.intent) then
-    error(string.format("credential intent '%s' is not a charge", tostring(echoed.intent)))
+    error_codes.raise(error_codes.CHALLENGE_ROUTE_MISMATCH,
+      string.format("credential intent '%s' is not a charge", tostring(echoed.intent)))
   end
   -- HMAC ID is computed using the server's own realm (not the echoed one),
   -- so a tampered echoed realm passes HMAC unless re-signed. Pin it here.
   if echoed.realm ~= self.realm then
-    error(string.format(
+    error_codes.raise(error_codes.CHALLENGE_ROUTE_MISMATCH, string.format(
       "credential realm '%s' does not match this server (expected '%s')",
       tostring(echoed.realm), tostring(self.realm)
     ))
   end
   if request.currency ~= self.currency then
-    error(string.format(
+    error_codes.raise(error_codes.CHALLENGE_ROUTE_MISMATCH, string.format(
       "credential currency '%s' does not match this server (expected '%s')",
       tostring(request.currency), tostring(self.currency)
     ))
   end
   if request.recipient ~= self.recipient then
-    error('credential recipient does not match this server')
+    error_codes.raise(error_codes.CHALLENGE_ROUTE_MISMATCH,
+      'credential recipient does not match this server')
   end
 end
 
@@ -257,21 +312,28 @@ function Server:_finalize_verification(credential_value, request, payload)
 
   local reference = result.reference or payload.signature or payload.transaction
   if reference == nil or reference == '' then
-    error('verification result must include a reference')
+    error_codes.raise(error_codes.PAYMENT_INVALID,
+      'verification result must include a reference')
   end
 
-  local replay_key = result.replay_key or (CONSUMED_PREFIX .. reference)
-  -- L8 ordering: in pull mode, solana_verify.verify_transaction now
-  -- writes the consume marker between broadcast and await_confirmation
-  -- and signals back via result.consumed=true. Skip the outer
-  -- put_if_absent in that case so we do not double-consume our own
-  -- marker. In push mode (signature credentials) and any other path
-  -- where the verifier did not consume, fall back to the outer guard
-  -- so the L4 lock still applies.
+  -- Settlement layers that already consumed the replay marker themselves
+  -- (e.g. `charge_handler:as_callback()` which writes
+  -- `solana-charge:consumed:<sig>` inside `settle_pull` before await, and
+  -- `solana_verify.verify_transaction` which writes the same key between
+  -- broadcast and await for the L8 ordering fix) signal back via
+  -- `result.consumed = true`. Skip the outer put_if_absent in that case so
+  -- the same marker is not re-asserted against the shared store. When the
+  -- verifier supplies its own `replay_key` we also know the consume already
+  -- happened, so honoring `consumed` here keeps the Kong / OpenResty
+  -- wiring (shared replay store between charge_handler and Server) from
+  -- double-asserting and returning a spurious `signature_consumed` on the
+  -- first valid payment. Push-mode signature verifiers that do not consume
+  -- themselves fall through to the outer guard.
   if result.consumed ~= true then
+    local replay_key = result.replay_key or (CONSUMED_PREFIX .. reference)
     local inserted = self.store:put_if_absent(replay_key, true)
     if not inserted then
-      error('payment already consumed')
+      error_codes.raise(error_codes.SIGNATURE_CONSUMED, 'payment already consumed')
     end
   end
 

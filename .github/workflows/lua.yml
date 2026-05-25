@@ -13,10 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install LuaJIT 2.1 and LuaRocks
+      - name: Install LuaJIT 2.1, LuaRocks, libsodium, openssl
         run: |
           sudo apt-get update
-          sudo apt-get install -y luajit libluajit-5.1-dev luarocks
+          sudo apt-get install -y luajit libluajit-5.1-dev luarocks libsodium-dev libssl-dev
           luajit -v
           luarocks --version
 
@@ -28,7 +28,7 @@ jobs:
           key: ${{ runner.os }}-luarocks-v2-${{ hashFiles('lua/mpp-dev-1.rockspec', 'lua/.luacov', 'lua/.luacheckrc') }}
           restore-keys: ${{ runner.os }}-luarocks-v2-
 
-      - name: Install dev rocks (luacheck + luacov)
+      - name: Install dev rocks (luacheck + luacov + luasocket + luasodium + luasec)
         if: steps.cache-rocks.outputs.cache-hit != 'true'
         working-directory: lua
         run: |
@@ -36,6 +36,9 @@ jobs:
           luarocks --lua-version=5.1 init --lua-versions 5.1 || true
           luarocks --lua-version=5.1 install --tree lua_modules luacheck
           luarocks --lua-version=5.1 install --tree lua_modules luacov
+          luarocks --lua-version=5.1 install --tree lua_modules luasocket
+          luarocks --lua-version=5.1 install --tree lua_modules luasodium
+          luarocks --lua-version=5.1 install --tree lua_modules luasec OPENSSL_DIR=/usr
 
       - name: Validate rockspec
         working-directory: lua
@@ -58,6 +61,18 @@ jobs:
           luacov
           ./scripts/check_coverage.sh ../luacov.report.out 90
 
+      # Codex PR #103 P3: the coverage gate excludes mpp/methods/solana/ata
+      # because luacov disables LuaJIT trace recording and the on-curve check
+      # becomes ~100x slower under coverage. Run the suite a second time
+      # WITHOUT luacov so the protocol-critical ATA fixture spec
+      # (`ata.derive matches the Ruby reference for the USDC Token-2022 ATA`)
+      # is actually exercised. test_helper.lua skips it when luacov is loaded.
+      - name: Run protocol-critical ATA fixture suite without coverage
+        working-directory: lua
+        run: |
+          eval "$(luarocks --lua-version=5.1 --tree lua_modules path)"
+          luajit tests/run.lua
+
       - name: Upload Lua coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -72,3 +87,76 @@ jobs:
           name: surfpool-reports-lua
           path: lua/target/surfpool-reports/
           if-no-files-found: ignore
+
+  interop-lua:
+    name: Lua interop focused matrix
+    needs: test-lua
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install LuaJIT 2.1, LuaRocks, libsodium, openssl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit libluajit-5.1-dev luarocks libsodium-dev libssl-dev
+          luajit -v
+
+      - name: Cache rocks tree
+        id: cache-rocks
+        uses: actions/cache@v4
+        with:
+          path: lua/lua_modules
+          key: ${{ runner.os }}-luarocks-v2-${{ hashFiles('lua/mpp-dev-1.rockspec', 'lua/.luacov', 'lua/.luacheckrc') }}
+          restore-keys: ${{ runner.os }}-luarocks-v2-
+
+      - name: Install runtime rocks
+        if: steps.cache-rocks.outputs.cache-hit != 'true'
+        working-directory: lua
+        run: |
+          mkdir -p lua_modules
+          luarocks --lua-version=5.1 init --lua-versions 5.1 || true
+          luarocks --lua-version=5.1 install --tree lua_modules luasocket
+          luarocks --lua-version=5.1 install --tree lua_modules luasodium
+          luarocks --lua-version=5.1 install --tree lua_modules luasec OPENSSL_DIR=/usr
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install TypeScript SDK deps
+        working-directory: typescript
+        run: pnpm install --frozen-lockfile
+
+      - name: Build TypeScript SDK
+        working-directory: typescript
+        run: pnpm --filter @solana/mpp build
+
+      - name: Build Rust interop client
+        working-directory: rust
+        run: cargo build --bin interop_client
+
+      - name: Install interop harness deps
+        working-directory: tests/interop
+        run: pnpm install --frozen-lockfile
+
+      - name: TS-to-Lua focused matrix
+        working-directory: tests/interop
+        env:
+          MPP_INTEROP_CLIENTS: typescript
+          MPP_INTEROP_SERVERS: lua
+          MPP_INTEROP_SCENARIOS: charge-basic,charge-split-ata,charge-network-mismatch,charge-cross-route-replay
+        run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "typescript client pays lua server"
+
+      - name: Rust-to-Lua focused matrix
+        working-directory: tests/interop
+        env:
+          MPP_INTEROP_CLIENTS: rust
+          MPP_INTEROP_SERVERS: lua
+          MPP_INTEROP_SCENARIOS: charge-basic,charge-split-ata
+        run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "rust client pays lua server"
