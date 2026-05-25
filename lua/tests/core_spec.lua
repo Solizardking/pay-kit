@@ -69,3 +69,69 @@ t.test('extract payment scheme ignores other auth parts', function()
   local scheme = mpp.ExtractPaymentScheme('Bearer abc, Payment xyz')
   t.assert_equal(scheme, 'Payment xyz')
 end)
+
+t.test('parse_www_authenticate_all parses multi-challenge header (RFC 7235 sec 4.1)', function()
+  local header = 'Payment id="a", realm="r1", method="solana", intent="charge", request="e30", '
+              .. 'Payment id="b", realm="r2", method="solana", intent="charge", request="e30"'
+  local results = mpp.ParseWWWAuthenticateAll(header)
+  t.assert_equal(#results, 2)
+  t.assert_equal(results[1].id, 'a')
+  t.assert_equal(results[2].id, 'b')
+end)
+
+t.test('parse_www_authenticate_all ignores Payment inside quoted realm', function()
+  local header = 'Payment id="a", realm="api, Payment realm", method="solana", intent="charge", request="e30", '
+              .. 'Payment id="b", realm="r2", method="solana", intent="charge", request="e30"'
+  local results = mpp.ParseWWWAuthenticateAll(header)
+  t.assert_equal(#results, 2)
+  t.assert_equal(results[1].realm, 'api, Payment realm')
+  t.assert_equal(results[2].id, 'b')
+end)
+
+-- RFC 8785 (canonical JSON) and RFC 3339 (expires) tests moved to
+-- json_canonical_rfc8785_spec.lua and expires_rfc3339_spec.lua per
+-- PR #102 review (inline comment 3298060956).
+
+t.test('parse_www_authenticate_all single Payment scheme', function()
+  local h = 'Payment id="a", realm="r", method="solana", intent="charge", request="e30"'
+  local results = mpp.ParseWWWAuthenticateAll(h)
+  t.assert_equal(#results, 1)
+  t.assert_equal(results[1].id, 'a')
+end)
+
+t.test('parse_www_authenticate_all Payment followed by Bearer', function()
+  local h = 'Payment id="a", realm="r", method="solana", intent="charge", request="e30", '
+         .. 'Bearer realm="oauth"'
+  local results = mpp.ParseWWWAuthenticateAll(h)
+  t.assert_equal(#results, 1)
+  t.assert_equal(results[1].id, 'a')
+end)
+
+t.test('parse_www_authenticate_all Bearer followed by Payment', function()
+  local h = 'Bearer realm="oauth", '
+         .. 'Payment id="a", realm="r", method="solana", intent="charge", request="e30"'
+  local results = mpp.ParseWWWAuthenticateAll(h)
+  t.assert_equal(#results, 1)
+  t.assert_equal(results[1].id, 'a')
+end)
+
+t.test('parse_www_authenticate_all interleaved schemes', function()
+  local h = 'Bearer realm="oauth", '
+         .. 'Payment id="a", realm="r", method="solana", intent="charge", request="e30", '
+         .. 'Basic realm="basic", '
+         .. 'Payment id="b", realm="r", method="solana", intent="charge", request="e30"'
+  local results = mpp.ParseWWWAuthenticateAll(h)
+  t.assert_equal(#results, 2)
+  t.assert_equal(results[1].id, 'a')
+  t.assert_equal(results[2].id, 'b')
+end)
+
+t.test('parse_www_authenticate_all skips malformed challenge and returns valid siblings', function()
+  -- First challenge has invalid base64url in request; second is valid. Should yield one challenge.
+  local header = 'Payment id="bad", realm="r", method="solana", intent="charge", request="!!!", '
+              .. 'Payment id="ok", realm="r", method="solana", intent="charge", request="e30"'
+  local results = mpp.ParseWWWAuthenticateAll(header)
+  t.assert_equal(#results, 1)
+  t.assert_equal(results[1].id, 'ok')
+end)
+

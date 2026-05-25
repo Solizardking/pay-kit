@@ -35,6 +35,12 @@ resource_path     = optional_env("MPP_INTEROP_RESOURCE_PATH", "/paid")
 settlement_header = optional_env("MPP_INTEROP_SETTLEMENT_HEADER", "x-payment-settlement-signature")
 replay_path       = ENV["MPP_INTEROP_REPLAY_SOURCE_PATH"]
 replay_amount     = ENV["MPP_INTEROP_REPLAY_SOURCE_AMOUNT"]
+# B34 / push-mode: when the harness drives this server in push mode the
+# challenge MUST NOT advertise a server-side fee payer (the Ruby verifier
+# rejects type=signature credentials whenever methodDetails.feePayer == true,
+# see methods/solana/verifier.rb). Passing fee_payer: nil omits both
+# feePayer and feePayerKey from the challenge so the push path verifies.
+payment_mode      = optional_env("MPP_INTEROP_PAYMENT_MODE", "pull")
 splits            = JSON.parse(optional_env("MPP_INTEROP_SPLITS", "[]"))
 unless splits.is_a?(Array)
   warn "MPP_INTEROP_SPLITS must decode to an array"
@@ -47,7 +53,7 @@ server = Mpp.create(
     currency:  mint,
     network:   network,
     rpc:       rpc_url,
-    fee_payer: account_from_env("MPP_INTEROP_FEE_PAYER_SECRET_KEY")
+    fee_payer: payment_mode == "push" ? nil : account_from_env("MPP_INTEROP_FEE_PAYER_SECRET_KEY")
   ),
   secret_key:        secret_key,
   realm:             "MPP Interop",
@@ -99,15 +105,36 @@ $stdout.write(JSON.generate({
 }) + "\n")
 $stdout.flush
 
+# Graceful shutdown: signal traps cannot safely take the same Mutex the
+# accept loop is parked on (Ruby raises `recursive locking (ThreadError)`
+# or `deadlock; recursive locking` when SIGTERM lands while `TCPServer#accept`
+# is blocked). Instead, flip an atomic flag from the trap context and close
+# the listener from a separate thread so `accept` returns with `IOError`
+# which the main loop treats as a clean exit. No `exit` from inside trap.
+shutting_down = false
 shutdown = proc do
-  listener.close unless listener.closed?
-  exit 0
+  next if shutting_down
+  shutting_down = true
+  Thread.new do
+    begin
+      listener.close unless listener.closed?
+    rescue StandardError
+      # Listener already torn down; nothing to do.
+    end
+  end
 end
 Signal.trap("TERM", &shutdown)
 Signal.trap("INT", &shutdown)
 
 loop do
-  conn = listener.accept
+  begin
+    conn = listener.accept
+  rescue IOError, Errno::EBADF
+    # Listener was closed by the shutdown trap; exit the accept loop cleanly.
+    break
+  end
+  break if shutting_down && conn.nil?
+
   begin
     req = read_request(conn)
     if req.nil?
@@ -158,3 +185,5 @@ loop do
     end
   end
 end
+
+exit 0

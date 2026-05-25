@@ -26,8 +26,19 @@ describe("interop scenario selection", () => {
     ).toEqual([
       "charge-basic",
       "charge-split-ata",
+      "charge-push",
       "charge-network-mismatch",
       "charge-cross-route-replay",
+      "charge-symbol-usdc-localnet",
+      "charge-token2022-split-ata",
+      "charge-decimals-9",
+      "charge-split-ata-idempotent",
+      "charge-compute-budget-over-cap",
+      "charge-sol-native",
+      "charge-splits-too-many",
+      "charge-splits-sum-equals-amount",
+      "charge-cross-server-portability",
+      "charge-idempotent-resubmit",
     ]);
   });
 

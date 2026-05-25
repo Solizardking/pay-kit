@@ -1,13 +1,49 @@
 use std::{
     collections::HashMap,
     env,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
+    process,
     sync::Arc,
     thread,
 };
 
 use serde_json::json;
+
+/// Write a line to stdout, swallowing `BrokenPipe` (EPIPE) errors instead of
+/// panicking the way Rust's default `println!` macro would when the harness
+/// has stopped reading our pipe. Any other I/O error is fatal.
+fn write_stdout_line(line: &str) {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    match writeln!(handle, "{line}") {
+        Ok(()) => {
+            let _ = handle.flush();
+        }
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+            // Harness already torn down; exit cleanly so we do not surface a
+            // panic that propagates into the vitest worker.
+            process::exit(0);
+        }
+        Err(err) => panic!("failed printing to stdout: {err}"),
+    }
+}
+
+/// Same as `write_stdout_line` but for stderr. Used by background threads so a
+/// post-teardown stderr write does not kill the process.
+fn write_stderr_line(line: &str) {
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    match writeln!(handle, "{line}") {
+        Ok(()) => {
+            let _ = handle.flush();
+        }
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+            // Drop the line silently.
+        }
+        Err(_) => {}
+    }
+}
 use solana_mpp::protocol::intents::ChargeRequest;
 use solana_mpp::protocol::solana::Split;
 use solana_mpp::server::{ChargeOptions, Config, Mpp};
@@ -22,12 +58,13 @@ const HEALTH_PATH: &str = "/health";
 const DEFAULT_PRICE: &str = "0.001";
 const DEFAULT_SECRET_KEY: &str = "mpp-interop-secret-key";
 const DEFAULT_SETTLEMENT_HEADER: &str = "x-fixture-settlement";
-const TOKEN_DECIMALS: u8 = 6;
+const DEFAULT_TOKEN_DECIMALS: u8 = 6;
 
 #[derive(Clone)]
 struct InteropState {
     mpp: Mpp,
     price: String,
+    push_mode: bool,
     replay_source: Option<ReplaySource>,
     resource_path: String,
     settlement_header: String,
@@ -46,16 +83,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
 
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "type": "ready",
-            "implementation": "rust",
-            "role": "server",
-            "port": port,
-            "capabilities": ["charge"],
-        }))?
-    );
+    write_stdout_line(&serde_json::to_string(&json!({
+        "type": "ready",
+        "implementation": "rust",
+        "role": "server",
+        "port": port,
+        "capabilities": ["charge"],
+    }))?);
 
     for stream in listener.incoming() {
         match stream {
@@ -64,11 +98,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let runtime = Arc::clone(&runtime);
                 thread::spawn(move || {
                     if let Err(error) = handle_connection(stream, &state, &runtime) {
-                        eprintln!("interop rust server error: {error}");
+                        write_stderr_line(&format!("interop rust server error: {error}"));
                     }
                 });
             }
-            Err(error) => eprintln!("interop rust server accept error: {error}"),
+            Err(error) => {
+                write_stderr_line(&format!("interop rust server accept error: {error}"));
+            }
         }
     }
 
@@ -80,6 +116,14 @@ fn read_state() -> Result<InteropState, Box<dyn std::error::Error + Send + Sync>
     let network = env::var("MPP_INTEROP_NETWORK").unwrap_or_else(|_| "localnet".to_string());
     let mint = read_required_env("MPP_INTEROP_MINT")?;
     let pay_to = read_required_env("MPP_INTEROP_PAY_TO")?;
+    // B34 / push-mode: routes driven in push mode must not advertise a
+    // server-side fee payer (see charge.rs: push credentials are rejected
+    // when method_details.fee_payer == true). The fee payer secret key is
+    // still required for pull-mode runs; we just keep `fee_payer` off the
+    // Config so the challenge omits feePayer/feePayerKey.
+    let push_mode = env::var("MPP_INTEROP_PAYMENT_MODE")
+        .map(|v| v == "push")
+        .unwrap_or(false);
     let fee_payer: Arc<dyn SolanaSigner> =
         Arc::new(read_memory_signer("MPP_INTEROP_FEE_PAYER_SECRET_KEY")?);
     let price = env::var("MPP_INTEROP_PRICE").unwrap_or_else(|_| DEFAULT_PRICE.to_string());
@@ -95,23 +139,28 @@ fn read_state() -> Result<InteropState, Box<dyn std::error::Error + Send + Sync>
     };
     let secret_key =
         env::var("MPP_INTEROP_SECRET_KEY").unwrap_or_else(|_| DEFAULT_SECRET_KEY.to_string());
+    let decimals = match env::var("MPP_INTEROP_DECIMALS") {
+        Ok(raw) if !raw.is_empty() => raw.parse::<u8>()?,
+        _ => DEFAULT_TOKEN_DECIMALS,
+    };
     let splits = read_splits()?;
 
     Ok(InteropState {
         mpp: Mpp::new(Config {
             recipient: pay_to,
             currency: mint,
-            decimals: TOKEN_DECIMALS,
+            decimals,
             network,
             rpc_url: Some(rpc_url),
             secret_key: Some(secret_key),
             realm: Some("MPP Interop".to_string()),
-            fee_payer: true,
-            fee_payer_signer: Some(fee_payer),
+            fee_payer: !push_mode,
+            fee_payer_signer: if push_mode { None } else { Some(fee_payer) },
             store: None,
             html: false,
         })?,
         price,
+        push_mode,
         replay_source,
         resource_path: env::var("MPP_INTEROP_RESOURCE_PATH")
             .unwrap_or_else(|_| DEFAULT_RESOURCE_PATH.to_string()),
@@ -178,13 +227,22 @@ fn handle_connection(
                     }
                     Err(error) => {
                         let challenge_header = payment_challenge_header(state, price)?;
+                        let message = error.to_string();
+                        // G39: surface a canonical L6 code on every 402 so
+                        // the harness fault matrix can assert cross-SDK
+                        // agreement on the code emitted for each failure
+                        // class. The Rust spine VerificationError carries
+                        // a kebab-case code today; classify_canonical_code
+                        // maps it to the canonical snake_case form.
+                        let code = classify_canonical_code(&message);
                         write_json_response(
                             &mut stream,
                             402,
                             &[(WWW_AUTHENTICATE_HEADER, challenge_header.as_str())],
                             &json!({
-                                "error": "payment_invalid",
-                                "message": error.to_string(),
+                                "code": code,
+                                "error": code,
+                                "message": message,
                             }),
                         )?;
                     }
@@ -213,7 +271,7 @@ fn payment_challenge_header(
         price,
         ChargeOptions {
             description: Some("Surfpool-backed protected content"),
-            fee_payer: true,
+            fee_payer: !state.push_mode,
             splits: state.splits.clone(),
             ..Default::default()
         },
@@ -250,7 +308,7 @@ fn expected_request_for_route(
         price,
         ChargeOptions {
             description: Some("Surfpool-backed protected content"),
-            fee_payer: true,
+            fee_payer: !state.push_mode,
             splits: state.splits.clone(),
             ..Default::default()
         },
@@ -314,4 +372,64 @@ fn read_memory_signer(
     let raw = read_required_env(name)?;
     let bytes: Vec<u8> = serde_json::from_str(&raw)?;
     Ok(MemorySigner::from_bytes(&bytes)?)
+}
+
+/// Classify a free-text error message into a canonical L6 structured
+/// error code. Mirrors tests/interop/src/canonical-codes.ts and the
+/// Python / Ruby SDK helpers. The G39 fault matrix asserts cross-SDK
+/// agreement on this code.
+fn classify_canonical_code(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("already consumed")
+        || lower.contains("signature already consumed")
+        // M1: pull-mode replay surfaces as the RPC's "already been
+        // processed" error before the L4 replay-store reservation
+        // fires. Canonically the same outcome as a replay-store hit.
+        || lower.contains("already been processed")
+        || lower.contains("transaction already processed")
+    {
+        return "signature_consumed";
+    }
+    if lower.contains("challenge id mismatch")
+        || lower.contains("not issued by this server")
+        || lower.contains("challenge verification failed")
+    {
+        return "challenge_verification_failed";
+    }
+    if lower.contains("challenge expired") || lower.contains("expired at") {
+        return "challenge_expired";
+    }
+    if lower.contains("signed against localnet but the server expects")
+        || lower.contains("network mismatch")
+        || lower.contains("wrong network")
+    {
+        return "wrong_network";
+    }
+    if lower.contains("amount mismatch")
+        || lower.contains("currency mismatch")
+        || lower.contains("recipient mismatch")
+        || lower.contains("method details mismatch")
+        || lower.contains("split amounts exceed")
+        || lower.contains("splits cannot exceed")
+        || lower.contains("too many splits")
+        || lower.contains("push-mode credentials are not allowed")
+        || lower.contains("unexpected program instruction")
+    {
+        return "charge_request_mismatch";
+    }
+    // Compute-budget allowlist violations fall through to `payment_invalid`
+    // rather than `charge_request_mismatch`. The message already names the
+    // observed value and the configured cap (see
+    // `validate_compute_budget_instruction` in `server/charge.rs`), so the
+    // harness can assert cross-SDK agreement on the canonical code without
+    // conflating tx-shape mismatch with a server policy rejection.
+    if lower.contains("credential method does not match")
+        || lower.contains("credential intent is not a charge")
+        || lower.contains("credential realm does not match")
+        || (lower.contains("intent")
+            && (lower.contains("not a charge") || lower.contains("does not match")))
+    {
+        return "challenge_route_mismatch";
+    }
+    "payment_invalid"
 }

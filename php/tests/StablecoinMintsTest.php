@@ -80,4 +80,33 @@ final class StablecoinMintsTest extends TestCase
         self::assertSame('CASH', StablecoinMints::symbolFor('CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH'));
         self::assertNull(StablecoinMints::symbolFor('FOOBAR'));
     }
+
+    /**
+     * The canonical mainnet slug is `mainnet`. Legacy `mainnet-beta` input
+     * is folded back to `mainnet` by normalizeNetwork() inside resolve(),
+     * so callers passing either spelling resolve to the same pubkey.
+     */
+    public function testMainnetBetaAliasResolvesToMainnetForEveryStablecoin(): void
+    {
+        self::assertSame(
+            StablecoinMints::resolve('USDC', 'mainnet'),
+            StablecoinMints::resolve('USDC', 'mainnet-beta')
+        );
+        self::assertSame(
+            StablecoinMints::resolve('USDT', 'mainnet'),
+            StablecoinMints::resolve('USDT', 'mainnet-beta')
+        );
+        self::assertSame(
+            StablecoinMints::resolve('USDG', 'mainnet'),
+            StablecoinMints::resolve('USDG', 'mainnet-beta')
+        );
+        self::assertSame(
+            StablecoinMints::resolve('PYUSD', 'mainnet'),
+            StablecoinMints::resolve('PYUSD', 'mainnet-beta')
+        );
+        self::assertSame(
+            StablecoinMints::resolve('CASH', 'mainnet'),
+            StablecoinMints::resolve('CASH', 'mainnet-beta')
+        );
+    }
 }

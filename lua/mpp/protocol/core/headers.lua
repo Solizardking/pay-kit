@@ -13,7 +13,13 @@ local max_token_len = 16 * 1024
 
 local function escape_quoted(value)
   value = tostring(value)
-  value = value:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\r', ''):gsub('\n', '')
+  -- RFC 9110 section 5.5 forbids CR and LF in header field values. Silent
+  -- strip is non-conformant and lets malformed inputs round-trip; reject
+  -- so the caller sees the problem at emission time.
+  if value:find('[\r\n]') then
+    error('control character in header parameter value')
+  end
+  value = value:gsub('\\', '\\\\'):gsub('"', '\\"')
   return value
 end
 
@@ -79,14 +85,135 @@ local function parse_auth_params(input)
   return params
 end
 
-function M.extract_payment_scheme(header)
-  for part in header:gmatch('[^,]+') do
-    local trimmed = part:gsub('^%s+', ''):gsub('%s+$', '')
-    if trimmed:sub(1, #M.PAYMENT_SCHEME + 1):lower() == string.lower(M.PAYMENT_SCHEME) .. ' ' then
-      return trimmed
+-- RFC 7230 sec 3.2.6 tchar.
+local TCHAR_EXTRA = "!#$%%&'*+-.^_`|~"
+local function token_char(ch)
+  if ch == '' then return false end
+  if ch:match('[%w]') then return true end
+  return TCHAR_EXTRA:find(ch, 1, true) ~= nil
+end
+
+-- If `header[pos]` starts an auth-scheme (RFC 7235 sec 2.1), return
+-- offset_after_scheme, is_payment_scheme. Otherwise return nil.
+--
+-- A scheme requires: token, 1*SP, then non-empty content (either auth-param
+-- list `key=val,...` or a token68 credential). A bare `token=` (no SP gap)
+-- is an auth-param continuation, not a new scheme.
+local function match_auth_scheme_start(header, pos, len, payment_scheme_lower)
+  local token_end = pos
+  while token_end <= len and token_char(header:sub(token_end, token_end)) do
+    token_end = token_end + 1
+  end
+  if token_end == pos then return nil end
+  local after_token = header:sub(token_end, token_end)
+  if after_token ~= ' ' and after_token ~= '\t' then return nil end
+  local cursor = token_end
+  while cursor <= len do
+    local c = header:sub(cursor, cursor)
+    if c ~= ' ' and c ~= '\t' then break end
+    cursor = cursor + 1
+  end
+  if cursor > len then return nil end
+  -- Must have non-empty content (not just trailing whitespace or a comma).
+  local c0 = header:sub(cursor, cursor)
+  if c0 == ',' then return nil end
+  local scheme = header:sub(pos, token_end - 1):lower()
+  return token_end, scheme == payment_scheme_lower
+end
+
+-- Quote-aware split of a WWW-Authenticate header value into individual `Payment` chunks (RFC 7235 sec 4.1).
+--
+-- Detects auth-scheme boundaries (token + SP + key=value), not just literal "Payment"
+-- occurrences, so trailing or interleaving non-Payment schemes (e.g. Bearer) correctly
+-- terminate the previous Payment chunk.
+local function split_payment_challenge_values(header)
+  local len = #header
+  local scheme_starts = {} -- list of {offset, is_payment}
+  local in_quote = false
+  local escaped = false
+  local at_boundary = true
+  local i = 1
+  local payment_scheme_lower = M.PAYMENT_SCHEME:lower()
+
+  while i <= len do
+    local ch = header:sub(i, i)
+    if in_quote then
+      if escaped then
+        escaped = false
+      elseif ch == '\\' then
+        escaped = true
+      elseif ch == '"' then
+        in_quote = false
+      end
+      i = i + 1
+    elseif ch == '"' then
+      in_quote = true
+      at_boundary = false
+      i = i + 1
+    elseif ch == ',' then
+      at_boundary = true
+      i = i + 1
+    elseif ch == ' ' or ch == '\t' then
+      i = i + 1
+    elseif at_boundary and token_char(ch) then
+      local scheme_end, is_payment = match_auth_scheme_start(header, i, len, payment_scheme_lower)
+      if scheme_end then
+        scheme_starts[#scheme_starts + 1] = { i, is_payment }
+        i = scheme_end
+        at_boundary = false
+      else
+        at_boundary = false
+        i = i + 1
+      end
+    else
+      at_boundary = false
+      i = i + 1
     end
   end
-  return nil
+
+  if #scheme_starts == 0 then
+    return {}
+  end
+
+  local chunks = {}
+  for idx, entry in ipairs(scheme_starts) do
+    local start, is_payment = entry[1], entry[2]
+    if is_payment then
+      local finish = scheme_starts[idx + 1] and (scheme_starts[idx + 1][1] - 1) or len
+      local chunk = header:sub(start, finish):gsub('^%s+', ''):gsub('%s+$', '')
+      chunk = chunk:gsub(',%s*$', '')
+      if chunk ~= '' then
+        chunks[#chunks + 1] = chunk
+      end
+    end
+  end
+  return chunks
+end
+
+function M.split_payment_challenge_values(header)
+  return split_payment_challenge_values(header)
+end
+
+function M.extract_payment_scheme(header)
+  local chunks = split_payment_challenge_values(header)
+  return chunks[1]
+end
+
+-- Parse all `Payment` challenges across one or more WWW-Authenticate values (RFC 7235 sec 4.1).
+-- Returns only successfully-parsed challenges; malformed individual challenges are skipped, mirroring
+-- the Rust spine which exposes Vec<Result<PaymentChallenge, Error>> and filters at the call site.
+function M.parse_www_authenticate_all(headers)
+  local list = type(headers) == 'string' and { headers } or headers
+  local results = {}
+  for _, h in ipairs(list) do
+    for _, chunk in ipairs(split_payment_challenge_values(h)) do
+      local ok, value = pcall(M.parse_www_authenticate, chunk)
+      if ok then
+        results[#results + 1] = value
+      end
+    end
+  end
+  return results
 end
 
 function M.parse_www_authenticate(header)

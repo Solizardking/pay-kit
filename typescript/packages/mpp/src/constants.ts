@@ -5,26 +5,35 @@ export const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
 export const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 
+// The canonical mainnet slug is `mainnet`. The legacy `mainnet-beta`
+// spelling is kept as an aliased key so direct bracket access from
+// consumer code (e.g. USDC['mainnet-beta']) keeps working through the
+// transition. Internal lookups go through normalizeNetwork below.
 export const USDC: Record<string, string> = {
     devnet: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+    mainnet: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
     'mainnet-beta': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 };
 
 export const USDT: Record<string, string> = {
+    mainnet: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
     'mainnet-beta': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
 };
 
 export const USDG: Record<string, string> = {
     devnet: '4F6PM96JJxngmHnZLBh9n58RH4aTVNWvDs2nuwrT5BP7',
+    mainnet: '2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH',
     'mainnet-beta': '2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH',
 };
 
 export const PYUSD: Record<string, string> = {
     devnet: 'CXk2AMBfi3TwaEL2468s6zP8xq9NxTXjp9gjMgzeUynM',
+    mainnet: '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',
     'mainnet-beta': '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',
 };
 
 export const CASH: Record<string, string> = {
+    mainnet: 'CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH',
     'mainnet-beta': 'CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH',
 };
 
@@ -49,29 +58,45 @@ export const STABLECOIN_TOKEN_PROGRAMS: Record<StablecoinSymbol, string> = {
 export const DEFAULT_RPC_URLS: Record<string, string> = {
     devnet: 'https://api.devnet.solana.com',
     localnet: 'http://localhost:8899',
+    mainnet: 'https://api.mainnet-beta.solana.com',
     'mainnet-beta': 'https://api.mainnet-beta.solana.com',
 };
 
-export function resolveStablecoinMint(currency: string, network = 'mainnet-beta'): string | undefined {
+/**
+ * Maintainer canonical for the mainnet slug is `mainnet`. The legacy
+ * `mainnet-beta` spelling is accepted as a backward-compatible alias
+ * and normalized to `mainnet`. Other networks pass through unchanged.
+ * Exposed so client helpers can compare and look up consistently.
+ */
+export function normalizeNetwork(network: string): string {
+    const lower = network.toLowerCase();
+    if (lower === 'mainnet' || lower === 'mainnet-beta') {
+        return 'mainnet';
+    }
+    return network;
+}
+
+export function resolveStablecoinMint(currency: string, network = 'mainnet'): string | undefined {
+    const key = normalizeNetwork(network);
     switch (currency.toUpperCase()) {
         case 'SOL':
             return undefined;
         case 'USDC':
-            return USDC[network] ?? USDC['mainnet-beta'];
+            return USDC[key] ?? USDC.mainnet;
         case 'USDT':
-            return USDT[network] ?? USDT['mainnet-beta'];
+            return USDT[key] ?? USDT.mainnet;
         case 'USDG':
-            return USDG[network] ?? USDG['mainnet-beta'];
+            return USDG[key] ?? USDG.mainnet;
         case 'PYUSD':
-            return PYUSD[network] ?? PYUSD['mainnet-beta'];
+            return PYUSD[key] ?? PYUSD.mainnet;
         case 'CASH':
-            return CASH[network] ?? CASH['mainnet-beta'];
+            return CASH[key] ?? CASH.mainnet;
         default:
             return currency;
     }
 }
 
-export function defaultTokenProgramForCurrency(currency: string | undefined, network = 'mainnet-beta'): string {
+export function defaultTokenProgramForCurrency(currency: string | undefined, network = 'mainnet'): string {
     const symbol = currency
         ? stablecoinSymbolForCurrency(resolveStablecoinMint(currency, network) ?? currency)
         : undefined;

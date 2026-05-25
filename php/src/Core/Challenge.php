@@ -108,7 +108,8 @@ final class Challenge
     }
 
     /**
-     * Return true when the challenge expiry is invalid or in the past.
+     * Return true when the challenge expiry is invalid or in the past
+     * (fail-closed). RFC 3339 parsing is delegated to {@see Rfc3339Parser}.
      */
     public function isExpired(?DateTimeImmutable $now = null): bool
     {
@@ -116,8 +117,8 @@ final class Challenge
             return false;
         }
 
-        $expiresAt = DateTimeImmutable::createFromFormat(DATE_ATOM, $this->expires);
-        if ($expiresAt === false) {
+        $expiresAt = Rfc3339Parser::parse($this->expires);
+        if ($expiresAt === null) {
             return true;
         }
 

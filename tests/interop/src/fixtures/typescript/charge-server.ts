@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { Mppx, solana } from "@solana/mpp/server";
+import { injectCanonicalCode } from "../../canonical-codes";
 import { readInteropEnvironment } from "./shared";
 
 function toWebRequest(request: http.IncomingMessage, body: string): Request {
@@ -39,22 +40,70 @@ async function main() {
   const feePayerSigner = await createKeyPairSignerFromBytes(
     environment.feePayerSecretKey,
   );
-  const mppx = Mppx.create({
-    secretKey: environment.secretKey,
-    methods: [
-      solana.charge({
-        recipient: environment.payTo,
-        currency: environment.mint,
-        decimals: 6,
-        network: environment.network,
-        rpcUrl: environment.rpcUrl,
-        signer: feePayerSigner,
-        splits: environment.splits,
-      }),
-    ],
-  });
+  const isSolNative = environment.assetKind === "sol";
+  const currency = isSolNative ? "sol" : environment.mint;
+  // G28a. `solana.charge({ splits })` validates split count at
+  // construction time and throws on > 8 entries. That one specific
+  // construct-time rejection is the correct 402-class outcome and
+  // gets surfaced as `challenge_unavailable` on protected requests.
+  // Other Mppx.create failures (bad signer, unsupported currency,
+  // env regressions) must crash the fixture so the harness sees a
+  // real error instead of a misleading 402 (Codex review of this
+  // PR). We allowlist by error message text rather than catching all.
+  // The exact return type of Mppx.create depends on the inferred
+  // methods tuple, which Typescript widens here. `unknown` plus a
+  // narrow cast at the call site is sufficient for the fixture.
+  let mppx: unknown;
+  let constructError: Error | undefined;
+  // B34 / push-mode: when the harness drives this server in push mode
+  // the route MUST NOT advertise a server-side fee payer. Omitting
+  // `signer` removes `feePayer/feePayerKey` from the challenge so the
+  // push verifier accepts the client-built, client-broadcast tx.
+  const pushMode = environment.paymentMode === "push";
+  try {
+    mppx = Mppx.create({
+      secretKey: environment.secretKey,
+      methods: [
+        solana.charge({
+          recipient: environment.payTo,
+          currency,
+          decimals: environment.decimals,
+          network: environment.network,
+          rpcUrl: environment.rpcUrl,
+          ...(pushMode ? {} : { signer: feePayerSigner }),
+          splits: environment.splits,
+        }),
+      ],
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/splits cannot exceed/i.test(message)) {
+      throw error;
+    }
+    constructError = error instanceof Error ? error : new Error(message);
+  }
+
+  // M1: capture the underlying SDK error message that mppx logs but
+  // strips from the wire response. The TS Mppx wraps any non-PaymentError
+  // thrown by `verify` into a generic `VerificationFailedError` (see
+  // mppx/src/server/Mppx.ts:425) and only emits `console.error('mppx:
+  // internal verification error', e)` with the original cause. Without
+  // this capture, the fixture cannot distinguish `signature_consumed`
+  // from `payment_invalid` on the 402 body the harness asserts on.
+  let lastInternalError: string | undefined;
+  const originalConsoleError = console.error.bind(console);
+  console.error = (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === "string" && first.includes("mppx: internal verification error")) {
+      const cause = args[1];
+      lastInternalError =
+        cause instanceof Error ? cause.message : String(cause ?? "");
+    }
+    originalConsoleError(...(args as []));
+  };
 
   const server = http.createServer(async (request, response) => {
+    lastInternalError = undefined;
     try {
       const chunks: Buffer[] = [];
       for await (const chunk of request) {
@@ -78,9 +127,37 @@ async function main() {
         return;
       }
 
-      const result = await mppx.charge({
+      if (!mppx || constructError) {
+        response.writeHead(402, { "content-type": "application/json" });
+        // G39: surface a canonical L6 code on every 402. The harness
+        // fault matrix asserts `responseBody.code` so the server fixture
+        // must always emit one, even on construct-time rejections.
+        response.end(
+          injectCanonicalCode(
+            JSON.stringify({
+              error: "challenge_unavailable",
+              message: constructError?.message ?? "mppx not initialized",
+            }),
+          ),
+        );
+        return;
+      }
+
+      const result = await (
+        mppx as {
+          charge: (params: {
+            amount: string;
+            currency: string;
+            description: string;
+          }) => (request: Request) => Promise<{
+            status: number;
+            challenge?: Response;
+            withReceipt: (response: Response) => Response;
+          }>;
+        }
+      ).charge({
         amount: amountForPath(url.pathname, environment),
-        currency: environment.mint,
+        currency,
         description: "Surfpool-backed protected content",
       })(toWebRequest(request, body));
 
@@ -90,7 +167,26 @@ async function main() {
           challenge.status,
           Object.fromEntries(challenge.headers),
         );
-        response.end(await challenge.text());
+        // G39: surface a canonical L6 code on every 402. The TS SDK
+        // emits free-text messages today; the fixture classifies them
+        // into canonical codes at the response boundary so the harness
+        // fault matrix has something to assert on.
+        const challengeBody = await challenge.text();
+        // M1: enrich the 402 body with the captured SDK-internal error
+        // message so injectCanonicalCode can classify replay-store hits
+        // and HMAC mismatches that mppx otherwise generalizes to
+        // "Payment verification failed."
+        let enriched = challengeBody;
+        if (lastInternalError) {
+          try {
+            const parsed = JSON.parse(challengeBody) as Record<string, unknown>;
+            parsed.message = lastInternalError;
+            enriched = JSON.stringify(parsed);
+          } catch {
+            // leave as-is
+          }
+        }
+        response.end(injectCanonicalCode(enriched));
         return;
       }
 
@@ -109,12 +205,27 @@ async function main() {
       response.writeHead(paid.status, Object.fromEntries(headers));
       response.end(await paid.text());
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // M1 cross-server portability / idempotent resubmit: the TS SDK
+      // surfaces replay-store hits and HMAC mismatches as thrown errors
+      // during settlement rather than as a structured 402. The harness
+      // expects a canonical 402 for these classes, so we translate any
+      // verification-class thrown error into the canonical 402 shape
+      // here and let injectCanonicalCode pick the snake_case code.
+      if (isVerificationClassError(message)) {
+        response.writeHead(402, { "content-type": "application/json" });
+        response.end(
+          injectCanonicalCode(
+            JSON.stringify({
+              error: "verification_failed",
+              message,
+            }),
+          ),
+        );
+        return;
+      }
       response.writeHead(500, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      response.end(JSON.stringify({ error: message }));
     }
   });
 
@@ -141,6 +252,26 @@ async function main() {
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+}
+
+function isVerificationClassError(message: string): boolean {
+  return (
+    /already consumed/i.test(message) ||
+    /signature already consumed/i.test(message) ||
+    /already been processed/i.test(message) ||
+    /transaction already processed/i.test(message) ||
+    /challenge verification failed/i.test(message) ||
+    /challenge id mismatch/i.test(message) ||
+    /not issued by this server/i.test(message) ||
+    /challenge expired/i.test(message) ||
+    /amount mismatch/i.test(message) ||
+    /currency mismatch/i.test(message) ||
+    /recipient mismatch/i.test(message) ||
+    /method details mismatch/i.test(message) ||
+    /credential method does not match/i.test(message) ||
+    /credential intent is not a charge/i.test(message) ||
+    /credential realm does not match/i.test(message)
+  );
 }
 
 function isProtectedPath(

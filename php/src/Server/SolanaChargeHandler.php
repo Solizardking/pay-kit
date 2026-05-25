@@ -7,7 +7,10 @@ namespace SolanaMpp\Server;
 use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
+use SolanaMpp\Core\Credential;
 use SolanaMpp\Intent\ChargeRequest;
+use SolanaMpp\Store\MemoryStore;
+use SolanaMpp\Store\Store;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Rpc\RpcClient;
 use SolanaPhpSdk\Transaction\Transaction;
@@ -29,7 +32,11 @@ use SolanaPhpSdk\Util\Base58;
  */
 final class SolanaChargeHandler
 {
+    private const REPLAY_KEY_PREFIX = 'solana-charge:consumed:';
+
     private readonly PaymentVerifier $verifier;
+    private readonly TransactionPayloadVerifier $transactionVerifier;
+    private readonly Store $replayStore;
 
     /**
      * @param ChargeServer $challenges Low-level challenge signing + credential
@@ -40,29 +47,44 @@ final class SolanaChargeHandler
      *        signature to the fee-payer slot before broadcast. Required for
      *        charge requests that advertise `methodDetails.feePayer = true`.
      * @param string $network Network identifier used for the Surfpool
-     *        blockhash sanity check. Defaults to `mainnet-beta`; set to
-     *        `localnet` when running against a Surfpool sandbox.
+     *        blockhash sanity check. Defaults to `mainnet`; the legacy
+     *        `mainnet-beta` spelling is also accepted. Set to `localnet`
+     *        when running against a Surfpool sandbox.
      * @param string $settlementHeader Name of the response header carrying
      *        the on-chain signature. The convention is
      *        `x-payment-settlement-signature`.
      * @param ?PaymentVerifier $verifier Override the default transaction
      *        verifier. Defaults to {@see SolanaChargeTransactionVerifier}.
+     * @param ?TransactionPayloadVerifier $transactionVerifier Override the
+     *        raw transaction verifier used after fetching push-mode
+     *        transactions by signature. Defaults to the same verifier
+     *        when it implements {@see TransactionPayloadVerifier}, otherwise
+     *        a fresh {@see SolanaChargeTransactionVerifier}.
      * @param int $confirmationAttempts How many times to poll
      *        `getSignatureStatuses` before giving up. 40 attempts at the
      *        default delay = 10 seconds.
      * @param int $confirmationDelayMicros Sleep between polls in microseconds.
+     * @param ?Store $replayStore Replay-protection store. Defaults to an
+     *        in-process {@see MemoryStore}; production deployments should
+     *        inject a shared atomic store (Redis, Postgres) so replay
+     *        protection survives restarts and worker pools.
      */
     public function __construct(
         private readonly ChargeServer $challenges,
         private readonly RpcClient $rpc,
         private readonly ?Keypair $feePayer = null,
-        private readonly string $network = 'mainnet-beta',
+        private readonly string $network = 'mainnet',
         private readonly string $settlementHeader = 'x-payment-settlement-signature',
         ?PaymentVerifier $verifier = null,
+        ?TransactionPayloadVerifier $transactionVerifier = null,
         private readonly int $confirmationAttempts = 40,
         private readonly int $confirmationDelayMicros = 250_000,
+        ?Store $replayStore = null,
     ) {
         $this->verifier = $verifier ?? new SolanaChargeTransactionVerifier();
+        $this->transactionVerifier = $transactionVerifier
+            ?? ($this->verifier instanceof TransactionPayloadVerifier ? $this->verifier : new SolanaChargeTransactionVerifier());
+        $this->replayStore = $replayStore ?? new MemoryStore();
     }
 
     /**
@@ -103,20 +125,8 @@ final class SolanaChargeHandler
             return $this->challenges->paymentRequiredResponse($request, 'verified result is missing credential or challenge');
         }
 
-        $transaction = $credential->payload['transaction'] ?? null;
-        if (!is_string($transaction) || $transaction === '') {
-            return $this->challenges->paymentRequiredResponse($request, 'missing transaction payload');
-        }
-
-        if ($this->isSurfpoolMismatch($transaction)) {
-            return $this->challenges->paymentRequiredResponse(
-                $request,
-                "Signed with a Surfpool localnet blockhash but the server expects {$this->network}.",
-            );
-        }
-
         try {
-            $signature = $this->settle($transaction);
+            $signature = $this->settleCredentialPayload($credential, $request);
         } catch (Throwable $error) {
             return $this->challenges->paymentRequiredResponse($request, $error->getMessage());
         }
@@ -141,8 +151,111 @@ final class SolanaChargeHandler
     }
 
     /**
-     * Co-sign (if a fee-payer is configured), broadcast, and wait for
-     * confirmation. Returns the on-chain signature.
+     * Dispatch on credential payload shape: pull mode (`type=transaction`,
+     * server broadcasts) or push mode (`type=signature`, client already
+     * broadcast on-chain).
+     *
+     * Push-mode B34: routes that advertise `methodDetails.feePayer = true`
+     * MUST NOT accept push credentials. A push credential references an
+     * already-landed transaction that the client has already paid the fee
+     * for, defeating the point of a server-funded charge. The B34 reject
+     * fires BEFORE any RPC call so a partially validated push credential
+     * never touches the network. Mirrors Rust `charge.rs::settle()`,
+     * Ruby `verifier.rb`, Lua `verify_signature`, and Python `_settle_push`.
+     */
+    private function settleCredentialPayload(Credential $credential, ChargeRequest $request): string
+    {
+        $methodDetails = is_array($request->methodDetails) ? $request->methodDetails : [];
+
+        $transaction = $credential->payload['transaction'] ?? null;
+        if (is_string($transaction) && $transaction !== '') {
+            if ($this->isSurfpoolMismatch($transaction)) {
+                throw new RuntimeException("Signed with a Surfpool localnet blockhash but the server expects {$this->network}.");
+            }
+            return $this->settle($transaction);
+        }
+
+        $signature = $credential->payload['signature'] ?? null;
+        if (!is_string($signature) || $signature === '') {
+            throw new InvalidArgumentException('missing transaction or signature payload');
+        }
+
+        if (($methodDetails['feePayer'] ?? false) === true) {
+            throw new RuntimeException('Push-mode credentials are not allowed when the route uses a server-side fee payer');
+        }
+
+        $transactionBase64 = $this->fetchSettledTransaction($signature);
+        $verification = $this->transactionVerifier->verifyTransactionPayload($transactionBase64, $request);
+        if (!$verification->ok) {
+            throw new RuntimeException($verification->reason);
+        }
+
+        // L8 push-mode ordering. Pull-mode broadcasts first then consumes
+        // between broadcast and await so a crashed await cannot double-pay
+        // on retry. Push-mode has no broadcast step (the client already
+        // broadcast and confirmed), so the on-chain artifact is fetched +
+        // verified first, then the signature is consumed. A replayed push
+        // credential trips the consume guard on the second attempt.
+        $this->consumeSignature($signature);
+        return $signature;
+    }
+
+    /**
+     * Fetch a confirmed transaction by signature and return its base64 wire
+     * form. Polls `getTransaction` (commitment=confirmed) up to
+     * `confirmationAttempts` times to ride out the brief gap between the
+     * client's `sendTransaction` accept and the cluster surfacing the
+     * settled transaction.
+     */
+    private function fetchSettledTransaction(string $signature): string
+    {
+        for ($attempt = 0; $attempt < $this->confirmationAttempts; $attempt += 1) {
+            /** @var mixed $transaction */
+            $transaction = $this->rpc->call('getTransaction', [
+                $signature,
+                [
+                    'encoding' => 'base64',
+                    'commitment' => 'confirmed',
+                    'maxSupportedTransactionVersion' => 0,
+                ],
+            ]);
+            if ($transaction === null) {
+                usleep($this->confirmationDelayMicros);
+                continue;
+            }
+            if (!is_array($transaction)) {
+                throw new RuntimeException('Invalid getTransaction response');
+            }
+            $meta = $transaction['meta'] ?? null;
+            if (!is_array($meta)) {
+                throw new RuntimeException('getTransaction response is missing transaction metadata');
+            }
+            if (($meta['err'] ?? null) !== null) {
+                throw new RuntimeException('Transaction ' . $signature . ' failed: ' . json_encode($meta['err'], JSON_THROW_ON_ERROR));
+            }
+            $wire = $transaction['transaction'] ?? null;
+            if (is_array($wire) && isset($wire[0]) && is_string($wire[0]) && $wire[0] !== '') {
+                return $wire[0];
+            }
+            if (is_string($wire) && $wire !== '') {
+                return $wire;
+            }
+            throw new RuntimeException('getTransaction response is missing base64 transaction data');
+        }
+
+        throw new RuntimeException("Timed out waiting for transaction $signature");
+    }
+
+    /**
+     * Co-sign (if a fee-payer is configured), broadcast, claim the signature
+     * in the replay store, then wait for confirmation. Returns the on-chain
+     * signature.
+     *
+     * `consumeSignature` is called between broadcast and confirmation
+     * polling on purpose. If the server crashes or the polling times out
+     * after `sendRawTransaction` accepted the transaction, the signature
+     * has already landed and must not be re-settled by a retry of the same
+     * credential. See PR #85 Greptile P1 and audit gap G05.
      */
     private function settle(string $transactionBase64): string
     {
@@ -171,8 +284,20 @@ final class SolanaChargeHandler
             'preflightCommitment' => 'confirmed',
         ]);
 
+        $this->consumeSignature($signature);
         $this->awaitConfirmation($signature);
         return $signature;
+    }
+
+    /**
+     * Reserve the signature in the replay store. Throws on replay attempts.
+     */
+    private function consumeSignature(string $signature): void
+    {
+        $key = self::REPLAY_KEY_PREFIX . $signature;
+        if (!$this->replayStore->putIfAbsent($key, true)) {
+            throw new RuntimeException("Transaction signature already consumed: $signature");
+        }
     }
 
     private function awaitConfirmation(string $signature): void

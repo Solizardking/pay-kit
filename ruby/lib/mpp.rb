@@ -2,10 +2,12 @@
 
 require_relative "mpp/version"
 require_relative "mpp/error"
+require_relative "mpp/error_codes"
 require_relative "mpp/expires"
 require_relative "mpp/store"
 require_relative "mpp/core/base64_url"
 require_relative "mpp/core/json"
+require_relative "mpp/core/rfc3339_parser"
 require_relative "mpp/core/challenge"
 require_relative "mpp/core/credential"
 require_relative "mpp/core/receipt"

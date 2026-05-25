@@ -36,14 +36,18 @@ function M.new(config)
   if secret_key == nil or secret_key == '' then
     error('missing secret key')
   end
+  local currency = config.currency or 'USDC'
+  -- Default decimals: SOL uses 9, every SPL stablecoin in our table uses 6.
+  -- Caller can still override explicitly.
+  local default_decimals = is_native_sol(currency) and 9 or 6
   local instance = {
     secret_key = secret_key,
     realm = config.realm or DEFAULT_REALM,
     recipient = config.recipient,
-    currency = config.currency or 'USDC',
-    decimals = config.decimals or 6,
-    network = config.network or 'mainnet-beta',
-    rpc_url = config.rpc_url or protocol.default_rpc_url(config.network or 'mainnet-beta'),
+    currency = currency,
+    decimals = config.decimals or default_decimals,
+    network = config.network or 'mainnet',
+    rpc_url = config.rpc_url or protocol.default_rpc_url(config.network or 'mainnet'),
     fee_payer = bool_or_nil(config.fee_payer),
     fee_payer_key = config.fee_payer_key,
     store = config.store or store.memory(),
@@ -195,7 +199,12 @@ function Server:_verify_challenge_and_decode(credential_value, now_epoch)
     error('missing or invalid payload type')
   end
   if payload_type == 'signature' and method_details.feePayer then
-    error('type="signature" credentials cannot be used with fee sponsorship')
+    -- B34: keep this message byte-identical to the verifier-layer B34
+    -- reject in solana_verify.lua so the canonical-codes classifier
+    -- and any text-based log monitor see the same string from either
+    -- layer. Divergence would force the classifier to learn two
+    -- patterns for the same condition.
+    error('Push-mode credentials are not allowed when the route uses a server-side fee payer')
   end
 
   return request, method_details, payload
@@ -252,9 +261,18 @@ function Server:_finalize_verification(credential_value, request, payload)
   end
 
   local replay_key = result.replay_key or (CONSUMED_PREFIX .. reference)
-  local inserted = self.store:put_if_absent(replay_key, true)
-  if not inserted then
-    error('payment already consumed')
+  -- L8 ordering: in pull mode, solana_verify.verify_transaction now
+  -- writes the consume marker between broadcast and await_confirmation
+  -- and signals back via result.consumed=true. Skip the outer
+  -- put_if_absent in that case so we do not double-consume our own
+  -- marker. In push mode (signature credentials) and any other path
+  -- where the verifier did not consume, fall back to the outer guard
+  -- so the L4 lock still applies.
+  if result.consumed ~= true then
+    local inserted = self.store:put_if_absent(replay_key, true)
+    if not inserted then
+      error('payment already consumed')
+    end
   end
 
   return challenge.new_receipt({

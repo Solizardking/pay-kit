@@ -166,4 +166,30 @@ function M.hmac_sha256_base64url(key, message)
   return base64url.encode(M.hmac_sha256(key, message))
 end
 
+-- Constant-time string equality. Always walks the full length to avoid
+-- leaking byte-by-byte timing information on HMAC challenge id verification.
+function M.constant_eq(a, b)
+  if type(a) ~= 'string' or type(b) ~= 'string' then
+    return false
+  end
+  local len_a = #a
+  local len_b = #b
+  -- XOR-fold over the expected (server-side) length so the loop count is
+  -- always controlled by the known reference, not by attacker-supplied
+  -- input. Fail-fast when the expected value is empty: two empty strings
+  -- are equal, anything else is not. This removes the timing leak that
+  -- would otherwise let an empty `a` make the loop depend on `len_b`.
+  if len_a == 0 then
+    return len_b == 0
+  end
+  local ref_len = len_a
+  local diff = bit.bxor(len_a, len_b)
+  for i = 1, ref_len do
+    local ai = a:byte(i) or 0
+    local bi = b:byte(((i - 1) % math.max(len_b, 1)) + 1) or 0
+    diff = bit.bor(diff, bit.bxor(ai, bi))
+  end
+  return diff == 0
+end
+
 return M

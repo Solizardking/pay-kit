@@ -108,7 +108,7 @@ t.test('verify credential rejects sponsored push mode', function()
   })
   t.assert_error(function()
     server:verify_credential(credential, 1770000000)
-  end, 'fee sponsorship')
+  end, 'server.side fee payer')
 end)
 
 t.test('verify credential requires verification callback', function()
@@ -132,34 +132,41 @@ t.test('verify credential accepts transaction payload when lua verifier hooks ar
     currency = 'sol',
     decimals = 9,
     secret_key = 'test-secret',
-    verifier_hooks = {
-      send_transaction = function(transaction)
-        t.assert_equal(transaction, 'deadbeef')
-        return 'sig-transaction'
-      end,
-      await_transaction = function(signature)
-        t.assert_equal(signature, 'sig-transaction')
-        return {
-          meta = { err = nil },
-          transaction = {
-            message = {
-              instructions = {
-                {
-                  program = 'system',
-                  parsed = {
-                    type = 'transfer',
-                    info = {
-                      destination = '3yGpUKnU5HSVSMxye83YuseTeSQykiS5N4eh6iQn1d2h',
-                      lamports = '1000000000',
-                    },
+    verifier_hooks = (function()
+      local pull_tx = {
+        meta = { err = nil },
+        transaction = {
+          message = {
+            instructions = {
+              {
+                program = 'system',
+                parsed = {
+                  type = 'transfer',
+                  info = {
+                    destination = '3yGpUKnU5HSVSMxye83YuseTeSQykiS5N4eh6iQn1d2h',
+                    lamports = '1000000000',
                   },
                 },
               },
             },
           },
-        }
-      end,
-    },
+        },
+      }
+      return {
+        parse_transaction = function(transaction)
+          t.assert_equal(transaction, 'deadbeef')
+          return pull_tx.transaction
+        end,
+        send_transaction = function(transaction)
+          t.assert_equal(transaction, 'deadbeef')
+          return 'sig-transaction'
+        end,
+        await_transaction = function(signature)
+          t.assert_equal(signature, 'sig-transaction')
+          return pull_tx
+        end,
+      }
+    end)(),
   })
   local challenge = server:charge('1')
   local credential = mpp.NewPaymentCredential(challenge:to_echo(), {

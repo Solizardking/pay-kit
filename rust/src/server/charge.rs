@@ -97,7 +97,7 @@ impl Default for Config {
             recipient: String::new(),
             currency: "USDC".to_string(),
             decimals: 6,
-            network: "mainnet-beta".to_string(),
+            network: "mainnet".to_string(),
             rpc_url: None,
             secret_key: None,
             realm: None,
@@ -531,18 +531,55 @@ impl Mpp {
             })?
             .unwrap_or_default();
 
-        // Settle — pull or push mode.
+        // Settle, with the consume_signature reservation sitting between
+        // broadcast and confirmation polling. If the server crashes or the
+        // poll loop times out after the transaction has already landed,
+        // the signature is still reserved so a retry of the same credential
+        // cannot trigger a second broadcast. See PR #85 Greptile P1 and
+        // audit gap G05.
         let signature_str = match payload {
             CredentialPayload::Transaction { ref transaction } => {
-                self.verify_pull(transaction, request, &method_details)
-                    .await?
+                let signature = self
+                    .broadcast_pull(transaction, request, &method_details)
+                    .await?;
+                self.consume_signature(&signature).await?;
+                self.await_pull_confirmation(&signature)?;
+                signature
             }
             CredentialPayload::Signature { ref signature } => {
-                self.verify_push(signature, request, &method_details)?
+                // B34: reject push-mode credentials (`type=signature`) on
+                // routes that require a server-side fee payer. A signature-
+                // only credential references an already-landed transaction
+                // that the client has paid the fee for, defeating the
+                // purpose of a server-funded charge. Reject before any RPC
+                // call so a partially-validated push credential never
+                // touches the network. Ludo's spec lock; mirrors PHP #100
+                // and Python #106.
+                if method_details.fee_payer.unwrap_or(false) {
+                    return Err(VerificationError::credential_mismatch(
+                        "Push-mode credentials are not allowed when the route uses a server-side fee payer",
+                    ));
+                }
+                let signature_str = self.verify_push(signature, request, &method_details)?;
+                self.consume_signature(&signature_str).await?;
+                signature_str
             }
         };
 
-        // Replay protection (atomic check-and-consume).
+        Ok(Receipt::success(
+            METHOD_NAME,
+            &signature_str,
+            credential.challenge.id.clone(),
+        ))
+    }
+
+    // ── Settlement ──
+
+    /// Reserve the settlement signature in the replay store. Returns an
+    /// error if the same signature has already been consumed by an earlier
+    /// successful settlement (replay attack) or an earlier broadcast whose
+    /// confirmation poll timed out (split-brain double-pay window).
+    async fn consume_signature(&self, signature_str: &str) -> Result<(), VerificationError> {
         let consumed_key = format!("solana-charge:consumed:{signature_str}");
         let inserted = self
             .store
@@ -554,18 +591,14 @@ impl Mpp {
                 "Transaction signature already consumed",
             ));
         }
-
-        Ok(Receipt::success(
-            METHOD_NAME,
-            &signature_str,
-            credential.challenge.id.clone(),
-        ))
+        Ok(())
     }
 
-    // ── Settlement ──
-
-    /// Pull mode: deserialize tx, optionally co-sign, simulate, broadcast, verify.
-    async fn verify_pull(
+    /// Pull mode: deserialize tx, optionally co-sign, simulate, broadcast.
+    /// Returns the signature once the broadcast is accepted. Confirmation
+    /// polling lives in `await_pull_confirmation` so the caller can reserve
+    /// the signature in the replay store between broadcast and poll.
+    async fn broadcast_pull(
         &self,
         transaction_b64: &str,
         request: &ChargeRequest,
@@ -711,29 +744,40 @@ impl Mpp {
         }
         tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "simulate", "verify_pull");
 
-        // Broadcast and wait for Confirmed commitment (not Finalized).
+        // Broadcast. Confirmation polling moved into await_pull_confirmation
+        // so the caller can reserve the signature in the replay store
+        // between broadcast acceptance and confirmation polling.
         let signature = self
             .rpc
             .send_transaction(&tx)
             .map_err(|e| VerificationError::network_error(format!("Broadcast failed: {e}")))?;
-        tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "send", "verify_pull");
+        tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "send", "broadcast_pull");
+        Ok(signature.to_string())
+    }
 
-        // Poll for confirmed status (typically ~400ms on devnet/surfnet).
+    /// Poll for `Confirmed` commitment on a signature that broadcast_pull
+    /// already accepted. Surfpool typically confirms within a single tick;
+    /// a real RPC may need up to ~32 slots (~12 seconds).
+    fn await_pull_confirmation(&self, signature_str: &str) -> Result<(), VerificationError> {
         use solana_commitment_config::CommitmentConfig;
+        use std::str::FromStr;
+        let signature = Signature::from_str(signature_str).map_err(|e| {
+            VerificationError::invalid_payload(format!("Invalid settlement signature: {e}"))
+        })?;
         let commitment = CommitmentConfig::confirmed();
+        let t0 = std::time::Instant::now();
         for _ in 0..30 {
             match self
                 .rpc
                 .confirm_transaction_with_commitment(&signature, commitment)
             {
                 Ok(resp) if resp.value => {
-                    tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "confirmed", "verify_pull");
-                    return Ok(signature.to_string());
+                    tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "confirmed", "await_pull_confirmation");
+                    return Ok(());
                 }
                 _ => std::thread::sleep(std::time::Duration::from_millis(200)),
             }
         }
-
         Err(VerificationError::network_error(
             "Transaction not confirmed within timeout".to_string(),
         ))
@@ -4075,6 +4119,87 @@ mod tests {
         let err = mpp.verify_credential(&cred).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
         assert!(err.message.contains("intent"), "got: {err:?}");
+    }
+
+    // ── B34: push-mode credentials rejected on fee-payer routes ──
+    //
+    // A signature-only credential references an already-landed transaction
+    // that the client paid the fee for. A route that uses a server-side fee
+    // payer expects the server to fund the transaction; accepting a push
+    // credential there means the route paid no fee, defeating the purpose
+    // of a server-funded charge. The reject runs before any RPC call so a
+    // partially-validated push credential never touches the network.
+    //
+    // Ludo's spec lock. Mirrors PHP #100 and Python #106.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b34_rejects_push_credential_on_fee_payer_route() {
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            secret_key: Some(TEST_SECRET.to_string()),
+            currency: crate::protocol::solana::mints::USDC_DEVNET.to_string(),
+            fee_payer: true,
+            fee_payer_signer: Some(test_fee_payer_signer()),
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({
+                "type": "signature",
+                "signature": "3yZe7d2X1bxYjP6kJtNJzC8mFqLgK6vQ9zR3hT5wXdAfVjY8nW1qB4uHpM2sC3rTzJtNeWfDqRmKxYjP6kJtNJzC",
+            }),
+        };
+
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
+        assert_eq!(err.code, Some("malformed-credential"));
+        assert!(
+            err.message
+                .to_lowercase()
+                .contains("push-mode credentials are not allowed"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b34_accepts_pull_credential_on_fee_payer_route() {
+        // Sanity check: the B34 reject is gated on the credential type, not
+        // on fee_payer alone. A pull-mode (transaction) credential against
+        // the same fee-payer route must still reach the broadcast path.
+        // We do not drive broadcast here, only assert the early reject does
+        // not fire: any error must come from broadcast, not from B34.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            secret_key: Some(TEST_SECRET.to_string()),
+            currency: crate::protocol::solana::mints::USDC_DEVNET.to_string(),
+            fee_payer: true,
+            fee_payer_signer: Some(test_fee_payer_signer()),
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({
+                "type": "transaction",
+                "transaction": "AAAA",
+            }),
+        };
+
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
+        assert!(
+            !err.message
+                .to_lowercase()
+                .contains("push-mode credentials are not allowed"),
+            "B34 fired on a pull credential: {err:?}"
+        );
     }
 
     // ── Replay protection tests ──

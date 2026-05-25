@@ -17,9 +17,50 @@ import { runClient, startServer, stopServer } from "../src/process";
 type RunningServer = Awaited<ReturnType<typeof startServer>>;
 
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SYSTEM_PROGRAM = "11111111111111111111111111111111";
 const MINT_ACCOUNT_SIZE = 82;
+const SOL_NATIVE_DECIMALS = 9;
+const DEFAULT_SPL_DECIMALS = 6;
+const CLIENT_SOL_FUND_LAMPORTS = 5_000_000_000;
+
+function tokenProgramAddress(
+  variant: "TOKEN_PROGRAM" | "TOKEN_2022_PROGRAM" | undefined,
+): string {
+  return variant === "TOKEN_2022_PROGRAM" ? TOKEN_2022_PROGRAM : TOKEN_PROGRAM;
+}
+
+// The on-chain mint pubkey for a scenario. In pubkey mode this is just
+// `scenario.asset`. In symbol mode the harness sends a stablecoin symbol
+// to adapters and the on-chain mint is `scenario.expectedMint` (the
+// pubkey each SDK's resolver is expected to return). For SOL-native
+// scenarios there is no mint at all.
+function onChainMintFor(scenario: InteropScenario): string | null {
+  if (isSolNative(scenario)) {
+    return null;
+  }
+  if (scenario.currencyMode === "symbol") {
+    if (!scenario.expectedMint) {
+      throw new Error(
+        `Scenario ${scenario.id} uses symbol mode but does not set expectedMint`,
+      );
+    }
+    return scenario.expectedMint;
+  }
+  return scenario.asset;
+}
+
+function isSolNative(scenario: InteropScenario): boolean {
+  return scenario.assetKind === "sol";
+}
+
+function scenarioDecimals(scenario: InteropScenario): number {
+  if (typeof scenario.decimals === "number") {
+    return scenario.decimals;
+  }
+  return isSolNative(scenario) ? SOL_NATIVE_DECIMALS : DEFAULT_SPL_DECIMALS;
+}
 
 const runningServers: RunningServer[] = [];
 
@@ -53,10 +94,11 @@ async function getTokenBalance(
   surfnet: Surfnet,
   owner: string,
   mint: string,
+  tokenProgram: string,
   missingAsZero = false,
 ): Promise<bigint> {
   const rpc = createSolanaRpc(surfnet.rpcUrl);
-  const ata = surfnet.getAta(owner, mint);
+  const ata = surfnet.getAta(owner, mint, tokenProgram);
   try {
     const response = await rpc.getTokenAccountBalance(ata as never).send();
     return BigInt(response.value.amount);
@@ -66,6 +108,36 @@ async function getTokenBalance(
     }
     throw error;
   }
+}
+
+async function getLamportBalance(
+  surfnet: Surfnet,
+  owner: string,
+): Promise<bigint> {
+  const rpc = createSolanaRpc(surfnet.rpcUrl);
+  const response = await rpc.getBalance(owner as never).send();
+  return BigInt(response.value);
+}
+
+// Balance helper that dispatches on scenario asset kind. For SPL
+// scenarios it reads the recipient ATA token balance; for SOL-native
+// scenarios it reads recipient lamports.
+async function getPrimaryRecipientBalance(
+  surfnet: Surfnet,
+  scenario: InteropScenario,
+  owner: string,
+  mint: string | null,
+  tokenProgram: string,
+): Promise<bigint> {
+  if (isSolNative(scenario)) {
+    return await getLamportBalance(surfnet, owner);
+  }
+  if (!mint) {
+    throw new Error(
+      `Scenario ${scenario.id} has no on-chain mint but is not SOL-native`,
+    );
+  }
+  return await getTokenBalance(surfnet, owner, mint, tokenProgram);
 }
 
 function createSplMintAccountData(decimals: number): Uint8Array {
@@ -99,18 +171,92 @@ beforeAll(async () => {
   const payTo = Surfnet.newKeypair();
   const platform = Surfnet.newKeypair();
 
-  surfnet.setAccount(
-    baseScenario.asset,
-    1_461_600,
-    createSplMintAccountData(6),
-    TOKEN_PROGRAM,
-  );
-  surfnet.fundToken(client.publicKey, baseScenario.asset, 100_000);
-  surfnet.fundToken(payTo.publicKey, baseScenario.asset, 1);
+  // Deploy every mint referenced by an active SPL scenario under the
+  // right token program with the right decimals byte. SOL-native
+  // scenarios contribute lamport funding instead. Symbol-mode
+  // scenarios deploy at `expectedMint`, not at the literal asset
+  // string. Conflicting tokenProgram or decimals for the same mint
+  // pubkey across scenarios is an authoring bug.
+  type MintConfig = {
+    variant: "TOKEN_PROGRAM" | "TOKEN_2022_PROGRAM";
+    decimals: number;
+  };
+  const uniqueMints = new Map<string, MintConfig>();
+  let needsSolFunding = false;
+  for (const scenario of activeScenarios) {
+    // Push-mode scenarios make the client pay its own fee on-chain, so
+    // the client wallet must be pre-funded with lamports even for SPL
+    // payments. SOL-native scenarios already trigger funding below.
+    if (scenario.paymentMode === "push") {
+      needsSolFunding = true;
+    }
+    if (isSolNative(scenario)) {
+      needsSolFunding = true;
+      continue;
+    }
+    const variant = scenario.tokenProgram ?? "TOKEN_PROGRAM";
+    const decimals = scenarioDecimals(scenario);
+    const mintPubkey = onChainMintFor(scenario);
+    if (!mintPubkey) {
+      continue;
+    }
+    const existing = uniqueMints.get(mintPubkey);
+    if (existing && existing.variant !== variant) {
+      throw new Error(
+        `Conflicting tokenProgram for mint ${mintPubkey}: ${existing.variant} vs ${variant} (scenario ${scenario.id})`,
+      );
+    }
+    if (existing && existing.decimals !== decimals) {
+      throw new Error(
+        `Conflicting decimals for mint ${mintPubkey}: ${existing.decimals} vs ${decimals} (scenario ${scenario.id})`,
+      );
+    }
+    uniqueMints.set(mintPubkey, { variant, decimals });
+  }
+  for (const [mintPubkey, config] of uniqueMints) {
+    const programAddress = tokenProgramAddress(config.variant);
+    surfnet.setAccount(
+      mintPubkey,
+      1_461_600,
+      createSplMintAccountData(config.decimals),
+      programAddress,
+    );
+    surfnet.fundToken(client.publicKey, mintPubkey, 100_000, programAddress);
+    surfnet.fundToken(payTo.publicKey, mintPubkey, 1, programAddress);
+  }
 
   splitRecipients = {
     platform: platform.publicKey,
   };
+
+  // G13. Pre-create the platform recipient's ATA for any scenario that
+  // requests it. `fundToken` with zero amount is the lowest-friction
+  // way to call the underlying surfnet cheatcode without changing the
+  // settled token balance the test asserts against.
+  for (const scenario of activeScenarios) {
+    if (!scenario.preCreatePlatformAta) {
+      continue;
+    }
+    const mintPubkey = onChainMintFor(scenario);
+    if (!mintPubkey) {
+      throw new Error(
+        `Scenario ${scenario.id} requested preCreatePlatformAta but has no on-chain mint`,
+      );
+    }
+    const variant = scenario.tokenProgram ?? "TOKEN_PROGRAM";
+    surfnet.fundToken(
+      platform.publicKey,
+      mintPubkey,
+      0,
+      tokenProgramAddress(variant),
+    );
+  }
+
+  // G27. SOL-native scenarios need the client wallet pre-funded with
+  // lamports so the system transfer can succeed.
+  if (needsSolFunding) {
+    surfnet.fundSol(client.publicKey, CLIENT_SOL_FUND_LAMPORTS);
+  }
 
   interopEnv = {
     MPP_INTEROP_RPC_URL: surfnet.rpcUrl,
@@ -145,6 +291,15 @@ describe("mpp interop", () => {
   const socketAwareIt = socketSupport ? it : it.skip;
 
   for (const scenario of activeScenarios) {
+    // M1: cross-server portability and idempotent-resubmit scenarios
+    // run in a dedicated block below; skip them here so the standard
+    // pair-iteration does not try to drive them with the wrong runner.
+    if (
+      scenario.kind === "cross-server-portability" ||
+      scenario.kind === "idempotent-resubmit"
+    ) {
+      continue;
+    }
     const scenarioServers = activeServers.filter(
       (implementation) =>
         !scenario.serverIds || scenario.serverIds.includes(implementation.id),
@@ -166,15 +321,24 @@ describe("mpp interop", () => {
             }
 
             const scenarioEnv = environmentForScenario(interopEnv, scenario);
-            const initialBalance = await getTokenBalance(
+            const scenarioTokenProgram = tokenProgramAddress(scenario.tokenProgram);
+            // On-chain mint pubkey (resolved expectedMint in symbol mode,
+            // literal asset in pubkey mode, or null for SOL-native). The
+            // literal in scenarioEnv goes to the adapter so the SDK's
+            // resolver is exercised end-to-end.
+            const onChainMint = onChainMintFor(scenario);
+            const initialBalance = await getPrimaryRecipientBalance(
               surfnet,
+              scenario,
               scenarioEnv.MPP_INTEROP_PAY_TO,
-              scenarioEnv.MPP_INTEROP_MINT,
+              onChainMint,
+              scenarioTokenProgram,
             );
             const initialSplitBalances = await splitBalances(
               surfnet,
               scenario,
-              scenarioEnv.MPP_INTEROP_MINT,
+              onChainMint,
+              scenarioTokenProgram,
               true,
             );
 
@@ -188,16 +352,22 @@ describe("mpp interop", () => {
               scenarioEnv,
             );
 
-            const finalBalance = await getTokenBalance(
+            const finalBalance = await getPrimaryRecipientBalance(
               surfnet,
+              scenario,
               scenarioEnv.MPP_INTEROP_PAY_TO,
-              scenarioEnv.MPP_INTEROP_MINT,
+              onChainMint,
+              scenarioTokenProgram,
             );
             const finalSplitBalances = await splitBalances(
               surfnet,
               scenario,
-              scenarioEnv.MPP_INTEROP_MINT,
-              false,
+              onChainMint,
+              scenarioTokenProgram,
+              // For 402 scenarios the recipient ATA may never have
+              // been created on-chain; treat missing as zero so the
+              // delta assertion below still holds.
+              scenario.expectedStatus === 402,
             );
 
             expect(result.status, JSON.stringify(result, null, 2)).toBe(
@@ -226,10 +396,141 @@ describe("mpp interop", () => {
               ).toEqual(expectedSplitDeltas(scenario));
             } else {
               expect(result.ok, JSON.stringify(result, null, 2)).toBe(false);
+              // Lamport balances are always accessible (unlike SPL token
+              // accounts, which can be missing when a 402 fires before
+              // any ATA creation), so assert zero delta for SOL-native
+              // 402s too. Catches a future SOL-native scenario that
+              // accidentally triggers a transfer despite returning 402.
               expect(finalBalance - initialBalance).toBe(0n);
               expect(
                 splitDeltas(initialSplitBalances, finalSplitBalances),
               ).toEqual(expectedZeroSplitDeltas(scenario));
+              // G39 fault matrix: every server SDK must emit the same
+              // canonical L6 structured code for the same failure class.
+              // Only asserted when the scenario declares an expectedCode
+              // so adapters that have not yet shipped L6 emission do not
+              // trip the matrix. Once an adapter ships L6 emission, its
+              // server id is added to the scenario's serverIds list and
+              // the matrix locks in the cross-SDK agreement.
+              if (scenario.expectedCode) {
+                const body = result.responseBody as
+                  | { code?: string }
+                  | undefined;
+                expect(
+                  body?.code,
+                  `G39: server ${serverImplementation.id} did not emit canonical code on 402 for scenario ${scenario.id}. Got body: ${JSON.stringify(result.responseBody)}`,
+                ).toBe(scenario.expectedCode);
+              }
+            }
+          },
+        );
+      }
+    }
+  }
+
+  // M1 cross-server credential portability + same-server idempotent
+  // resubmit. These run outside the per-pair matrix because they
+  // either need two distinct servers (portability) or assert a 402
+  // canonical reject on a credential that was already settled
+  // (idempotent). Only the TypeScript client adapter implements the
+  // raw capture/re-submit flow today, so other clients are gated out.
+  const crossServerScenarios = activeScenarios.filter(
+    (scenario) => scenario.kind === "cross-server-portability",
+  );
+  const idempotentScenarios = activeScenarios.filter(
+    (scenario) => scenario.kind === "idempotent-resubmit",
+  );
+
+  for (const scenario of crossServerScenarios) {
+    const pairs = scenario.crossServerPairs ?? [];
+    const eligibleClients = activeClients.filter(
+      (implementation) =>
+        !scenario.clientIds || scenario.clientIds.includes(implementation.id),
+    );
+    for (const [aId, bId] of pairs) {
+      const serverA = activeServers.find((impl) => impl.id === aId);
+      const serverB = activeServers.find((impl) => impl.id === bId);
+      if (!serverA || !serverB) {
+        continue;
+      }
+      for (const clientImplementation of eligibleClients) {
+        socketAwareIt(
+          `${scenario.id}: ${clientImplementation.id} client, A=${aId} B=${bId}`,
+          async () => {
+            if (!surfnet || !interopEnv) {
+              throw new Error("Surfpool interop environment was not initialized");
+            }
+            const envA = environmentForScenario(interopEnv, scenario);
+            const envB = {
+              ...environmentForScenario(interopEnv, scenario),
+              MPP_INTEROP_SECRET_KEY: "mpp-interop-secret-key-server-b",
+            };
+            const a = await startServer(serverA, envA);
+            runningServers.push(a);
+            const b = await startServer(serverB, envB);
+            runningServers.push(b);
+            const aUrl = `http://127.0.0.1:${a.ready.port}${scenario.resourcePath}`;
+            const bUrl = `http://127.0.0.1:${b.ready.port}${scenario.resourcePath}`;
+            const result = await runClient(clientImplementation, aUrl, {
+              ...envA,
+              MPP_INTEROP_RESUBMIT_URL: bUrl,
+            });
+            const resultPayload = JSON.stringify(result, null, 2);
+            const firstStatus = (result as unknown as { firstStatus?: number })
+              .firstStatus;
+            expect(firstStatus, `first hop must succeed: ${resultPayload}`).toBe(
+              200,
+            );
+            expect(result.status, resultPayload).toBe(scenario.expectedStatus);
+            if (scenario.expectedCode) {
+              const body = result.responseBody as { code?: string } | undefined;
+              expect(
+                body?.code,
+                `server B=${bId} did not emit canonical code; body: ${JSON.stringify(result.responseBody)}`,
+              ).toBe(scenario.expectedCode);
+            }
+          },
+        );
+      }
+    }
+  }
+
+  for (const scenario of idempotentScenarios) {
+    const eligibleServers = activeServers.filter(
+      (impl) => !scenario.serverIds || scenario.serverIds.includes(impl.id),
+    );
+    const eligibleClients = activeClients.filter(
+      (impl) => !scenario.clientIds || scenario.clientIds.includes(impl.id),
+    );
+    for (const serverImplementation of eligibleServers) {
+      for (const clientImplementation of eligibleClients) {
+        socketAwareIt(
+          `${scenario.id}: ${clientImplementation.id} client pays ${serverImplementation.id} server twice`,
+          async () => {
+            if (!surfnet || !interopEnv) {
+              throw new Error("Surfpool interop environment was not initialized");
+            }
+            const env = environmentForScenario(interopEnv, scenario);
+            const server = await startServer(serverImplementation, env);
+            runningServers.push(server);
+            const url = `http://127.0.0.1:${server.ready.port}${scenario.resourcePath}`;
+            const result = await runClient(clientImplementation, url, {
+              ...env,
+              MPP_INTEROP_RESUBMIT_URL: url,
+            });
+            const resultPayload = JSON.stringify(result, null, 2);
+            const firstStatus = (result as unknown as { firstStatus?: number })
+              .firstStatus;
+            expect(firstStatus, `first pay must succeed: ${resultPayload}`).toBe(
+              200,
+            );
+            expect(result.status, resultPayload).toBe(scenario.expectedStatus);
+            if (scenario.expectedCode) {
+              const body = result.responseBody as { code?: string } | undefined;
+              expect(
+                body?.code,
+                `server ${serverImplementation.id} did not emit canonical code on resubmit; body: ${JSON.stringify(result.responseBody)}`,
+              ).toBe(scenario.expectedCode);
             }
           },
         );
@@ -242,12 +543,16 @@ function environmentForScenario(
   baseEnv: Record<string, string>,
   scenario: InteropScenario,
 ): Record<string, string> {
-  return {
+  const env: Record<string, string> = {
     ...baseEnv,
     MPP_INTEROP_AMOUNT: scenario.amount,
+    MPP_INTEROP_MINT: scenario.asset,
     MPP_INTEROP_NETWORK: scenario.network,
+    MPP_INTEROP_PAYMENT_MODE: scenario.paymentMode ?? "pull",
     MPP_INTEROP_PRICE: scenario.price,
     MPP_INTEROP_RESOURCE_PATH: scenario.resourcePath,
+    MPP_INTEROP_DECIMALS: String(scenarioDecimals(scenario)),
+    MPP_INTEROP_ASSET_KIND: isSolNative(scenario) ? "sol" : "spl",
     ...(scenario.replaySource
       ? {
           MPP_INTEROP_REPLAY_SOURCE_AMOUNT: scenario.replaySource.amount,
@@ -267,6 +572,13 @@ function environmentForScenario(
       })),
     ),
   };
+  if (typeof scenario.clientComputeUnitLimit === "number") {
+    env.MPP_INTEROP_COMPUTE_UNIT_LIMIT = String(scenario.clientComputeUnitLimit);
+  }
+  if (typeof scenario.clientComputeUnitPrice === "string") {
+    env.MPP_INTEROP_COMPUTE_UNIT_PRICE = scenario.clientComputeUnitPrice;
+  }
+  return env;
 }
 
 async function expectSettledTransactionShape(
@@ -286,33 +598,60 @@ async function expectSettledTransactionShape(
   const message = decodeTransactionMessage(transaction);
   expect(message.addressTableLookups ?? []).toHaveLength(0);
 
+  // G27. SOL-native scenarios expect a System Program transfer, not
+  // SPL transferChecked. The system transfer discriminator is u32 LE
+  // = 2 in the first 4 bytes of the instruction data, followed by a
+  // u64 LE lamports amount.
+  if (isSolNative(scenario)) {
+    expectSystemProgramTransfer(message, {
+      destination: scenarioEnv.MPP_INTEROP_PAY_TO,
+      amount: primaryDelta(scenario),
+    });
+    return;
+  }
+
   const matchedInstructions = new Set<number>();
   const expectedTransferCount = 1 + (scenario.splits?.length ?? 0);
   const primaryAmount = primaryDelta(scenario);
+  const tokenProgram = tokenProgramAddress(scenario.tokenProgram);
+  const onChainMint = onChainMintFor(scenario);
+  if (!onChainMint) {
+    throw new Error(
+      `Scenario ${scenario.id} is not SOL-native but resolves to no on-chain mint`,
+    );
+  }
+  const decimals = scenarioDecimals(scenario);
   expectSplTransferChecked(
     message,
     {
       destination: surfnet.getAta(
         scenarioEnv.MPP_INTEROP_PAY_TO,
-        scenarioEnv.MPP_INTEROP_MINT,
+        onChainMint,
+        tokenProgram,
       ),
-      mint: scenarioEnv.MPP_INTEROP_MINT,
+      mint: onChainMint,
       amount: primaryAmount,
-      decimals: 6,
+      decimals,
+      tokenProgram,
     },
     matchedInstructions,
   );
 
   for (const split of scenario.splits ?? []) {
     const recipient = splitRecipients[split.recipientKey];
-    const destination = surfnet.getAta(recipient, scenarioEnv.MPP_INTEROP_MINT);
+    const destination = surfnet.getAta(
+      recipient,
+      onChainMint,
+      tokenProgram,
+    );
     expectSplTransferChecked(
       message,
       {
         destination,
-        mint: scenarioEnv.MPP_INTEROP_MINT,
+        mint: onChainMint,
         amount: BigInt(split.amount),
-        decimals: 6,
+        decimals,
+        tokenProgram,
       },
       matchedInstructions,
     );
@@ -321,7 +660,8 @@ async function expectSettledTransactionShape(
       expectIdempotentAtaCreation(message, {
         ata: destination,
         owner: recipient,
-        mint: scenarioEnv.MPP_INTEROP_MINT,
+        mint: onChainMint,
+        tokenProgram,
       });
     }
 
@@ -330,7 +670,48 @@ async function expectSettledTransactionShape(
     }
   }
 
-  expectTransferCheckedCount(message, scenarioEnv.MPP_INTEROP_MINT, expectedTransferCount);
+  expectTransferCheckedCount(
+    message,
+    onChainMint,
+    expectedTransferCount,
+    tokenProgram,
+  );
+}
+
+function expectSystemProgramTransfer(
+  message: CompiledMessage,
+  expected: { destination: string; amount: bigint },
+): void {
+  const match = message.instructions.find((instruction) => {
+    if (
+      accountAt(message, instruction.programAddressIndex) !== SYSTEM_PROGRAM
+    ) {
+      return false;
+    }
+    // System Program transfer discriminator (4-byte u32 LE = 2),
+    // followed by a u64 LE lamports value (8 bytes). Total 12 bytes.
+    if (instruction.data.length < 12) {
+      return false;
+    }
+    const view = new DataView(
+      instruction.data.buffer,
+      instruction.data.byteOffset,
+      instruction.data.byteLength,
+    );
+    if (view.getUint32(0, true) !== 2) {
+      return false;
+    }
+    if (instruction.accountIndices.length < 2) {
+      return false;
+    }
+    const destination = accountAt(message, instruction.accountIndices[1]);
+    const amount = view.getBigUint64(4, true);
+    return destination === expected.destination && amount === expected.amount;
+  });
+  expect(
+    match,
+    `missing system transfer destination=${expected.destination} amount=${expected.amount}`,
+  ).toBeDefined();
 }
 
 async function fetchTransactionBase64(
@@ -390,6 +771,7 @@ function expectSplTransferChecked(
     mint: string;
     amount: bigint;
     decimals: number;
+    tokenProgram: string;
   },
   matchedInstructions: Set<number>,
 ): void {
@@ -397,7 +779,9 @@ function expectSplTransferChecked(
     if (matchedInstructions.has(index)) {
       return false;
     }
-    if (accountAt(message, instruction.programAddressIndex) !== TOKEN_PROGRAM) {
+    if (
+      accountAt(message, instruction.programAddressIndex) !== expected.tokenProgram
+    ) {
       return false;
     }
     if (instruction.data[0] !== 12) {
@@ -430,6 +814,7 @@ function expectIdempotentAtaCreation(
     ata: string;
     owner: string;
     mint: string;
+    tokenProgram: string;
   },
 ): void {
   const match = message.instructions.find((instruction) => {
@@ -444,7 +829,7 @@ function expectIdempotentAtaCreation(
       accountAt(message, instruction.accountIndices[2]) === expected.owner &&
       accountAt(message, instruction.accountIndices[3]) === expected.mint &&
       accountAt(message, instruction.accountIndices[4]) === SYSTEM_PROGRAM &&
-      accountAt(message, instruction.accountIndices[5]) === TOKEN_PROGRAM
+      accountAt(message, instruction.accountIndices[5]) === expected.tokenProgram
     );
   });
 
@@ -458,9 +843,10 @@ function expectTransferCheckedCount(
   message: CompiledMessage,
   mint: string,
   expectedCount: number,
+  tokenProgram: string,
 ): void {
   const transfers = message.instructions.filter((instruction) => {
-    if (accountAt(message, instruction.programAddressIndex) !== TOKEN_PROGRAM) {
+    if (accountAt(message, instruction.programAddressIndex) !== tokenProgram) {
       return false;
     }
     if (instruction.data[0] !== 12 || instruction.accountIndices.length < 4) {
@@ -507,16 +893,27 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 async function splitBalances(
   surfnet: Surfnet,
   scenario: InteropScenario,
-  mint: string,
+  mint: string | null,
+  tokenProgram: string,
   missingAsZero: boolean,
 ): Promise<Record<string, bigint>> {
   const balances: Record<string, bigint> = {};
   for (const split of scenario.splits ?? []) {
     const recipient = splitRecipients[split.recipientKey];
+    if (isSolNative(scenario)) {
+      balances[split.recipientKey] = await getLamportBalance(surfnet, recipient);
+      continue;
+    }
+    if (!mint) {
+      throw new Error(
+        `Scenario ${scenario.id} has splits but no on-chain mint`,
+      );
+    }
     balances[split.recipientKey] = await getTokenBalance(
       surfnet,
       recipient,
       mint,
+      tokenProgram,
       missingAsZero,
     );
   }

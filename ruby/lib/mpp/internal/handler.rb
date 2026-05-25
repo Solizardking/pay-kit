@@ -30,14 +30,22 @@ module Mpp
       end
 
       # Process one HTTP request and return a response object.
+      #
+      # The settlement order is: broadcast (pull) or fetch (push), then
+      # consume_signature, then await_confirmation (pull only). The consume
+      # call sits between broadcast and confirmation polling on purpose so
+      # that a confirmation timeout or server crash after the transaction has
+      # already landed on chain cannot be replayed against the same
+      # credential. See PR #85 Greptile P1 and audit gap G05.
       def handle(authorization, request)
         return @challenges.payment_required_response(request) if authorization.nil? || authorization.empty?
 
         result = @challenges.verify_authorization_header(authorization, verifier: @verifier, expected_request: request)
-        return @challenges.payment_required_response(request, reason: result.reason) unless result.ok?
+        return @challenges.payment_required_response(request, reason: result.reason, code: result.code) unless result.ok?
 
         signature = settle_payload(result.credential, request)
         consume_signature(signature)
+        await_settlement(result.credential, signature)
         receipt = @challenges.create_receipt_header(challenge: result.challenge, reference: signature, external_id: request.external_id)
         Settlement.new(
           signature: signature,
@@ -48,7 +56,8 @@ module Mpp
           }
         )
       rescue ArgumentError, Error => error
-        @challenges.payment_required_response(request, reason: error.message)
+        code = error.respond_to?(:code) ? error.code : nil
+        @challenges.payment_required_response(request, reason: error.message, code: code)
       end
 
       private
@@ -75,9 +84,16 @@ module Mpp
         simulation = simulate_transaction_with_retry(signed_base64)
         raise VerificationError, "Simulation failed: #{simulation["err"].inspect}" unless simulation["err"].nil?
 
-        signature = @rpc.send_raw_transaction(signed_base64)
+        @rpc.send_raw_transaction(signed_base64)
+      end
+
+      # await_confirmation only runs on the pull path; push mode already
+      # fetched a confirmed transaction in settle_payload.
+      def await_settlement(credential, signature)
+        transaction = credential.payload["transaction"]
+        return unless transaction.is_a?(String) && !transaction.empty?
+
         await_confirmation(signature)
-        signature
       end
 
       def fetch_settled_transaction(signature)
@@ -125,14 +141,14 @@ module Mpp
       def consume_signature(signature)
         key = "solana-charge:consumed:#{signature}"
         inserted = @replay_store.put_if_absent(key, true)
-        raise VerificationError, "Transaction signature already consumed" unless inserted
+        raise VerificationError.new("Transaction signature already consumed", code: ErrorCodes::CODE_SIGNATURE_CONSUMED) unless inserted
       end
 
       def check_network_blockhash(blockhash)
         return unless blockhash.start_with?(SURFPOOL_BLOCKHASH_PREFIX)
         return if network == "localnet"
 
-        raise VerificationError, "Signed against localnet but the server expects #{network}. Switch your client RPC to #{network} and re-sign."
+        raise VerificationError.new("Signed against localnet but the server expects #{network}. Switch your client RPC to #{network} and re-sign.", code: ErrorCodes::CODE_WRONG_NETWORK)
       end
     end
   end

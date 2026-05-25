@@ -6,6 +6,8 @@ if ENV["COVERAGE"] == "1"
   SimpleCov.start do
     add_filter "/test/"
     add_filter "/examples/"
+    # Cross-SDK baseline target is 90 percent branch coverage. Line
+    # coverage stays at 92 since the suite already exceeds that.
     minimum_coverage line: 92, branch: 90
   end
 end

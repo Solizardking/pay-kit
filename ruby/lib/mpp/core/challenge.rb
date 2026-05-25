@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "date"
 require "openssl"
 require "time"
 
@@ -74,13 +75,15 @@ module Mpp
         secure_compare(expected, id)
       end
 
-      # Return true if the challenge is expired or has an invalid timestamp.
+      # Return true if the challenge is expired or has an invalid timestamp
+      # (fail-closed). RFC 3339 parsing is delegated to {Rfc3339Parser}.
       def expired?(now: Time.now.utc)
         return false if expires.nil?
 
-        Time.iso8601(expires) <= now
-      rescue ArgumentError
-        true
+        parsed = Rfc3339Parser.parse(expires)
+        return true if parsed.nil?
+
+        parsed <= now
       end
 
       # Decode the base64url canonical JSON request.
