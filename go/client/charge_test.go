@@ -7,9 +7,9 @@ import (
 
 	solana "github.com/gagliardetto/solana-go"
 
-	"github.com/solana-foundation/pay-kit/go"
-	"github.com/solana-foundation/pay-kit/go/internal/solanautil"
+	mpp "github.com/solana-foundation/pay-kit/go"
 	"github.com/solana-foundation/pay-kit/go/internal/testutil"
+	"github.com/solana-foundation/pay-kit/go/internal/utils"
 	"github.com/solana-foundation/pay-kit/go/protocol"
 )
 
@@ -46,7 +46,7 @@ func TestBuildChargeTransactionSOLPull(t *testing.T) {
 	if payload.Type != "transaction" || payload.Transaction == "" {
 		t.Fatalf("unexpected payload: %#v", payload)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestBuildChargeTransactionSOLWithExternalIDMemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestBuildChargeTransactionWithFeePayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -141,12 +141,53 @@ func TestBuildChargeTransactionTokenPull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
-	if len(tx.Message.Instructions) != 4 {
-		t.Fatalf("expected 4 instructions, got %d", len(tx.Message.Instructions))
+	if len(tx.Message.Instructions) != 3 {
+		t.Fatalf("expected 3 instructions, got %d", len(tx.Message.Instructions))
+	}
+}
+
+// TestBuildChargeTransactionTokenCreateRecipientATAFlag table-tests the
+// opt-in CreateRecipientATA flag. The default (false) matches the
+// canonical Rust/TS clients which leave primary-recipient ATA creation
+// to the server, while setting the flag prepends an idempotent
+// createAssociatedTokenAccount instruction for first-run wallets that
+// do not yet hold a token account for the selected mint.
+func TestBuildChargeTransactionTokenCreateRecipientATAFlag(t *testing.T) {
+	mint := testutil.NewPrivateKey().PublicKey()
+	cases := []struct {
+		name             string
+		createRecipient  bool
+		wantInstructions int
+	}{
+		{name: "default_skips_primary_ata", createRecipient: false, wantInstructions: 3},
+		{name: "opt_in_adds_primary_ata", createRecipient: true, wantInstructions: 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcClient := testutil.NewFakeRPC()
+			rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
+			signer := testutil.NewPrivateKey()
+			recipient := testutil.NewPrivateKey().PublicKey().String()
+			decimals := uint8(6)
+
+			payload, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient, protocol.MethodDetails{
+				Decimals: &decimals,
+			}, BuildOptions{CreateRecipientATA: tc.createRecipient})
+			if err != nil {
+				t.Fatalf("build failed: %v", err)
+			}
+			tx, err := utils.DecodeTransactionBase64(payload.Transaction)
+			if err != nil {
+				t.Fatalf("decode failed: %v", err)
+			}
+			if len(tx.Message.Instructions) != tc.wantInstructions {
+				t.Fatalf("instructions = %d, want %d", len(tx.Message.Instructions), tc.wantInstructions)
+			}
+		})
 	}
 }
 
@@ -164,7 +205,7 @@ func TestBuildChargeTransactionTokenWithExternalIDMemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -189,7 +230,7 @@ func TestBuildChargeTransactionSOLWithSplits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -288,13 +329,13 @@ func TestBuildChargeTransactionTokenWithSplits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
-	// 2 compute budget + 2 (create ATA + transfer) for primary + 2 for split + 1 split memo = 7
-	if len(tx.Message.Instructions) != 7 {
-		t.Fatalf("expected 7 instructions, got %d", len(tx.Message.Instructions))
+	// 2 compute budget + 1 primary transfer + 2 split instructions + 1 split memo = 6
+	if len(tx.Message.Instructions) != 6 {
+		t.Fatalf("expected 6 instructions, got %d", len(tx.Message.Instructions))
 	}
 	if !hasMemoText(memoTexts(t, tx), "platform fee") {
 		t.Fatalf("expected split memo instruction")
@@ -319,7 +360,7 @@ func TestBuildChargeTransactionTokenWithFeePayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
@@ -448,5 +489,55 @@ func TestBuildCredentialHeaderWithOptions(t *testing.T) {
 	}
 	if header == "" {
 		t.Fatal("expected non-empty header")
+	}
+}
+
+func TestBuildChargeTransactionTokenRejectsInvalidFeePayerKey(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	signer := testutil.NewPrivateKey()
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	mint := testutil.NewPrivateKey().PublicKey()
+	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
+	decimals := uint8(6)
+	enabled := true
+
+	_, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient, protocol.MethodDetails{
+		Decimals:    &decimals,
+		FeePayer:    &enabled,
+		FeePayerKey: "not-a-pubkey",
+	}, BuildOptions{})
+	if err == nil {
+		t.Fatal("expected invalid fee payer key to fail")
+	}
+}
+
+func TestBuildChargeTransactionRejectsUnsupportedTokenProgramHint(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	signer := testutil.NewPrivateKey()
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	mint := testutil.NewPrivateKey().PublicKey()
+	decimals := uint8(6)
+
+	if _, err := BuildChargeTransaction(context.Background(), signer, rpcClient, "1000", mint.String(), recipient, protocol.MethodDetails{
+		Decimals:     &decimals,
+		TokenProgram: protocol.SystemProgram,
+	}, BuildOptions{}); err == nil {
+		t.Fatal("expected unsupported token program hint to fail")
+	}
+}
+
+func TestBuildCredentialHeaderRejectsInvalidMethodDetails(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	signer := testutil.NewPrivateKey()
+	challengeRequest, _ := mpp.NewBase64URLJSONValue(map[string]any{
+		"amount":        "1000",
+		"currency":      "sol",
+		"recipient":     testutil.NewPrivateKey().PublicKey().String(),
+		"methodDetails": map[string]any{"decimals": "not-a-number"},
+	})
+	challenge := mpp.NewChallengeWithSecret("secret", "realm", "solana", "charge", challengeRequest)
+
+	if _, err := BuildCredentialHeader(context.Background(), signer, rpcClient, challenge); err == nil {
+		t.Fatal("expected invalid methodDetails to fail")
 	}
 }

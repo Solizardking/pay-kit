@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -48,7 +49,17 @@ func NewBase64URLJSONValue(value any) (Base64URLJSON, error) {
 	if err != nil {
 		return Base64URLJSON{}, err
 	}
-	return Base64URLJSON{raw: Base64URLEncode(raw)}, nil
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var canonicalValue any
+	if err := decoder.Decode(&canonicalValue); err != nil {
+		return Base64URLJSON{}, err
+	}
+	canonicalRaw, err := json.Marshal(canonicalValue)
+	if err != nil {
+		return Base64URLJSON{}, err
+	}
+	return Base64URLJSON{raw: Base64URLEncode(canonicalRaw)}, nil
 }
 
 // Raw returns the raw base64url value.
@@ -75,10 +86,13 @@ func (b Base64URLJSON) DecodeValue() (map[string]any, error) {
 	return out, nil
 }
 
+// MarshalJSON emits the embedded base64url-encoded JSON string so the
+// outer document keeps the canonical wire form.
 func (b Base64URLJSON) MarshalJSON() ([]byte, error) {
 	return json.Marshal(b.raw)
 }
 
+// UnmarshalJSON reads a base64url-encoded JSON string into the value.
 func (b *Base64URLJSON) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &b.raw)
 }

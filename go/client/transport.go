@@ -2,20 +2,19 @@ package client
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"net/http"
 
 	mpp "github.com/solana-foundation/pay-kit/go"
-	"github.com/solana-foundation/pay-kit/go/internal/solanautil"
+	"github.com/solana-foundation/pay-kit/go/internal/utils"
 )
 
 // PaymentTransport wraps an http.RoundTripper and transparently handles
 // HTTP 402 challenges by building a payment credential and retrying.
 type PaymentTransport struct {
 	Base    http.RoundTripper
-	Signer  solanautil.Signer
-	RPC     solanautil.RPCClient
+	Signer  utils.Signer
+	RPC     utils.RPCClient
 	Options *BuildOptions
 }
 
@@ -45,7 +44,7 @@ func (t *PaymentTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if err != nil {
 			return nil, err
 		}
-		req.Body.Close()
+		_ = req.Body.Close()
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
@@ -63,22 +62,25 @@ func (t *PaymentTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return resp, nil
 	}
 
-	challenge := challenges[0]
-
-	ctx := req.Context()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	authHeader, err := BuildCredentialHeaderWithOptions(ctx, t.Signer, t.RPC, challenge, t.buildOptions())
-	if err != nil {
-		// Cannot build credential — return original 402.
+	challenge, ok := selectChargeChallenge(challenges)
+	if !ok {
 		return resp, nil
 	}
 
+	// req.Context() is documented to never return nil for a server-prepared
+	// or client-built request, so propagate it directly. Never substitute
+	// context.Background() here, which would break cancellation/deadline.
+	authHeader, err := BuildCredentialHeaderWithOptions(req.Context(), t.Signer, t.RPC, challenge, t.buildOptions())
+	if err != nil {
+		// Cannot build credential: return the original 402 response so the
+		// caller still sees the server's challenge headers. The credential
+		// build failure is recoverable from the caller's perspective.
+		return resp, nil //nolint:nilerr // intentional fallback to original 402
+	}
+
 	// Drain and close the first response body before retrying.
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 
 	// Clone the request for retry.
 	retry := req.Clone(req.Context())
@@ -91,8 +93,21 @@ func (t *PaymentTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return t.base().RoundTrip(retry)
 }
 
+func selectChargeChallenge(challenges []mpp.PaymentChallenge) (mpp.PaymentChallenge, bool) {
+	for _, challenge := range challenges {
+		if isSupportedChargeChallenge(challenge) {
+			return challenge, true
+		}
+	}
+	return mpp.PaymentChallenge{}, false
+}
+
+func isSupportedChargeChallenge(challenge mpp.PaymentChallenge) bool {
+	return challenge.Method == mpp.NewMethodName("solana") && challenge.Intent.IsCharge()
+}
+
 // NewClient creates an *http.Client with automatic 402 payment handling.
-func NewClient(signer solanautil.Signer, rpc solanautil.RPCClient, opts ...func(*PaymentTransport)) *http.Client {
+func NewClient(signer utils.Signer, rpc utils.RPCClient, opts ...func(*PaymentTransport)) *http.Client {
 	transport := &PaymentTransport{
 		Signer: signer,
 		RPC:    rpc,

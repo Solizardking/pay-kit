@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/solana-foundation/pay-kit/go"
+	mpp "github.com/solana-foundation/pay-kit/go"
 	"github.com/solana-foundation/pay-kit/go/internal/testutil"
 	"github.com/solana-foundation/pay-kit/go/protocol/intents"
 )
@@ -267,5 +267,53 @@ func TestRequestRoundTrip(t *testing.T) {
 	raw2, _ := json.Marshal(out)
 	if string(raw1) != string(raw2) {
 		t.Fatalf("json mismatch: %s vs %s", raw1, raw2)
+	}
+}
+
+func TestVerifyCredentialWithExpectedRejectsCurrencyMismatchAssertsCode(t *testing.T) {
+	handler, _, _ := newTestMpp(t)
+	challenge, err := handler.Charge(context.Background(), "0.001")
+	if err != nil {
+		t.Fatalf("charge: %v", err)
+	}
+	cred := signatureCredentialFromEcho(t, challenge.ToEcho())
+
+	var expected intents.ChargeRequest
+	if decErr := challenge.Request.Decode(&expected); decErr != nil {
+		t.Fatalf("decode: %v", decErr)
+	}
+	expected.Currency = "USDC"
+
+	_, err = handler.VerifyCredentialWithExpected(context.Background(), cred, expected)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "currency") {
+		t.Fatalf("expected currency mismatch, got: %v", err)
+	}
+	var paymentErr *mpp.Error
+	if !mppErrAs(err, &paymentErr) || paymentErr.Code != mpp.ErrCodeChallengeRouteMismatch {
+		t.Fatalf("expected challenge-route-mismatch mpp error, got %T: %v", err, err)
+	}
+}
+
+func TestVerifyCredentialWithExpectedRejectsRecipientMismatchAssertsCode(t *testing.T) {
+	handler, _, _ := newTestMpp(t)
+	challenge, err := handler.Charge(context.Background(), "0.001")
+	if err != nil {
+		t.Fatalf("charge: %v", err)
+	}
+	cred := signatureCredentialFromEcho(t, challenge.ToEcho())
+
+	var expected intents.ChargeRequest
+	if decErr := challenge.Request.Decode(&expected); decErr != nil {
+		t.Fatalf("decode: %v", decErr)
+	}
+	expected.Recipient = testutil.NewPrivateKey().PublicKey().String()
+
+	_, err = handler.VerifyCredentialWithExpected(context.Background(), cred, expected)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "recipient") {
+		t.Fatalf("expected recipient mismatch, got: %v", err)
+	}
+	var paymentErr *mpp.Error
+	if !mppErrAs(err, &paymentErr) || paymentErr.Code != mpp.ErrCodeRecipientMismatch {
+		t.Fatalf("expected recipient-mismatch mpp error, got %T: %v", err, err)
 	}
 }

@@ -14,8 +14,8 @@ import (
 	token2022 "github.com/gagliardetto/solana-go/programs/token-2022"
 	"github.com/gagliardetto/solana-go/rpc"
 
-	"github.com/solana-foundation/pay-kit/go"
-	"github.com/solana-foundation/pay-kit/go/internal/solanautil"
+	mpp "github.com/solana-foundation/pay-kit/go"
+	"github.com/solana-foundation/pay-kit/go/internal/utils"
 	"github.com/solana-foundation/pay-kit/go/protocol"
 	"github.com/solana-foundation/pay-kit/go/protocol/intents"
 )
@@ -24,7 +24,24 @@ const (
 	defaultRealm    = "MPP Payment"
 	secretKeyEnvVar = "MPP_SECRET_KEY"
 	consumedPrefix  = "solana-charge:consumed:"
+
+	// maxSplits caps the number of secondary recipients per charge.
+	// Matches the limit enforced by every other server SDK (see the
+	// rust reference in rust/src/server/charge.rs and the typescript
+	// fixture in typescript/packages/mpp/src/server/Charge.ts).
+	maxSplits = 8
+
+	// Compute budget caps mirror the Rust reference and the TypeScript
+	// server fixture. A credential whose transaction sets a compute unit
+	// limit or microlamport price above these caps is rejected before
+	// broadcast so the on-chain settlement cannot be steered into a
+	// pathological resource footprint.
+	maxComputeUnitLimit              uint32 = 200_000
+	maxComputeUnitPriceMicroLamports uint64 = 5_000_000
 )
+
+// computeBudgetProgramID is the on-chain ID of the ComputeBudget program.
+var computeBudgetProgramID = solana.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111")
 
 // Config controls server-side challenge generation and credential verification.
 type Config struct {
@@ -36,9 +53,9 @@ type Config struct {
 	SecretKey      string
 	Realm          string
 	HTML           bool
-	FeePayerSigner solanautil.Signer
+	FeePayerSigner utils.Signer
 	Store          mpp.Store
-	RPC            solanautil.RPCClient
+	RPC            utils.RPCClient
 }
 
 // ChargeOptions customize challenge generation.
@@ -53,7 +70,7 @@ type ChargeOptions struct {
 
 // Mpp is the server-side Solana charge handler.
 type Mpp struct {
-	rpc            solanautil.RPCClient
+	rpc            utils.RPCClient
 	secretKey      string
 	realm          string
 	recipient      solana.PublicKey
@@ -62,7 +79,7 @@ type Mpp struct {
 	network        string
 	rpcURL         string
 	html           bool
-	feePayerSigner solanautil.Signer
+	feePayerSigner utils.Signer
 	store          mpp.Store
 }
 
@@ -224,7 +241,7 @@ func (m *Mpp) VerifyCredentialWithExpected(
 	}
 	if credRequest.Currency != expected.Currency {
 		return mpp.Receipt{}, mpp.NewError(
-			mpp.ErrCodeChallengeMismatch,
+			mpp.ErrCodeChallengeRouteMismatch,
 			fmt.Sprintf("currency mismatch: credential has %s but endpoint expects %s",
 				credRequest.Currency, expected.Currency),
 		)
@@ -295,21 +312,21 @@ func (m *Mpp) verifyChallengeAndDecode(
 func (m *Mpp) verifyPinnedFields(credential mpp.PaymentCredential, request intents.ChargeRequest) error {
 	const methodName = "solana"
 	if string(credential.Challenge.Method) != methodName {
-		return mpp.NewError(mpp.ErrCodeChallengeMismatch,
+		return mpp.NewError(mpp.ErrCodeChallengeRouteMismatch,
 			fmt.Sprintf("credential method %q does not match this server (expected %q)",
 				credential.Challenge.Method, methodName))
 	}
 	if !credential.Challenge.Intent.IsCharge() {
-		return mpp.NewError(mpp.ErrCodeChallengeMismatch,
+		return mpp.NewError(mpp.ErrCodeChallengeRouteMismatch,
 			fmt.Sprintf("credential intent %q is not a charge", credential.Challenge.Intent))
 	}
 	if credential.Challenge.Realm != m.realm {
-		return mpp.NewError(mpp.ErrCodeChallengeMismatch,
+		return mpp.NewError(mpp.ErrCodeChallengeRouteMismatch,
 			fmt.Sprintf("credential realm %q does not match this server (expected %q)",
 				credential.Challenge.Realm, m.realm))
 	}
 	if request.Currency != m.currency {
-		return mpp.NewError(mpp.ErrCodeChallengeMismatch,
+		return mpp.NewError(mpp.ErrCodeChallengeRouteMismatch,
 			fmt.Sprintf("credential currency %q does not match this server (expected %q)",
 				request.Currency, m.currency))
 	}
@@ -365,8 +382,14 @@ func (m *Mpp) verifyTransaction(
 	if payload.Transaction == "" {
 		return mpp.Receipt{}, mpp.NewError(mpp.ErrCodeMissingTransaction, "missing transaction data in credential payload")
 	}
-	tx, err := solanautil.DecodeTransactionBase64(payload.Transaction)
+	if err := validateSplitsCount(details.Splits); err != nil {
+		return mpp.Receipt{}, err
+	}
+	tx, err := utils.DecodeTransactionBase64(payload.Transaction)
 	if err != nil {
+		return mpp.Receipt{}, err
+	}
+	if err := validateComputeBudgetInstructions(tx); err != nil {
 		return mpp.Receipt{}, err
 	}
 	// Reject up-front if the client signed against the wrong network
@@ -376,8 +399,22 @@ func (m *Mpp) verifyTransaction(
 	if err := CheckNetworkBlockhash(m.network, tx.Message.RecentBlockhash.String()); err != nil {
 		return mpp.Receipt{}, err
 	}
+	// Verify the transaction's transfer instructions BEFORE the server co-signs
+	// or broadcasts. The on-chain `verifyOnChain` check still runs after
+	// confirmation as defense-in-depth, but inspecting the decoded instructions
+	// up-front prevents a malformed or tampered credential from spending the
+	// fee payer's lamports on a doomed broadcast. Mirrors the Rust reference
+	// (`verify_versioned_transaction_pre_broadcast` in
+	// rust/src/server/charge.rs).
+	amount, err := request.ParseAmount()
+	if err != nil {
+		return mpp.Receipt{}, err
+	}
+	if err := verifyTransfersAgainstChallenge(tx, amount, request.Currency, m.recipient, request.ExternalID, details); err != nil {
+		return mpp.Receipt{}, err
+	}
 	if m.feePayerSigner != nil {
-		if err := solanautil.SignTransaction(tx, m.feePayerSigner); err != nil {
+		if err := utils.SignTransaction(tx, m.feePayerSigner); err != nil {
 			return mpp.Receipt{}, err
 		}
 	}
@@ -395,17 +432,19 @@ func (m *Mpp) verifyTransaction(
 	cleanupConsumed := true
 	defer func() {
 		if cleanupConsumed {
-			_ = m.store.Delete(context.Background(), consumedKey)
+			// Detach cancellation but keep trace/values so rollback still
+			// runs when the caller's context is already canceled.
+			_ = m.store.Delete(context.WithoutCancel(ctx), consumedKey)
 		}
 	}()
-	if err := solanautil.SimulateTransaction(ctx, m.rpc, tx); err != nil {
+	if err := utils.SimulateTransaction(ctx, m.rpc, tx); err != nil {
 		return mpp.Receipt{}, mpp.WrapError(mpp.ErrCodeSimulationFailed, "simulate transaction", err)
 	}
-	signature, err := solanautil.SendTransaction(ctx, m.rpc, tx)
+	signature, err := utils.SendTransaction(ctx, m.rpc, tx)
 	if err != nil {
 		return mpp.Receipt{}, mpp.WrapError(mpp.ErrCodeRPC, "send transaction", err)
 	}
-	if err := solanautil.WaitForConfirmation(ctx, m.rpc, signature); err != nil {
+	if err := utils.WaitForConfirmation(ctx, m.rpc, signature); err != nil {
 		return mpp.Receipt{}, mpp.WrapError(mpp.ErrCodeTransactionFailed, "confirm transaction", err)
 	}
 	if err := m.verifyOnChain(ctx, signature, request, details); err != nil {
@@ -434,18 +473,18 @@ func (m *Mpp) verifySignature(
 	}
 	signature, err := solana.SignatureFromBase58(payload.Signature)
 	if err != nil {
-		_ = m.store.Delete(context.Background(), consumedPrefix+payload.Signature)
+		_ = m.store.Delete(context.WithoutCancel(ctx), consumedPrefix+payload.Signature)
 		return mpp.Receipt{}, err
 	}
 	if err := m.verifyOnChain(ctx, signature, request, details); err != nil {
-		_ = m.store.Delete(context.Background(), consumedPrefix+payload.Signature)
+		_ = m.store.Delete(context.WithoutCancel(ctx), consumedPrefix+payload.Signature)
 		return mpp.Receipt{}, err
 	}
 	return successReceipt(payload.Signature, credential.Challenge.ID, request.ExternalID), nil
 }
 
 func (m *Mpp) verifyOnChain(ctx context.Context, signature solana.Signature, request intents.ChargeRequest, details protocol.MethodDetails) error {
-	tx, meta, err := solanautil.FetchTransaction(ctx, m.rpc, signature)
+	tx, meta, err := utils.FetchTransaction(ctx, m.rpc, signature)
 	if err != nil {
 		return mpp.WrapError(mpp.ErrCodeTransactionNotFound, "transaction not found or not yet confirmed", err)
 	}
@@ -472,7 +511,10 @@ func verifyTransfersAgainstChallenge(tx *solana.Transaction, amount uint64, curr
 				if matched[index] {
 					continue
 				}
-				programID := tx.Message.AccountKeys[compiled.ProgramIDIndex]
+				programID, err := resolveProgramID(tx, compiled.ProgramIDIndex)
+				if err != nil {
+					return err
+				}
 				if !programID.Equals(solana.SystemProgramID) {
 					continue
 				}
@@ -517,7 +559,7 @@ func verifyTransfersAgainstChallenge(tx *solana.Transaction, amount uint64, curr
 	}
 	tokenExpected := make([]tokenExpectation, 0, len(expected))
 	for _, want := range expected {
-		ata, err := solanautil.FindAssociatedTokenAddressWithProgram(want.recipient, mint, expectedProgram)
+		ata, err := utils.FindAssociatedTokenAddressWithProgram(want.recipient, mint, expectedProgram)
 		if err != nil {
 			return err
 		}
@@ -533,7 +575,10 @@ func verifyTransfersAgainstChallenge(tx *solana.Transaction, amount uint64, curr
 			if matched[index] {
 				continue
 			}
-			programID := tx.Message.AccountKeys[compiled.ProgramIDIndex]
+			programID, err := resolveProgramID(tx, compiled.ProgramIDIndex)
+			if err != nil {
+				return err
+			}
 			if !programID.Equals(expectedProgram) {
 				continue
 			}
@@ -613,7 +658,10 @@ func verifyMemoInstructions(tx *solana.Transaction, matched []bool, externalID s
 			if matched[index] {
 				continue
 			}
-			programID := tx.Message.AccountKeys[compiled.ProgramIDIndex]
+			programID, err := resolveProgramID(tx, compiled.ProgramIDIndex)
+			if err != nil {
+				return err
+			}
 			if !programID.Equals(memoProgram) {
 				continue
 			}
@@ -632,7 +680,10 @@ func verifyMemoInstructions(tx *solana.Transaction, matched []bool, externalID s
 		if matched[index] {
 			continue
 		}
-		programID := tx.Message.AccountKeys[compiled.ProgramIDIndex]
+		programID, err := resolveProgramID(tx, compiled.ProgramIDIndex)
+		if err != nil {
+			return err
+		}
 		if programID.Equals(memoProgram) {
 			return mpp.NewError(mpp.ErrCodeInvalidPayload, "unexpected Memo Program instruction in payment transaction")
 		}
@@ -646,7 +697,7 @@ type expectedTransfer struct {
 }
 
 func buildExpectedTransfers(amount uint64, recipient solana.PublicKey, details protocol.MethodDetails) ([]expectedTransfer, error) {
-	primaryAmount, err := solanautil.SplitAmounts(amount, details.Splits)
+	primaryAmount, err := utils.SplitAmounts(amount, details.Splits)
 	if err != nil {
 		return nil, err
 	}
@@ -681,4 +732,106 @@ func successReceipt(reference, challengeID, externalID string) mpp.Receipt {
 
 func isNativeSOL(currency string) bool {
 	return strings.EqualFold(currency, "sol")
+}
+
+// resolveProgramID safely resolves the program account for a compiled
+// instruction. Attacker-controlled credential transactions on the pull
+// path may carry a ProgramIDIndex that points outside AccountKeys; the
+// raw indexing operation panics in that case, so verification helpers
+// must use this guard and surface a structured 402 payment_invalid
+// rejection instead of crashing the request handler.
+func resolveProgramID(tx *solana.Transaction, programIDIndex uint16) (solana.PublicKey, error) {
+	idx := int(programIDIndex)
+	if idx < 0 || idx >= len(tx.Message.AccountKeys) {
+		return solana.PublicKey{}, mpp.NewError(
+			mpp.ErrCodeInvalidPayload,
+			fmt.Sprintf("instruction program index %d is out of range for %d account keys",
+				programIDIndex, len(tx.Message.AccountKeys)),
+		)
+	}
+	return tx.Message.AccountKeys[idx], nil
+}
+
+// validateComputeBudgetInstructions inspects every ComputeBudget program
+// instruction in the credential transaction and rejects ones that exceed
+// the unit-limit or microlamport-price caps. The wire format follows the
+// on-chain ComputeBudget program:
+//
+//   - discriminator 2 + u32 LE => SetComputeUnitLimit
+//   - discriminator 3 + u64 LE => SetComputeUnitPrice
+//
+// Matches rust/src/server/charge.rs validate_compute_budget_instruction.
+func validateComputeBudgetInstructions(tx *solana.Transaction) error {
+	for _, ix := range tx.Message.Instructions {
+		programID, err := resolveProgramID(tx, ix.ProgramIDIndex)
+		if err != nil {
+			return err
+		}
+		if !programID.Equals(computeBudgetProgramID) {
+			continue
+		}
+		if len(ix.Accounts) != 0 {
+			return mpp.NewError(
+				mpp.ErrCodeComputeBudgetExceeded,
+				"compute budget instruction must not have accounts",
+			)
+		}
+		data := []byte(ix.Data)
+		if len(data) == 0 {
+			return mpp.NewError(
+				mpp.ErrCodeComputeBudgetExceeded,
+				"unsupported compute budget instruction: empty data",
+			)
+		}
+		switch data[0] {
+		case 2:
+			if len(data) != 5 {
+				return mpp.NewError(
+					mpp.ErrCodeComputeBudgetExceeded,
+					fmt.Sprintf("compute unit limit instruction has %d data bytes, expected 5", len(data)),
+				)
+			}
+			units := uint32(data[1]) | uint32(data[2])<<8 | uint32(data[3])<<16 | uint32(data[4])<<24
+			if units > maxComputeUnitLimit {
+				return mpp.NewError(
+					mpp.ErrCodeComputeBudgetExceeded,
+					fmt.Sprintf("compute unit limit %d exceeds maximum %d", units, maxComputeUnitLimit),
+				)
+			}
+		case 3:
+			if len(data) != 9 {
+				return mpp.NewError(
+					mpp.ErrCodeComputeBudgetExceeded,
+					fmt.Sprintf("compute unit price instruction has %d data bytes, expected 9", len(data)),
+				)
+			}
+			price := uint64(data[1]) | uint64(data[2])<<8 | uint64(data[3])<<16 | uint64(data[4])<<24 |
+				uint64(data[5])<<32 | uint64(data[6])<<40 | uint64(data[7])<<48 | uint64(data[8])<<56
+			if price > maxComputeUnitPriceMicroLamports {
+				return mpp.NewError(
+					mpp.ErrCodeComputeBudgetExceeded,
+					fmt.Sprintf("compute unit price %d exceeds maximum %d", price, maxComputeUnitPriceMicroLamports),
+				)
+			}
+		default:
+			return mpp.NewError(
+				mpp.ErrCodeComputeBudgetExceeded,
+				fmt.Sprintf("unsupported compute budget instruction discriminator %d", data[0]),
+			)
+		}
+	}
+	return nil
+}
+
+// validateSplitsCount enforces the cross-SDK cap of 8 secondary recipients
+// per charge. Mirrors the rust/typescript/python/ruby/php server checks so
+// a client cannot smuggle a fanned-out fee schedule past the Go SDK.
+func validateSplitsCount(splits []protocol.Split) error {
+	if len(splits) > maxSplits {
+		return mpp.NewError(
+			mpp.ErrCodeTooManySplits,
+			fmt.Sprintf("too many splits: %d (maximum %d)", len(splits), maxSplits),
+		)
+	}
+	return nil
 }

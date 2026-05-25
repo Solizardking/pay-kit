@@ -1,7 +1,9 @@
-package solanautil
+package utils
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	solana "github.com/gagliardetto/solana-go"
@@ -10,6 +12,19 @@ import (
 	"github.com/solana-foundation/pay-kit/go/internal/testutil"
 	"github.com/solana-foundation/pay-kit/go/protocol"
 )
+
+type failingSigner struct {
+	key solana.PublicKey
+	err error
+}
+
+func (s failingSigner) PublicKey() solana.PublicKey {
+	return s.key
+}
+
+func (s failingSigner) Sign([]byte) (solana.Signature, error) {
+	return solana.Signature{}, s.err
+}
 
 func TestSplitAmounts(t *testing.T) {
 	primary, err := SplitAmounts(1000, []protocol.Split{{Recipient: testutil.NewPrivateKey().PublicKey().String(), Amount: "100"}})
@@ -173,6 +188,56 @@ func TestSplitAmountsNoSplits(t *testing.T) {
 	}
 }
 
+func TestSplitAmountsAccumulatorOverflow(t *testing.T) {
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	const maxU64 = "18446744073709551615" // 2^64 - 1
+	cases := []struct {
+		name    string
+		total   uint64
+		splits  []protocol.Split
+		wantErr bool
+	}{
+		{
+			name:  "splits sum exactly fits in uint64",
+			total: 1<<63 + 1, // > sum, so primary is non-zero
+			splits: []protocol.Split{
+				{Recipient: recipient, Amount: "9223372036854775807"}, // 2^63 - 1
+				{Recipient: recipient, Amount: "1"},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "splits sum overflows uint64 must reject",
+			total: 1000,
+			splits: []protocol.Split{
+				{Recipient: recipient, Amount: maxU64},
+				{Recipient: recipient, Amount: "1"},
+			},
+			wantErr: true,
+		},
+		{
+			name:  "two near-max splits wrap to small value must reject",
+			total: 1000,
+			splits: []protocol.Split{
+				{Recipient: recipient, Amount: "9223372036854775808"}, // 2^63
+				{Recipient: recipient, Amount: "9223372036854775808"}, // 2^63, sum wraps to 0
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := SplitAmounts(tc.total, tc.splits)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestSplitAmountsInvalidAmount(t *testing.T) {
 	splits := []protocol.Split{
 		{Recipient: testutil.NewPrivateKey().PublicKey().String(), Amount: "not-a-number"},
@@ -285,5 +350,105 @@ func TestWaitForConfirmationReturnsFailure(t *testing.T) {
 	}
 	if err := WaitForConfirmation(context.Background(), rpcClient, signature); err == nil {
 		t.Fatal("expected confirmation failure")
+	}
+}
+
+func TestSignTransactionRejectsSignerFailure(t *testing.T) {
+	payer := testutil.NewPrivateKey()
+	recipient := testutil.NewPrivateKey().PublicKey()
+	transfer, err := BuildSOLTransfer(payer.PublicKey(), recipient, 1000)
+	if err != nil {
+		t.Fatalf("transfer failed: %v", err)
+	}
+	tx, err := solana.NewTransaction([]solana.Instruction{transfer}, testutil.NewFakeRPC().Blockhash, solana.TransactionPayer(payer.PublicKey()))
+	if err != nil {
+		t.Fatalf("tx failed: %v", err)
+	}
+	if err := SignTransaction(tx, failingSigner{key: payer.PublicKey(), err: errors.New("sign failed")}); err == nil {
+		t.Fatal("expected signer failure")
+	}
+}
+
+func TestSignTransactionRejectsUnexpectedSigner(t *testing.T) {
+	payer := testutil.NewPrivateKey()
+	other := testutil.NewPrivateKey()
+	recipient := testutil.NewPrivateKey().PublicKey()
+	transfer, err := BuildSOLTransfer(payer.PublicKey(), recipient, 1000)
+	if err != nil {
+		t.Fatalf("transfer failed: %v", err)
+	}
+	tx, err := solana.NewTransaction([]solana.Instruction{transfer}, testutil.NewFakeRPC().Blockhash, solana.TransactionPayer(payer.PublicKey()))
+	if err != nil {
+		t.Fatalf("tx failed: %v", err)
+	}
+	if err := SignTransaction(tx, other); err == nil {
+		t.Fatal("expected non-required signer to fail")
+	}
+}
+
+func TestBuildMemoInstructionParity(t *testing.T) {
+	ix, err := BuildMemoInstruction("order-123")
+	if err != nil {
+		t.Fatalf("memo failed: %v", err)
+	}
+	if ix == nil {
+		t.Fatal("expected memo instruction")
+	}
+	data, err := ix.Data()
+	if err != nil {
+		t.Fatalf("memo data failed: %v", err)
+	}
+	if string(data) != "order-123" {
+		t.Fatalf("unexpected memo data %q", string(data))
+	}
+}
+
+func TestBuildMemoInstructionRejectsLongMemo(t *testing.T) {
+	if _, err := BuildMemoInstruction(strings.Repeat("x", 567)); err == nil {
+		t.Fatal("expected long memo to fail")
+	}
+}
+
+func TestResolveRecentBlockhashRejectsInvalidProvided(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	if _, err := ResolveRecentBlockhash(context.Background(), rpcClient, "not-a-blockhash"); err == nil {
+		t.Fatal("expected invalid provided blockhash to fail")
+	}
+}
+
+func TestSplitAmountsRejectsPartiallyNumericAmount(t *testing.T) {
+	splits := []protocol.Split{
+		{Recipient: testutil.NewPrivateKey().PublicKey().String(), Amount: "100abc"},
+	}
+	if _, err := SplitAmounts(1000, splits); err == nil {
+		t.Fatal("expected error for partially numeric split amount")
+	}
+}
+
+func TestWaitForConfirmationReturnsContextError(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	signature := solana.MustSignatureFromBase58("5jKh25biPsnrmLWXXuqKNH2Q67Q4UmVVx8Gf2wrS6VoCeyfGE9wKikjY7Q1GQQgmpQ3xy7wJX5U1rcz82q4R8Nkv")
+	rpcClient.Statuses[signature.String()] = nil
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := WaitForConfirmation(ctx, rpcClient, signature); err == nil {
+		t.Fatal("expected context cancellation")
+	}
+}
+
+func TestSimulateTransactionReturnsSimulationError(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	rpcClient.SimulateErr = errors.New("simulate failed")
+	if err := SimulateTransaction(context.Background(), rpcClient, &solana.Transaction{}); err == nil {
+		t.Fatal("expected simulate error")
+	}
+}
+
+func TestFetchTransactionReturnsRPCError(t *testing.T) {
+	rpcClient := testutil.NewFakeRPC()
+	rpcClient.GetTxErr = errors.New("get transaction failed")
+	signature := solana.MustSignatureFromBase58("5jKh25biPsnrmLWXXuqKNH2Q67Q4UmVVx8Gf2wrS6VoCeyfGE9wKikjY7Q1GQQgmpQ3xy7wJX5U1rcz82q4R8Nkv")
+	if _, _, err := FetchTransaction(context.Background(), rpcClient, signature); err == nil {
+		t.Fatal("expected get transaction error")
 	}
 }

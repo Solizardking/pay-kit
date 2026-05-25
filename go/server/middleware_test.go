@@ -69,8 +69,8 @@ func TestMiddlewareNoAuth402(t *testing.T) {
 		t.Fatalf("expected Payment scheme in WWW-Authenticate, got %q", wwwAuth)
 	}
 	contentType := rr.Header().Get("Content-Type")
-	if !strings.Contains(contentType, "application/json") {
-		t.Fatalf("expected JSON content type, got %q", contentType)
+	if !strings.Contains(contentType, "application/problem+json") {
+		t.Fatalf("expected problem+json content type, got %q", contentType)
 	}
 	if rr.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("expected no-store cache control, got %q", rr.Header().Get("Cache-Control"))
@@ -238,5 +238,22 @@ func TestMiddlewareChargeFuncError500(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestMarkAuthorizationBoundResponsePreservesExistingVary(t *testing.T) {
+	withAuthorization := http.Header{"Vary": {"Accept-Encoding, Authorization"}}
+	markAuthorizationBoundResponse(withAuthorization)
+	if got := withAuthorization.Values("Vary"); len(got) != 1 {
+		t.Fatalf("expected existing authorization vary to be preserved, got %#v", got)
+	}
+	if withAuthorization.Get("Cache-Control") != "no-store" {
+		t.Fatal("expected no-store cache control")
+	}
+
+	wildcard := http.Header{"Vary": {"*"}}
+	markAuthorizationBoundResponse(wildcard)
+	if got := wildcard.Values("Vary"); len(got) != 1 || got[0] != "*" {
+		t.Fatalf("expected wildcard vary to be preserved, got %#v", got)
 	}
 }

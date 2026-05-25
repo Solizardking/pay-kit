@@ -1,7 +1,15 @@
+// Package protocol carries the Solana-specific protocol constants and
+// method-detail/credential-payload wire types shared by the MPP server
+// and client. Program IDs, stablecoin mint tables, and default RPC URLs
+// mirror rust/src/protocol/solana.rs so the wire-format paths stay
+// byte-identical across language SDKs.
 package protocol
 
 import "strings"
 
+// Solana program and well-known mint addresses used by the SDK.
+// Mirrors the constant tables in rust/src/protocol/solana.rs so the
+// wire-format paths stay byte-identical across language SDKs.
 const (
 	TokenProgram           = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 	Token2022Program       = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -119,10 +127,11 @@ type MethodDetails struct {
 
 // Split is an additional transfer in the same asset.
 type Split struct {
-	Recipient string `json:"recipient"`
-	Amount    string `json:"amount"`
-	Label     string `json:"label,omitempty"`
-	Memo      string `json:"memo,omitempty"`
+	Recipient           string `json:"recipient"`
+	Amount              string `json:"amount"`
+	Label               string `json:"label,omitempty"`
+	Memo                string `json:"memo,omitempty"`
+	AtaCreationRequired *bool  `json:"ataCreationRequired,omitempty"`
 }
 
 // CredentialPayload is sent by clients in the payment credential payload.

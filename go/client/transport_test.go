@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -11,6 +12,16 @@ import (
 	"github.com/solana-foundation/pay-kit/go/internal/testutil"
 )
 
+type errReadCloser struct{}
+
+func (errReadCloser) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func (errReadCloser) Close() error {
+	return nil
+}
+
 // roundTripFunc adapts a function to http.RoundTripper.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -19,6 +30,10 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func newTestChallenge() mpp.PaymentChallenge {
+	return newTestChallengeFor("solana", "charge")
+}
+
+func newTestChallengeFor(method string, intent string) mpp.PaymentChallenge {
 	fakeRPC := testutil.NewFakeRPC()
 	request, _ := mpp.NewBase64URLJSONValue(map[string]any{
 		"amount":    "1000",
@@ -29,7 +44,13 @@ func newTestChallenge() mpp.PaymentChallenge {
 			"recentBlockhash": fakeRPC.Blockhash.String(),
 		},
 	})
-	return mpp.NewChallengeWithSecret("secret", "realm", "solana", "charge", request)
+	return mpp.NewChallengeWithSecret(
+		"secret",
+		"realm",
+		mpp.NewMethodName(method),
+		mpp.NewIntentName(intent),
+		request,
+	)
 }
 
 func TestTransportPassthroughNon402(t *testing.T) {
@@ -265,4 +286,186 @@ func TestTransport402Debug(t *testing.T) {
 		t.Fatalf("BuildCredentialHeader after roundtrip: %v", err)
 	}
 	t.Logf("OK: %s...", header[:40])
+}
+
+func TestTransport402SelectsSolanaChargeChallenge(t *testing.T) {
+	unsupportedChallenge := newTestChallengeFor("card", "charge")
+	unsupportedWWWAuth, err := mpp.FormatWWWAuthenticate(unsupportedChallenge)
+	if err != nil {
+		t.Fatalf("format unsupported challenge: %v", err)
+	}
+	challenge := newTestChallenge()
+	wwwAuth, err := mpp.FormatWWWAuthenticate(challenge)
+	if err != nil {
+		t.Fatalf("format challenge: %v", err)
+	}
+
+	calls := 0
+	transport := &PaymentTransport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusPaymentRequired,
+					Body:       io.NopCloser(strings.NewReader("payment required")),
+					Header:     http.Header{"Www-Authenticate": {unsupportedWWWAuth, wwwAuth}},
+				}, nil
+			}
+			auth := req.Header.Get(mpp.AuthorizationHeader)
+			if auth == "" {
+				t.Fatal("expected Authorization header on retry")
+			}
+			credential, err := mpp.ParseAuthorization(auth)
+			if err != nil {
+				t.Fatalf("parse retry authorization: %v", err)
+			}
+			if credential.Challenge.Method != "solana" {
+				t.Fatalf("expected solana challenge, got %q", credential.Challenge.Method)
+			}
+			if !credential.Challenge.Intent.IsCharge() {
+				t.Fatalf("expected charge intent, got %q", credential.Challenge.Intent)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("paid")),
+				Header:     http.Header{},
+			}, nil
+		}),
+		Signer: testutil.NewPrivateKey(),
+		RPC:    testutil.NewFakeRPC(),
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after retry, got %d", resp.StatusCode)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 round trips, got %d", calls)
+	}
+}
+
+func TestTransport402KeepsOriginalResponseWithoutSupportedChargeChallenge(t *testing.T) {
+	unsupportedChallenge := newTestChallengeFor("card", "charge")
+	unsupportedWWWAuth, err := mpp.FormatWWWAuthenticate(unsupportedChallenge)
+	if err != nil {
+		t.Fatalf("format unsupported challenge: %v", err)
+	}
+
+	calls := 0
+	transport := &PaymentTransport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusPaymentRequired,
+				Body:       io.NopCloser(strings.NewReader("payment required")),
+				Header:     http.Header{"Www-Authenticate": {unsupportedWWWAuth}},
+			}, nil
+		}),
+		Signer: testutil.NewPrivateKey(),
+		RPC:    testutil.NewFakeRPC(),
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("expected original 402, got %d", resp.StatusCode)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 round trip, got %d", calls)
+	}
+}
+
+func TestTransportDefaults(t *testing.T) {
+	transport := &PaymentTransport{}
+	if transport.base() != http.DefaultTransport {
+		t.Fatal("expected default transport")
+	}
+	if got := transport.buildOptions(); got != (BuildOptions{}) {
+		t.Fatalf("expected empty build options, got %#v", got)
+	}
+
+	opts := &BuildOptions{ComputeUnitLimit: 400_000, ComputeUnitPrice: 10}
+	transport.Options = opts
+	if got := transport.buildOptions(); got != *opts {
+		t.Fatalf("expected configured build options, got %#v", got)
+	}
+}
+
+func TestTransportReturnsBodyReadError(t *testing.T) {
+	transport := &PaymentTransport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatal("base transport should not be called when request body cannot be buffered")
+			return nil, nil
+		}),
+	}
+
+	req, _ := http.NewRequest("POST", "http://example.com", nil)
+	req.Body = errReadCloser{}
+	_, err := transport.RoundTrip(req)
+	if err == nil || !strings.Contains(err.Error(), "read failed") {
+		t.Fatalf("expected body read error, got %v", err)
+	}
+}
+
+func TestTransportReturnsBaseError(t *testing.T) {
+	transport := &PaymentTransport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("network failed")
+		}),
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	_, err := transport.RoundTrip(req)
+	if err == nil || !strings.Contains(err.Error(), "network failed") {
+		t.Fatalf("expected base transport error, got %v", err)
+	}
+}
+
+func TestTransportBuildCredentialFailureReturnsOriginal402(t *testing.T) {
+	request, err := mpp.NewBase64URLJSONValue(map[string]any{
+		"amount":    "not-a-number",
+		"currency":  "sol",
+		"recipient": testutil.NewPrivateKey().PublicKey().String(),
+	})
+	if err != nil {
+		t.Fatalf("request encode failed: %v", err)
+	}
+	challenge := mpp.NewChallengeWithSecret("secret", "realm", "solana", "charge", request)
+	wwwAuth, err := mpp.FormatWWWAuthenticate(challenge)
+	if err != nil {
+		t.Fatalf("format challenge: %v", err)
+	}
+
+	calls := 0
+	transport := &PaymentTransport{
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusPaymentRequired,
+				Body:       io.NopCloser(strings.NewReader("payment required")),
+				Header:     http.Header{"Www-Authenticate": {wwwAuth}},
+			}, nil
+		}),
+		Signer: testutil.NewPrivateKey(),
+		RPC:    testutil.NewFakeRPC(),
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("expected original 402, got %d", resp.StatusCode)
+	}
+	if calls != 1 {
+		t.Fatalf("expected no retry when credential build fails, got %d calls", calls)
+	}
 }

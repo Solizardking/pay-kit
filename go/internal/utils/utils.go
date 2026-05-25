@@ -1,9 +1,19 @@
-package solanautil
+// Package utils holds internal Solana-toolchain glue used by the
+// MPP charge handlers and client builders: a minimal Signer interface,
+// an RPCClient interface mirroring the subset of gagliardetto's
+// solana-go RPC client the SDK depends on, plus helpers to build SOL /
+// SPL transfer / associated-token-account / compute-budget / memo
+// instructions, decode transactions, split amounts, and run the
+// simulate-broadcast-confirm sequence. Internal-only; the public SDK
+// surface lives in the top-level mpp/server/client packages.
+package utils
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math/bits"
+	"strconv"
 	"time"
 
 	bin "github.com/gagliardetto/binary"
@@ -14,7 +24,7 @@ import (
 	token2022 "github.com/gagliardetto/solana-go/programs/token-2022"
 	"github.com/gagliardetto/solana-go/rpc"
 
-	"github.com/solana-foundation/pay-kit/go"
+	mpp "github.com/solana-foundation/pay-kit/go"
 	"github.com/solana-foundation/pay-kit/go/protocol"
 )
 
@@ -269,11 +279,15 @@ func SplitAmounts(total uint64, splits []protocol.Split) (uint64, error) {
 	}
 	var splitTotal uint64
 	for _, split := range splits {
-		var amount uint64
-		if _, err := fmt.Sscanf(split.Amount, "%d", &amount); err != nil {
+		amount, err := strconv.ParseUint(split.Amount, 10, 64)
+		if err != nil {
 			return 0, fmt.Errorf("invalid split amount %q", split.Amount)
 		}
-		splitTotal += amount
+		sum, carry := bits.Add64(splitTotal, amount, 0)
+		if carry != 0 {
+			return 0, mpp.NewError(mpp.ErrCodeSplitsExceed, "splits consume the entire amount")
+		}
+		splitTotal = sum
 	}
 	if splitTotal >= total {
 		return 0, mpp.NewError(mpp.ErrCodeSplitsExceed, "splits consume the entire amount")
