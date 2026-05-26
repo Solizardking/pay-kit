@@ -211,6 +211,38 @@ jobs:
           path: rust/target/surfpool-reports/
           if-no-files-found: ignore
 
+  test-go:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Run tests with coverage
+        working-directory: go
+        env:
+          GOCACHE: /tmp/go-build-cache
+        run: |
+          # Narrow `go test` to library packages so coverage measures SDK
+          # surface area only (cmd/ + internal/testutil hold fixtures and
+          # are excluded; mirrors the per-package narrowing pattern from
+          # PR #101). Gate set to the cross-SDK baseline of 90; library
+          # packages currently aggregate at ~85% because client,
+          # internal/utils, and server have known coverage gaps.
+          # The threshold WILL fail until gap-fill PRs land; surfaced as
+          # an explicit finding per PR #102 review thread rather than
+          # lowering the gate.
+          go test ./ ./client ./internal/utils ./protocol ./protocol/core ./protocol/intents ./server -coverprofile=coverage.out -covermode=atomic
+          ./scripts/check_coverage.sh coverage.out 90
+      - name: Upload Go coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-coverage
+          path: go/coverage.out
+
   integration:
     name: Integration tests
     needs: build-html
@@ -230,12 +262,12 @@ jobs:
         with:
           name: html-assets
       - name: Install Surfnet helper dependencies
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm install --frozen-lockfile
       - name: Start Surfnet
         working-directory: .
         run: |
-          node tests/interop/start-surfnet-proxy.mjs &
+          node harness/start-surfnet-proxy.mjs &
           ready=0
           for i in $(seq 1 50); do
             if curl -sf -X POST http://localhost:8899 \
@@ -270,12 +302,12 @@ jobs:
         with:
           name: html-assets
       - name: Install Surfnet helper dependencies
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm install --frozen-lockfile
       - name: Start Surfnet
         working-directory: .
         run: |
-          node tests/interop/start-surfnet-proxy.mjs &
+          node harness/start-surfnet-proxy.mjs &
           ready=0
           for i in $(seq 1 50); do
             if curl -sf -X POST http://localhost:8899 \
@@ -344,12 +376,12 @@ jobs:
         with:
           name: html-assets
       - name: Install Surfnet helper dependencies
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm install --frozen-lockfile
       - name: Start Surfnet
         working-directory: .
         run: |
-          node tests/interop/start-surfnet-proxy.mjs &
+          node harness/start-surfnet-proxy.mjs &
           ready=0
           for i in $(seq 1 50); do
             if curl -sf -X POST http://localhost:8899 \
@@ -419,7 +451,7 @@ jobs:
         working-directory: rust
         run: cargo build -p solana-mpp --bin interop_client --bin interop_server
       - name: Install interop harness
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm install --frozen-lockfile
       - uses: ruby/setup-ruby@v1
         with:
@@ -427,34 +459,34 @@ jobs:
           bundler-cache: true
           working-directory: ruby
       - name: Typecheck interop harness
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm typecheck
       - name: Run Rust client interop smoke
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "rust client pays typescript server"
         env:
           MPP_INTEROP_CLIENTS: rust
           MPP_INTEROP_SERVERS: typescript
       - name: Run Rust server interop smoke
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "typescript client pays rust server"
         env:
           MPP_INTEROP_CLIENTS: typescript
           MPP_INTEROP_SERVERS: rust
       - name: Run Rust end-to-end interop smoke
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "rust client pays rust server"
         env:
           MPP_INTEROP_CLIENTS: rust
           MPP_INTEROP_SERVERS: rust
       - name: Run Ruby server interop smoke
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "typescript client pays ruby server"
         env:
           MPP_INTEROP_CLIENTS: typescript
           MPP_INTEROP_SERVERS: ruby
       - name: Run Rust client to Ruby server interop smoke
-        working-directory: tests/interop
+        working-directory: harness
         run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "rust client pays ruby server"
         env:
           MPP_INTEROP_CLIENTS: rust
