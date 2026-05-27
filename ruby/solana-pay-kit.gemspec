@@ -14,6 +14,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "base64", "~> 0.3"
+  spec.add_dependency "bigdecimal", "~> 3.1"
   spec.add_dependency "ed25519", "~> 1.4"
   spec.add_dependency "json", "~> 2.9"
   spec.add_dependency "net-http", "~> 0.6"
@@ -25,6 +26,7 @@ Gem::Specification.new do |spec|
 
   spec.add_development_dependency "bundler-audit", "~> 0.9"
   spec.add_development_dependency "minitest", "~> 5.25"
+  spec.add_development_dependency "rack-test", "~> 2.1"
   spec.add_development_dependency "rake", "~> 13.2"
   spec.add_development_dependency "simplecov", "~> 0.22"
   spec.add_development_dependency "standard", "~> 1.43"

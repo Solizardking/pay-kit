@@ -4,6 +4,10 @@ export type ImplementationDefinition = {
   role: "client" | "server";
   command: string[];
   enabled: boolean;
+  // Optional. When set, this adapter only participates in scenarios whose
+  // `intent` is in this list. Defaults to "charge" only for back-compat
+  // with the existing MPP charge matrix.
+  intents?: string[];
 };
 
 function isEnabled(id: string, envName: string, defaultEnabled: boolean): boolean {
@@ -73,12 +77,50 @@ export const clientImplementations: ImplementationDefinition[] = [
     id: "kotlin",
     label: "Kotlin HTTP client",
     role: "client",
+    // Pre-warmed by `gradle installDist` in `.github/workflows/kotlin.yml`
+    // (the `interop-kotlin` job) so the script lands at this path. Local
+    // runs can prime it with `(cd harness/kotlin-client && gradle installDist)`.
     command: [
       "sh",
       "-c",
-      "cd kotlin-client && gradle --quiet run --no-daemon",
+      "kotlin-client/build/install/mpp-kotlin-interop-client/bin/mpp-kotlin-interop-client",
     ],
-    enabled: isEnabled("kotlin", "MPP_INTEROP_CLIENTS", true),
+    // Defaults off to match swift/php/ruby/go: opt-in via
+    // `MPP_INTEROP_CLIENTS=kotlin` (the interop-kotlin CI job sets this).
+    enabled: isEnabled("kotlin", "MPP_INTEROP_CLIENTS", false),
+  },
+  {
+    id: "ts-x402",
+    label: "TypeScript x402 exact client",
+    role: "client",
+    command: [
+      "pnpm",
+      "exec",
+      "node",
+      "--import",
+      "tsx",
+      "src/fixtures/typescript/exact-client.ts",
+    ],
+    enabled: isEnabled("ts-x402", "X402_INTEROP_CLIENTS", true),
+    intents: ["x402-exact"],
+  },
+  {
+    id: "rust-x402",
+    label: "Rust x402 exact client",
+    role: "client",
+    command: [
+      "cargo",
+      "run",
+      "--quiet",
+      "--manifest-path",
+      "../rust/Cargo.toml",
+      "-p",
+      "solana-x402",
+      "--bin",
+      "interop_client",
+    ],
+    enabled: isEnabled("rust-x402", "X402_INTEROP_CLIENTS", true),
+    intents: ["x402-exact"],
   },
 ];
 
@@ -128,14 +170,21 @@ export const serverImplementations: ImplementationDefinition[] = [
   },
   {
     id: "ruby",
-    label: "Ruby HTTP server",
+    label: "Ruby PayKit server (dual protocol)",
     role: "server",
+    // One adapter binary, two settle paths. The harness orchestrator
+    // sets either `X402_INTEROP_*` (x402-exact intent) or `MPP_INTEROP_*`
+    // (charge intent); the adapter detects which one is active (via
+    // PAY_KIT_INTEROP_PROTOCOL hint or namespace probe) and routes
+    // through PayKit::Rack::Dispatcher (x402) or Mpp::Server::Charge
+    // directly (mpp).
     command: [
       "sh",
       "-c",
       "cd ../ruby && bundle exec ruby ../harness/ruby-server/server.rb",
     ],
     enabled: isEnabled("ruby", "MPP_INTEROP_SERVERS", false),
+    intents: ["charge", "x402-exact"],
   },
   {
     id: "lua",
@@ -171,5 +220,50 @@ export const serverImplementations: ImplementationDefinition[] = [
     role: "server",
     command: ["sh", "-c", "cd go-server && go run ."],
     enabled: isEnabled("go", "MPP_INTEROP_SERVERS", true),
+  },
+  {
+    id: "ts-x402",
+    label: "TypeScript x402 exact server",
+    role: "server",
+    command: [
+      "pnpm",
+      "exec",
+      "node",
+      "--import",
+      "tsx",
+      "src/fixtures/typescript/exact-server.ts",
+    ],
+    enabled: isEnabled("ts-x402", "X402_INTEROP_SERVERS", true),
+    intents: ["x402-exact"],
+  },
+  {
+    id: "rust-x402",
+    label: "Rust x402 exact server",
+    role: "server",
+    command: [
+      "cargo",
+      "run",
+      "--quiet",
+      "--manifest-path",
+      "../rust/Cargo.toml",
+      "-p",
+      "solana-x402",
+      "--bin",
+      "interop_server",
+    ],
+    enabled: isEnabled("rust-x402", "X402_INTEROP_SERVERS", true),
+    intents: ["x402-exact"],
+  },
+  {
+    id: "ruby-x402-server",
+    label: "Ruby x402 exact server",
+    role: "server",
+    command: [
+      "sh",
+      "-c",
+      "cd ../ruby && bundle exec ruby bin/x402-interop-server",
+    ],
+    enabled: isEnabled("ruby-x402-server", "X402_INTEROP_SERVERS", false),
+    intents: ["x402-exact"],
   },
 ];

@@ -44,3 +44,55 @@ jobs:
           name: surfpool-reports-ruby
           path: ruby/target/surfpool-reports/
           if-no-files-found: ignore
+
+  interop-ruby:
+    name: "Interop: Ruby PayKit server (dual protocol)"
+    needs: test-ruby
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+        with:
+          package_json_file: package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: ruby
+      - name: Install TypeScript workspace
+        working-directory: typescript
+        run: pnpm install --frozen-lockfile
+      - name: Build TypeScript package
+        working-directory: typescript
+        run: pnpm --filter @solana/mpp build
+      - name: Install interop harness
+        working-directory: harness
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck interop harness
+        working-directory: harness
+        run: pnpm typecheck
+      # Dual-protocol proof: one e2e run drives MPP charge scenarios
+      # (typescript client) and x402 exact (rust-x402 client) against
+      # the same ruby adapter binary. The harness's interopEnv exposes
+      # X402_INTEROP_* shadows alongside MPP_INTEROP_* (same surfpool,
+      # same funded keypairs) and stamps every scenario with
+      # PAY_KIT_INTEROP_PROTOCOL so the dual-protocol adapter binds the
+      # right protocol per scenario without relying on env namespace
+      # probing. ts-x402 is intentionally excluded - it is a wire-only
+      # fixture whose payload omits the on-chain transaction, so it can
+      # only pair against the matching wire-only ts-x402 server, not a
+      # real settle server.
+      - name: Run interop smoke (mpp charge + x402 exact)
+        working-directory: harness
+        env:
+          MPP_INTEROP_CLIENTS: typescript
+          MPP_INTEROP_SERVERS: ruby,typescript
+          MPP_INTEROP_INTENTS: charge,x402-exact
+          X402_INTEROP_CLIENTS: rust-x402
+          X402_INTEROP_SERVERS: ""
+        run: pnpm exec vitest run test/e2e.test.ts --testNamePattern "ruby" --testTimeout 180000
