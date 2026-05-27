@@ -55,28 +55,40 @@ module PayKit
         status, headers, body = @app.call(env)
 
         if (settled = env[ENV_PAYMENT_KEY])
-          settled.settlement_headers.each { |name, value| headers[name] ||= value }
+          settled.settlement_headers.each { |name, value| headers[name.to_s.downcase] ||= value }
         end
 
         [status, headers, body]
       rescue ::PayKit::PaymentRequired => e
-        render_402(e.challenge)
+        self.class.render_402(e.challenge)
       rescue ::PayKit::InvalidProof => e
-        render_invalid(e)
+        self.class.render_invalid(e)
       end
 
-      private
+      # Build a Rack 402 tuple from a `PayKit::Challenge`. Class methods
+      # so the Sinatra helper path (`require_payment!` → `halt`) and
+      # the middleware-rescue path can share the exact same rendering
+      # logic — no drift between the two.
+      class << self
+        def render_402(challenge)
+          body = JSON.generate(challenge.to_h)
+          headers = {"content-type" => "application/json"}.merge(normalize_headers(challenge.headers))
+          [402, headers, [body]]
+        end
 
-      def render_402(challenge)
-        body = JSON.generate(challenge.to_h)
-        headers = {"content-type" => "application/json"}.merge(challenge.headers)
-        [402, headers, [body]]
-      end
+        def render_invalid(error)
+          payload = {error: error.code.to_s, message: error.detail}
+          payload[:spec_code] = error.spec_code if error.spec_code
+          [402, {"content-type" => "application/json"}, [JSON.generate(payload)]]
+        end
 
-      def render_invalid(error)
-        payload = {error: error.code.to_s, message: error.detail}
-        payload[:spec_code] = error.spec_code if error.spec_code
-        [402, {"content-type" => "application/json"}, [JSON.generate(payload)]]
+        # Rack 3 requires response header names to be lowercase. The
+        # x402/MPP wire constants are upper/mixed case to match the spec
+        # and the Rust spine — downcase only at this boundary so the
+        # wire constants stay canonical.
+        def normalize_headers(headers)
+          headers.each_with_object({}) { |(k, v), h| h[k.to_s.downcase] = v }
+        end
       end
     end
 
@@ -306,7 +318,10 @@ module PayKit
         table = ::PayCore::Solana::Mints::MINTS[coin_str]
         return coin_str if table.nil?
 
-        table.fetch(net_key) do
+        # MINTS has no `localnet` row — local validators (Surfpool) clone
+        # mainnet, so fall back to the mainnet mint. Matches
+        # `PayCore::Solana::Mints.resolve` and the Rust spine.
+        table[net_key] || table.fetch("mainnet") do
           raise ::PayKit::ConfigurationError, "stablecoin #{coin.inspect} not configured for network #{network.inspect}"
         end
       end
