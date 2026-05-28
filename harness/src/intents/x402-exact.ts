@@ -88,26 +88,16 @@ export const x402ExactScenarios: readonly InteropScenario[] = [
     expectedStatus: 402,
     expectedCode: "challenge_verification_failed",
     clientIds: ["ts-x402"],
-    // The wire-only ts-x402 client cannot pair with a real-settling
-    // server (lua/rust-x402) for the cross-server portability test;
-    // crossServerPairs gates the matrix to ts-x402<->ts-x402 only.
+    // Only the TS reference client today implements the
+    // capture/re-submit flow that e2e.test.ts's cross-server runner
+    // expects (reads MPP_INTEROP_RESUBMIT_URL, emits firstStatus).
+    // The rust-x402 client's `payment-signature-sent` echo (added in
+    // this PR) is consumed by the alternate runner in
+    // harness/test/cross-server-scenarios.test.ts which is gated
+    // behind X402_INTEROP_CROSS_SERVER=1 and not run in this CI step.
+    // Re-add rust-x402 to clientIds when the rust spine grows
+    // resubmit-URL support so e2e.test.ts can drive it.
     serverIds: ["ts-x402"],
-    // Cross-server portability requires the client adapter to expose the
-    // credential it sent so the runner can replay it. The TS reference
-    // client echoes `payment-signature-sent`; the Rust spine adapter does
-    // not (and is preserved as the canonical settlement-signing path
-    // rather than a credential-capturing one).
-    //
-    // We intentionally only pair `ts-x402 -> ts-x402` here. The TS
-    // fixture's `payload` is a stub envelope (`{ challengeId, resource }`)
-    // and does NOT deserialize into Rust's typed
-    // `PaymentProof::{transaction|signature}` enum, so replaying that
-    // header to the Rust spine produces `payment_invalid` (parse error)
-    // instead of the canonical `challenge_verification_failed` we want
-    // to assert. Rust's own portability semantics are covered by the
-    // rust/crates/x402 integration tests; we will add a real
-    // `ts -> rust-x402` pair once the TS fixture emits a typed
-    // PaymentProof payload.
     crossServerPairs: [["ts-x402", "ts-x402"]],
   },
   {
@@ -125,17 +115,13 @@ export const x402ExactScenarios: readonly InteropScenario[] = [
     settlementHeader: "x-fixture-settlement",
     expectedStatus: 402,
     expectedCode: "signature_consumed",
-    // Driven by the TS client (the only one that echoes the sent
-    // credential back to the harness). The first paid request must
-    // reach 200, which constrains us to the TS reference server in
-    // the default matrix because that server is what speaks the TS
-    // client's stub payload. Rust server coverage of `signature_consumed`
-    // lives in the Rust crate's own integration tests.
+    // Driven by the TS client only: e2e.test.ts's idempotent runner
+    // requires the client to read MPP_INTEROP_RESUBMIT_URL and emit a
+    // `firstStatus` field, which the rust spine client does not do
+    // yet. Real-settling-server coverage of signature_consumed lives
+    // in the rust crate's own integration tests until the rust client
+    // grows resubmit support.
     clientIds: ["ts-x402"],
-    // Lua omitted intentionally (see cross-route-replay note above):
-    // ts-x402's stub credential will not settle through the lua
-    // server's broadcast path. The replay-store rejection is
-    // exercised by the rust crate's own integration tests.
     serverIds: ["ts-x402"],
   },
 ] as const;
