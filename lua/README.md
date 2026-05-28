@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-lua-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-lua-light.png">
-    <img alt="Solana pay-kit — Lua" width="100%" src="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-lua-light.png">
+    <img alt="Solana pay-kit — Lua" width="100%" style="border-top-left-radius: 8px; border-top-right-radius: 8px; margin-bottom: 16px;" src="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-lua-light.png">
   </picture>
 </div>
 
@@ -239,11 +239,11 @@ address.
 
 Supported on the Lua server:
 
-| Scheme  | Status |
-|---------|--------|
-| `exact` | ✅      |
-| `upto`  | —      |
-| `batch` | —      |
+| Scheme             | Status |
+|--------------------|--------|
+| `exact`            | ✅      |
+| `upto`             | —      |
+| `batch-settlement` | —      |
 
 ## MPP
 
@@ -262,11 +262,12 @@ Use MPP when:
 
 Supported on the Lua server:
 
-| Scheme        | Status |
-|---------------|--------|
-| `charge/pull` | ✅      |
-| `charge/push` | ✅      |
-| `session`     | —      |
+| Scheme         | Status |
+|----------------|--------|
+| `charge/pull`  | ✅      |
+| `charge/push`  | ✅      |
+| `session`      | —      |
+| `subscription` | —      |
 
 ---
 

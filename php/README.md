@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-php-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-php-light.png">
-    <img alt="Solana pay-kit — PHP" width="100%" src="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-php-light.png">
+    <img alt="Solana pay-kit — PHP" width="100%" style="border-top-left-radius: 8px; border-top-right-radius: 8px; margin-bottom: 16px;" src="https://github.com/solana-foundation/pay-kit/raw/main/docs/assets/banner-php-light.png">
   </picture>
 </div>
 
@@ -156,11 +156,11 @@ pay curl -i http://127.0.0.1:4567/api/paid # 200 - payment provided
 client-server payment handshake. x402 is single-recipient by design;
 gates with `feeWithin` or `feeOnTop` auto-disable x402.
 
-| Scheme  | Status |
-|---------|--------|
-| `exact` | ✅      |
-| `upto`  | —      |
-| `batch` | —      |
+| Scheme             | Status |
+|--------------------|--------|
+| `exact`            | ✅      |
+| `upto`             | —      |
+| `batch-settlement` | —      |
 
 ## MPP
 
@@ -169,11 +169,12 @@ multi-recipient splits, server-side fee accounting, and a separate
 fee-payer signer. Use MPP when your gate has a platform fee or the
 server subsidises the customer's network fee.
 
-| Scheme        | Status |
-|---------------|--------|
-| `charge/pull` | ✅      |
-| `charge/push` | ✅      |
-| `session`     | —      |
+| Scheme         | Status |
+|----------------|--------|
+| `charge/pull`  | ✅      |
+| `charge/push`  | ✅      |
+| `session`      | —      |
+| `subscription` | —      |
 
 ---
 
