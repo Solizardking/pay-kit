@@ -85,30 +85,11 @@ public enum Charge {
     }
 
     /// Resolves a currency string (symbol or mint) to a mint base58 or
-    /// `nil` for native SOL. Mirrors `protocol::solana::resolve_stablecoin_mint`.
+    /// `nil` for native SOL. Uses the MPP charge rule (`Mints.resolveChargeMint`),
+    /// which maps `localnet` to the mainnet mint, unlike the x402 `exact`
+    /// rule. Both share the single mint registry in the paycore layer.
     public static func resolveStablecoinMint(currency: String, network: String?) -> String? {
-        switch currency.uppercased() {
-        case "SOL": return nil
-        case "USDC":
-            switch network {
-            case "devnet": return "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
-            case "testnet": return "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
-            default: return "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            }
-        case "USDT": return "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-        case "USDG":
-            switch network {
-            case "devnet", "testnet": return "4F6PM96JJxngmHnZLBh9n58RH4aTVNWvDs2nuwrT5BP7"
-            default: return "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH"
-            }
-        case "PYUSD":
-            switch network {
-            case "devnet", "testnet": return "CXk2AMBfi3TwaEL2468s6zP8xq9NxTXjp9gjMgzeUynM"
-            default: return "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo"
-            }
-        case "CASH": return "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH"
-        default: return currency
-        }
+        Mints.resolveChargeMint(currency: currency, network: network)
     }
 
     /// Builds and signs the Solana transaction for an MPP charge request,

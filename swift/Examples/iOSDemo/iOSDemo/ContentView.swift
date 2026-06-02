@@ -1,5 +1,5 @@
 import SwiftUI
-import SolanaMpp
+import SolanaPayKit
 
 struct ContentView: View {
     // Defaults match the local Surfpool + MerchantServer setup. Edit in
@@ -137,20 +137,17 @@ struct ContentView: View {
             return
         }
 
-        let client = MppHTTPClient(
+        // The Python `payment_link_server.py` example surfaces the
+        // settlement signature in the `Payment-Receipt` header.
+        let client = PayKit.HttpClient.mpp(
             signer: DemoSigner.shared,
-            rpc: RpcClient(endpoint: rpcURL)
+            rpc: RpcClient(endpoint: rpcURL),
+            settlementHeader: "payment-receipt"
         )
         do {
-            // The Python `payment_link_server.py` example surfaces the
-            // settlement signature in the `Payment-Receipt` header.
-            let response = try await client.fetch(
-                url: merchantURL,
-                method: "GET",
-                additionalHeaders: ["Accept": "application/json"],
-                body: nil,
-                settlementHeader: "payment-receipt"
-            )
+            let response = try await client
+                .request(merchantURL, headers: ["Accept": "application/json"])
+                .response()
             if (200..<300).contains(response.status) {
                 let body = String(data: response.body, encoding: .utf8) ?? ""
                 status = .success(ChargeOutcome(
