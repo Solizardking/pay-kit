@@ -66,13 +66,23 @@ the directory skeleton and CI from earlier ones.
    subtle bugs to avoid, test cases to mirror, spec links. Reference the
    Rust file paths cited in the leaf to disambiguate anything that's
    under-specified.
-6. **Add the interop adapter.** Read `references/interop-harness.md`,
+6. **Consume Solana program clients via Codama.** Read
+   `references/codegen.md`. Pay-kit vendors Codama IDLs at
+   `idl/<program>.json` and renders per-language clients with
+   `@codama/renderers-*` via the tooling under `codegen/` (sibling of
+   this `SKILL.md`). Today the Rust path ships for the subscriptions
+   program; do **not** hand-write a Solana program client in a new
+   language — add a `subscriptions-generate-<lang>` recipe alongside
+   the existing `subscriptions-generate-rs` and consume the generated
+   tree the same way `mpp/program/payment_channels.rs` and
+   `mpp/program/subscriptions.rs` do in Rust.
+7. **Add the interop adapter.** Read `references/interop-harness.md`,
    create `harness/<lang>-client/` (and a `bin/interop_server` if
    you're shipping a server), and register it in
    `harness/src/implementations.ts`. Run the focused matrix
    (`MPP_INTEROP_CLIENTS=<lang> MPP_INTEROP_SERVERS=rust pnpm test` and
    the inverse) before flipping `enabled: true`.
-7. **Apply the operability caveats.** Read
+8. **Apply the operability caveats.** Read
    `references/operability-caveats.md`. These are the gaps the Ruby
    gem's PR #142 follow-up closed (default `localnet` RPC, mainnet
    mint fallback on `localnet`, preflight + Surfnet cheatcode
@@ -80,7 +90,7 @@ the directory skeleton and CI from earlier ones.
    `recentBlockhash` in the x402 challenge, framework-host quirks).
    Every port has to land them; PRs that omit any of the numbered
    items need an explicit "not applicable" note in the body.
-8. **Write the README last.** Read `references/readme-template.md` and
+9. **Write the README last.** Read `references/readme-template.md` and
    fill in the title, badges, repo layout, basic snippet, install/usage,
    client and server matrices (with the seven rows above), example
    walkthrough, Solana dependency list, and links to spec. The matrix

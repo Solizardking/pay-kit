@@ -1,7 +1,72 @@
 set shell := ["bash", "-uc"]
 
+# Pinned upstream commits. Bump each `_ref` alongside an IDL refresh so
+# reproducibility doesn't depend on whatever `main` happens to be when
+# the `*-pull-idl` recipes were last run.
+subscriptions_repo     := "solana-foundation/subscriptions"
+subscriptions_ref      := "30a6f7cbd1c53862cc598d93cb771c2c86a10cbf"
+payment_channels_repo  := "Moonsong-Labs/solana-payment-channels"
+payment_channels_ref   := "f1b5e91482553fd1dce33aab4ff2a71cb6e734f8"
+
 default:
     @just --list
+
+# ── Codama codegen ──
+#
+# Single source of truth for Solana program clients consumed by the SDKs.
+# Today: pulls the subscriptions IDL from a pinned upstream commit and
+# renders a Rust client into `rust/crates/programs/subscriptions/`.
+# Extending to TS/Go/Python is a matter of dropping the matching
+# `@codama/renderers-*` into `skills/pay-sdk-implementation/codegen/`
+# and adding a recipe below.
+
+codegen_dir := "skills/pay-sdk-implementation/codegen"
+
+# Install codegen Node deps (run once after clone; idempotent).
+codegen-install:
+    cd {{codegen_dir}} && pnpm install
+
+# Fetch the subscriptions IDL from the pinned upstream commit into
+# `idl/subscriptions.json`. Vendor the file alongside the generated
+# client so codegen is reproducible from a clean checkout without a
+# round-trip to GitHub.
+subscriptions-pull-idl:
+    @mkdir -p idl
+    @echo "Fetching idl/subscriptions.json @ {{subscriptions_ref}}"
+    curl -fsSL \
+        "https://raw.githubusercontent.com/{{subscriptions_repo}}/{{subscriptions_ref}}/idl/subscriptions.json" \
+        -o idl/subscriptions.json
+    @echo "Wrote idl/subscriptions.json"
+
+# Render the Rust client from the vendored IDL. Wipes
+# `rust/crates/programs/subscriptions/src/generated/` and rewrites it
+# in place — see {{codegen_dir}}/generate-subscriptions-client.ts.
+subscriptions-generate-rs: codegen-install
+    cd {{codegen_dir}} && pnpm run subscriptions:rust
+    cd rust && cargo fmt -p subscriptions-client
+
+# Full refresh: pull IDL + regenerate Rust client.
+subscriptions-sync: subscriptions-pull-idl subscriptions-generate-rs
+
+# Fetch the payment-channels IDL from the pinned upstream commit into
+# `idl/payment-channels.json`.
+payment-channels-pull-idl:
+    @mkdir -p idl
+    @echo "Fetching idl/payment-channels.json @ {{payment_channels_ref}}"
+    curl -fsSL \
+        "https://raw.githubusercontent.com/{{payment_channels_repo}}/{{payment_channels_ref}}/program/payment_channels/idl/payment_channels.json" \
+        -o idl/payment-channels.json
+    @echo "Wrote idl/payment-channels.json"
+
+# Render the Rust client from the vendored IDL. Wipes
+# `rust/crates/programs/payment-channels/src/generated/` and rewrites
+# it in place — see {{codegen_dir}}/generate-payment-channels-client.ts.
+payment-channels-generate-rs: codegen-install
+    cd {{codegen_dir}} && pnpm run payment-channels:rust
+    cd rust && cargo fmt -p payment-channels-client
+
+# Full refresh: pull IDL + regenerate Rust client.
+payment-channels-sync: payment-channels-pull-idl payment-channels-generate-rs
 
 # ── TypeScript ──
 
