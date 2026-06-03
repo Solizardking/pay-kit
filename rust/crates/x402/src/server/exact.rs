@@ -875,6 +875,7 @@ mod tests {
             payload: PaymentProof::Signature {
                 signature: "sig".to_string(),
             },
+            extensions: None,
         };
         let header = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -907,6 +908,7 @@ mod tests {
             payload: PaymentProof::Signature {
                 signature: "sig".to_string(),
             },
+            extensions: None,
         };
         let wrong_scheme = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -936,6 +938,7 @@ mod tests {
                     bincode::serialize(&VersionedTransaction::from(tx)).unwrap(),
                 ),
             },
+            extensions: None,
         };
         let header = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -963,6 +966,7 @@ mod tests {
             payload: PaymentProof::Transaction {
                 transaction: "%%%".to_string(),
             },
+            extensions: None,
         };
         let header = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -989,6 +993,7 @@ mod tests {
             payload: PaymentProof::Signature {
                 signature: "not-a-signature".to_string(),
             },
+            extensions: None,
         };
         let header = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -1031,6 +1036,7 @@ mod tests {
                 signature: "5UfDuX6nSqMzMR8W7n6K3b1GKLmaqEisBFCcYPRLjNHrCbVQJF3BVjkE7aQJMQ2Kx"
                     .to_string(),
             },
+            extensions: None,
         };
         base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -1189,6 +1195,7 @@ mod tests {
             payload: PaymentProof::Transaction {
                 transaction: "%%%".to_string(),
             },
+            extensions: None,
         };
         let header = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
