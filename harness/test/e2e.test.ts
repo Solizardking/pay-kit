@@ -13,6 +13,11 @@ import {
   serverImplementations,
 } from "../src/implementations";
 import { runClient, startServer, stopServer } from "../src/process";
+import {
+  evaluateShardEligibility,
+  SOCKET_UNAVAILABLE_CI_MESSAGE,
+  socketGateMode,
+} from "../src/guards";
 
 type RunningServer = Awaited<ReturnType<typeof startServer>>;
 
@@ -316,7 +321,27 @@ describe("mpp interop", () => {
   const activeClients = clientImplementations.filter(
     (implementation) => implementation.enabled,
   );
-  const socketAwareIt = socketSupport ? it : it.skip;
+  // P0: a sandbox that cannot bind a loopback socket must NOT green-skip
+  // the whole matrix under CI. Outside CI we still skip so a restricted
+  // local box does not go red. `socketAwareIt` registers a real test, a
+  // skip, or a hard-failing test depending on the gate mode.
+  const gateMode = socketGateMode(socketSupport);
+  const socketAwareIt = (
+    name: string,
+    body: () => void | Promise<void>,
+  ): void => {
+    if (gateMode === "run") {
+      it(name, body);
+      return;
+    }
+    if (gateMode === "fail") {
+      it(name, () => {
+        throw new Error(SOCKET_UNAVAILABLE_CI_MESSAGE);
+      });
+      return;
+    }
+    it.skip(name, body);
+  };
 
   for (const scenario of activeScenarios) {
     // Cross-server portability and idempotent-resubmit scenarios
@@ -333,16 +358,54 @@ describe("mpp interop", () => {
     // alongside MPP_INTEROP_* (same fixtures), and the pair filter
     // below gates on `impl.intents.includes(scenario.intent)` so
     // charge-only adapters skip x402 scenarios automatically.
-    const scenarioServers = activeServers.filter(
-      (implementation) =>
-        (implementation.intents ?? ["charge"]).includes(scenario.intent) &&
-        (!scenario.serverIds || scenario.serverIds.includes(implementation.id)),
-    );
-    const scenarioClients = activeClients.filter(
-      (implementation) =>
-        (implementation.intents ?? ["charge"]).includes(scenario.intent) &&
-        (!scenario.clientIds || scenario.clientIds.includes(implementation.id)),
-    );
+    const intentServerFilter = (implementation: {
+      id: string;
+      intents?: string[];
+    }) =>
+      (implementation.intents ?? ["charge"]).includes(scenario.intent) &&
+      (!scenario.serverIds || scenario.serverIds.includes(implementation.id));
+    const intentClientFilter = (implementation: {
+      id: string;
+      intents?: string[];
+    }) =>
+      (implementation.intents ?? ["charge"]).includes(scenario.intent) &&
+      (!scenario.clientIds || scenario.clientIds.includes(implementation.id));
+
+    const scenarioServers = activeServers.filter(intentServerFilter);
+    const scenarioClients = activeClients.filter(intentClientFilter);
+    // Full-registry eligibility (ignores the `enabled` shard flag) so the
+    // guard can tell a legitimate shard exclusion from a genuine false green.
+    const fullServers = serverImplementations.filter(intentServerFilter);
+    const fullClients = clientImplementations.filter(intentClientFilter);
+
+    // P0 zero-eligible guard, shard-aware: a scenario that has no eligible
+    // client/server/pair across the FULL adapter registry is a false green
+    // and hard-fails. A scenario that is eligible in the full registry but
+    // excluded by THIS shard's enabled-adapter subset is a legitimate
+    // shard skip, not a false green.
+    const eligibility = evaluateShardEligibility({
+      scenarioId: scenario.id,
+      shard: {
+        clientCount: scenarioClients.length,
+        serverCount: scenarioServers.length,
+        pairCount: scenarioServers.length * scenarioClients.length,
+      },
+      full: {
+        clientCount: fullClients.length,
+        serverCount: fullServers.length,
+        pairCount: fullServers.length * fullClients.length,
+      },
+    });
+    it(`${scenario.id}: has at least one eligible client/server pair`, () => {
+      // evaluateShardEligibility already threw above if globally empty; this
+      // test exists to keep the guard visible per-scenario in the report.
+      if (eligibility.verdict === "skip") {
+        console.log(`[interop] ${eligibility.reason}`);
+      }
+    });
+    if (eligibility.verdict === "skip") {
+      continue;
+    }
 
     for (const serverImplementation of scenarioServers) {
       for (const clientImplementation of scenarioClients) {
@@ -478,10 +541,42 @@ describe("mpp interop", () => {
 
   for (const scenario of crossServerScenarios) {
     const pairs = scenario.crossServerPairs ?? [];
-    const eligibleClients = activeClients.filter(
-      (implementation) =>
-        !scenario.clientIds || scenario.clientIds.includes(implementation.id),
+    const clientFilter = (implementation: { id: string }) =>
+      !scenario.clientIds || scenario.clientIds.includes(implementation.id);
+    const eligibleClients = activeClients.filter(clientFilter);
+    const resolvablePairs = pairs.filter(
+      ([aId, bId]) =>
+        activeServers.some((impl) => impl.id === aId) &&
+        activeServers.some((impl) => impl.id === bId),
     );
+    // Full-registry view (ignores the shard `enabled` flag).
+    const fullEligibleClients = clientImplementations.filter(clientFilter);
+    const fullResolvablePairs = pairs.filter(
+      ([aId, bId]) =>
+        serverImplementations.some((impl) => impl.id === aId) &&
+        serverImplementations.some((impl) => impl.id === bId),
+    );
+    const eligibility = evaluateShardEligibility({
+      scenarioId: scenario.id,
+      shard: {
+        clientCount: eligibleClients.length,
+        serverCount: resolvablePairs.length,
+        pairCount: resolvablePairs.length * eligibleClients.length,
+      },
+      full: {
+        clientCount: fullEligibleClients.length,
+        serverCount: fullResolvablePairs.length,
+        pairCount: fullResolvablePairs.length * fullEligibleClients.length,
+      },
+    });
+    it(`${scenario.id}: has at least one eligible cross-server pair`, () => {
+      if (eligibility.verdict === "skip") {
+        console.log(`[interop] ${eligibility.reason}`);
+      }
+    });
+    if (eligibility.verdict === "skip") {
+      continue;
+    }
     for (const [aId, bId] of pairs) {
       const serverA = activeServers.find((impl) => impl.id === aId);
       const serverB = activeServers.find((impl) => impl.id === bId);
@@ -531,12 +626,35 @@ describe("mpp interop", () => {
   }
 
   for (const scenario of idempotentScenarios) {
-    const eligibleServers = activeServers.filter(
-      (impl) => !scenario.serverIds || scenario.serverIds.includes(impl.id),
-    );
-    const eligibleClients = activeClients.filter(
-      (impl) => !scenario.clientIds || scenario.clientIds.includes(impl.id),
-    );
+    const serverFilter = (impl: { id: string }) =>
+      !scenario.serverIds || scenario.serverIds.includes(impl.id);
+    const clientFilter = (impl: { id: string }) =>
+      !scenario.clientIds || scenario.clientIds.includes(impl.id);
+    const eligibleServers = activeServers.filter(serverFilter);
+    const eligibleClients = activeClients.filter(clientFilter);
+    const fullEligibleServers = serverImplementations.filter(serverFilter);
+    const fullEligibleClients = clientImplementations.filter(clientFilter);
+    const eligibility = evaluateShardEligibility({
+      scenarioId: scenario.id,
+      shard: {
+        clientCount: eligibleClients.length,
+        serverCount: eligibleServers.length,
+        pairCount: eligibleServers.length * eligibleClients.length,
+      },
+      full: {
+        clientCount: fullEligibleClients.length,
+        serverCount: fullEligibleServers.length,
+        pairCount: fullEligibleServers.length * fullEligibleClients.length,
+      },
+    });
+    it(`${scenario.id}: has at least one eligible idempotent pair`, () => {
+      if (eligibility.verdict === "skip") {
+        console.log(`[interop] ${eligibility.reason}`);
+      }
+    });
+    if (eligibility.verdict === "skip") {
+      continue;
+    }
     for (const serverImplementation of eligibleServers) {
       for (const clientImplementation of eligibleClients) {
         socketAwareIt(
