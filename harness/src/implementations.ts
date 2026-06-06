@@ -365,4 +365,21 @@ export const serverImplementations: ImplementationDefinition[] = [
     intents: ["x402-exact"],
     reportsAs: "ruby",
   },
+  {
+    // Clawd x402 demo server — proxies to x402.wtf (live mainnet gateway).
+    // Requires: pnpm install inside demo/clawd-server/ and a funded fee-payer
+    // keypair in FEE_PAYER_KEY. Opt in via X402_INTEROP_SERVERS=clawd-x402.
+    // The server reports "typescript" because it is built on the TS MPP SDK.
+    id: "clawd-x402",
+    label: "Clawd x402 gateway server (x402.wtf)",
+    role: "server",
+    command: [
+      "sh",
+      "-c",
+      "cd ../demo/clawd-server && pnpm start",
+    ],
+    enabled: isEnabled("clawd-x402", "X402_INTEROP_SERVERS", false),
+    intents: ["charge", "x402-exact"],
+    reportsAs: "typescript",
+  },
 ];
