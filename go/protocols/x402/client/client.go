@@ -141,6 +141,10 @@ type ChallengeSelection struct {
 type challengeEnvelope struct {
 	X402Version int                 `json:"x402Version"`
 	Accepts     []x402.AcceptsEntry `json:"accepts"`
+	// Extensions is the untyped v2 `extensions` passthrough the server
+	// advertised on the challenge (rust PaymentRequiredEnvelope.extensions).
+	// The client echoes it into the outbound credential. nil when absent.
+	Extensions json.RawMessage `json:"extensions"`
 }
 
 // ParseChallenge parses an x402 challenge and selects one offer per the
@@ -164,36 +168,65 @@ func ParseChallenge(h http.Header, body []byte, sel ChallengeSelection) (*x402.A
 // transport can stay a v2 producer by default and only fall back to the
 // v1 producer when the server itself spoke v1.
 func ParseChallengeVersioned(h http.Header, body []byte, sel ChallengeSelection) (*x402.AcceptsEntry, int, bool) {
+	entry, version, _, ok := ParseChallengeVersionedWithExtensions(h, body, sel)
+	return entry, version, ok
+}
+
+// ParseChallengeWithExtensions is ParseChallenge plus the verbatim v2
+// `extensions` object the server advertised on the matched challenge
+// envelope (rust PaymentRequiredEnvelope.extensions). The returned raw is
+// nil when the server advertised none; pass it to
+// BuildPaymentHeaderWithExtensions so the client echoes it back per x402
+// v2 §5.1.2.
+func ParseChallengeWithExtensions(h http.Header, body []byte, sel ChallengeSelection) (*x402.AcceptsEntry, json.RawMessage, bool) {
+	entry, _, ext, ok := ParseChallengeVersionedWithExtensions(h, body, sel)
+	return entry, ext, ok
+}
+
+// ParseChallengeVersionedWithExtensions is the unified challenge parser: it
+// reports the selected offer, the declared wire version (so the transport
+// emits the matching producer), and the verbatim v2 `extensions` object the
+// server advertised (so the client echoes it per x402 v2 §5.1.2). The
+// dual-read precedence mirrors the rust spine: the canonical
+// PAYMENT-REQUIRED header first, then the legacy X-PAYMENT-REQUIRED header,
+// then the 402 JSON body. The version defaults to the canonical version
+// when the field is absent; advertised is nil when the server advertised
+// no extensions (the legacy v1 wire never carries them).
+func ParseChallengeVersionedWithExtensions(h http.Header, body []byte, sel ChallengeSelection) (*x402.AcceptsEntry, int, json.RawMessage, bool) {
 	if raw := h.Get(paymentRequiredHeader); raw != "" {
 		if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil {
-			if entry, version := selectFromJSON(decoded, sel); entry != nil {
-				return entry, version, true
+			if entry, version, ext := selectFromJSON(decoded, sel); entry != nil {
+				return entry, version, ext, true
 			}
 		}
 	}
 	if raw := h.Get(paymentRequiredHeaderLegacy); raw != "" {
-		if entry, version := selectFromJSON([]byte(raw), sel); entry != nil {
-			return entry, version, true
+		if entry, version, ext := selectFromJSON([]byte(raw), sel); entry != nil {
+			return entry, version, ext, true
 		}
 	}
 	if len(body) > 0 {
-		if entry, version := selectFromJSON(body, sel); entry != nil {
-			return entry, version, true
+		if entry, version, ext := selectFromJSON(body, sel); entry != nil {
+			return entry, version, ext, true
 		}
 	}
-	return nil, 0, false
+	return nil, 0, nil, false
 }
 
-func selectFromJSON(raw []byte, sel ChallengeSelection) (*x402.AcceptsEntry, int) {
+func selectFromJSON(raw []byte, sel ChallengeSelection) (*x402.AcceptsEntry, int, json.RawMessage) {
 	var env challengeEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, 0
+		return nil, 0, nil
+	}
+	entry := selectEntry(env.Accepts, sel)
+	if entry == nil {
+		return nil, 0, nil
 	}
 	version := env.X402Version
 	if version == 0 {
 		version = x402Version
 	}
-	return selectEntry(env.Accepts, sel), version
+	return entry, version, env.Extensions
 }
 
 // selectEntry implements the Rust select_requirement logic: keep Solana
@@ -303,8 +336,32 @@ func BuildPaymentHeader(
 	rpc solanatx.RPCClient,
 	entry *x402.AcceptsEntry,
 ) (string, error) {
+	return BuildPaymentHeaderWithExtensions(ctx, signer, rpc, entry, nil)
+}
+
+// BuildPaymentHeaderWithExtensions is BuildPaymentHeader plus the x402 v2
+// echo-and-append rule (§5.1.2). It echoes the inbound challenge
+// `extensions` object (advertised) into the outbound credential verbatim,
+// preserving unknown extensions, and when the server marks payment-identifier
+// info.required=true it appends a freshly generated `pay_`-shaped id
+// (GeneratePaymentIdentifierID) without overwriting the server's fields.
+// Pass advertised=nil (the server advertised no extensions) to omit the
+// `extensions` object entirely. Mirrors rust build_payment_header(...,
+// extensions) + PaymentExtensions::echoing + with_payment_identifier_id
+// (payment.rs:132-150, types.rs:548-565).
+func BuildPaymentHeaderWithExtensions(
+	ctx context.Context,
+	signer solanatx.Signer,
+	rpc solanatx.RPCClient,
+	entry *x402.AcceptsEntry,
+	advertised json.RawMessage,
+) (string, error) {
 	if entry == nil {
 		return "", errors.New("x402 client: nil accept entry")
+	}
+	extensions, err := echoAndAppendExtensions(advertised)
+	if err != nil {
+		return "", err
 	}
 	txBase64, err := buildTransaction(ctx, signer, rpc, entry)
 	if err != nil {
@@ -314,14 +371,39 @@ func BuildPaymentHeader(
 		X402Version: x402Version,
 		// v2 omits top-level scheme/network (they ride in `accepted`),
 		// matching the rust spine; only the v1 producer sets them.
-		Payload:  x402.CredentialPayload{Transaction: txBase64},
-		Accepted: entry,
+		Payload:    x402.CredentialPayload{Transaction: txBase64},
+		Accepted:   entry,
+		Extensions: extensions,
 	}
 	raw, err := json.Marshal(credential)
 	if err != nil {
 		return "", fmt.Errorf("x402 client: marshal credential: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// echoAndAppendExtensions implements the x402 v2 §5.1.2 echo-and-append
+// rule: echo the inbound challenge extensions verbatim, and when the server
+// requires a payment-identifier and the client has not already supplied an
+// id, generate a fresh `pay_`-shaped one. Returns nil when the server
+// advertised no extensions or the echoed object is empty, so the outbound
+// omits the `extensions` key (never an empty {}), matching rust
+// skip_serializing_if = Option::is_none + PaymentExtensions::is_empty.
+func echoAndAppendExtensions(advertised json.RawMessage) (*x402.PaymentExtensions, error) {
+	extensions, err := x402.EchoExtensions(advertised)
+	if err != nil {
+		return nil, fmt.Errorf("x402 client: echo extensions: %w", err)
+	}
+	if extensions == nil {
+		return nil, nil
+	}
+	if extensions.RequiresPaymentIdentifier() && extensions.PaymentIdentifierID() == "" {
+		extensions.WithPaymentIdentifierID(x402.GeneratePaymentIdentifierID())
+	}
+	if extensions.IsEmpty() {
+		return nil, nil
+	}
+	return extensions, nil
 }
 
 // BuildPaymentHeaderV1 builds and signs the transaction the selected offer
@@ -558,7 +640,7 @@ func (t *PaymentTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
-	entry, version, ok := ParseChallengeVersioned(resp.Header, respBody, t.Selection)
+	entry, version, advertised, ok := ParseChallengeVersionedWithExtensions(resp.Header, respBody, t.Selection)
 	if !ok {
 		return resp, nil // not an x402 offer we can satisfy; hand back the 402.
 	}
@@ -572,7 +654,8 @@ func (t *PaymentTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	// legacy X-PAYMENT producer, everything else stays on the canonical
 	// Payment-Signature producer (the default). Mirrors the rust client
 	// emitting the version the server's challenge declared while keeping
-	// v2 the default producer.
+	// v2 the default producer. The legacy v1 wire carries no extensions;
+	// the v2 producer echoes the advertised challenge extensions (§5.1.2).
 	if version == x402VersionLegacy {
 		header, err := BuildPaymentHeaderV1(req.Context(), t.Signer, t.RPC, entry)
 		if err != nil {
@@ -582,7 +665,7 @@ func (t *PaymentTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return t.base().RoundTrip(retry)
 	}
 
-	header, err := BuildPaymentHeader(req.Context(), t.Signer, t.RPC, entry)
+	header, err := BuildPaymentHeaderWithExtensions(req.Context(), t.Signer, t.RPC, entry, advertised)
 	if err != nil {
 		return nil, err
 	}

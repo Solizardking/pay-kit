@@ -52,6 +52,10 @@ from pay_kit.protocols.x402.client.exact.payment import (
     build_payment_header,
     build_payment_header_legacy,
 )
+from pay_kit.protocols.x402.exact.extensions import (
+    PAYMENT_IDENTIFIER_KEY,
+    verify_payment_identifier,
+)
 from pay_kit.protocols.x402.exact.legacy import caip2_for_network
 from pay_kit.protocols.x402.exact.verify import (
     EXACT_SCHEME,
@@ -91,8 +95,7 @@ class OfflineRPC:
 
     async def _refuse(self, method: str) -> Any:
         raise RuntimeError(
-            f"offline conformance runner refused RPC call {method}: "
-            "vector must pin blockhash and token program"
+            f"offline conformance runner refused RPC call {method}: vector must pin blockhash and token program"
         )
 
     async def get_latest_blockhash(self, *args: Any, **kwargs: Any) -> Any:
@@ -411,6 +414,30 @@ def _decode_envelope_shape(header_b64: str) -> dict[str, Any]:
         shape["acceptedAsset"] = accepted.get("asset")
         shape["acceptedPayTo"] = accepted.get("payTo")
         shape["acceptedAmount"] = accepted.get("amount")
+
+    # Surface the v2 extensions object. ``hasExtensions`` is false when the key
+    # is absent OR present-but-empty (the echo-and-omit rule means a conforming
+    # build never emits an empty ``extensions: {}``, but a decoder must still
+    # classify a stray ``{}`` as "no extensions"). Mirrors decodeEnvelopeShape
+    # in harness/src/conformance/x402.ts.
+    extensions = env.get("extensions")
+    if isinstance(extensions, dict):
+        keys = sorted(extensions.keys())
+        shape["hasExtensions"] = len(keys) > 0
+        shape["extensionKeys"] = keys
+        pid = extensions.get(PAYMENT_IDENTIFIER_KEY)
+        shape["hasPaymentIdentifier"] = isinstance(pid, dict)
+        if isinstance(pid, dict):
+            info = pid.get("info")
+            if isinstance(info, dict):
+                if "required" in info:
+                    shape["paymentIdentifierRequired"] = info.get("required")
+                if "id" in info:
+                    shape["paymentIdentifierId"] = info.get("id")
+    else:
+        shape["hasExtensions"] = False
+        shape["hasPaymentIdentifier"] = False
+        shape["extensionKeys"] = []
     return shape
 
 
@@ -429,14 +456,32 @@ async def _x402_build_header(vector: dict[str, Any]) -> str:
     if not offer:
         raise ValueError("x402 build vector is missing input.x402Offer")
 
+    # Echo-and-append (x402 v2 §5.1.2): the server's advertised extensions are
+    # echoed back onto the credential, with payment-identifier.info.id filled
+    # when required. A pinned id keeps the build deterministic for byte-asserted
+    # vectors; otherwise the client generates a fresh pay_ id.
+    advertised_extensions = inp.get("x402AdvertisedExtensions")
+    payment_identifier_id = inp.get("x402PaymentIdentifierId")
+
     signer = LocalSigner.generate()
-    builder = build_payment_header_legacy if inp.get("x402Version") == X402_VERSION_V1 else build_payment_header
-    return await builder(
+    # The legacy v1 producer has no `extensions` concept, so it does not accept
+    # the echo-and-append kwargs; only the v2 producer does.
+    if inp.get("x402Version") == X402_VERSION_V1:
+        return await build_payment_header_legacy(
+            signer,
+            OfflineRPC(),
+            offer,
+            recent_blockhash_provider=lambda: _X402_PINNED_BLOCKHASH,
+            memo_nonce=lambda: _X402_PINNED_MEMO_NONCE,
+        )
+    return await build_payment_header(
         signer,
         OfflineRPC(),
         offer,
         recent_blockhash_provider=lambda: _X402_PINNED_BLOCKHASH,
         memo_nonce=lambda: _X402_PINNED_MEMO_NONCE,
+        advertised_extensions=advertised_extensions,
+        payment_identifier_id=payment_identifier_id,
     )
 
 
@@ -476,15 +521,23 @@ def _x402_verify(vector: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Network mismatch: expected {expected_network}, got {accepted_network}")
         # accepted-vs-route field comparison (rust verify_envelope_payload).
         if (accepted.get("amount") or "") != (inp.get("x402ServerAmount") or ""):
-            raise ValueError(
-                f"Amount mismatch: expected {inp.get('x402ServerAmount')}, got {accepted.get('amount')}"
-            )
+            raise ValueError(f"Amount mismatch: expected {inp.get('x402ServerAmount')}, got {accepted.get('amount')}")
         if (accepted.get("payTo") or "") != (inp.get("x402ServerRecipient") or ""):
             raise ValueError("Recipient mismatch: credential claims a different recipient")
         if (accepted.get("asset") or "") != (inp.get("x402ServerCurrency") or ""):
             raise ValueError(
                 f"Currency mismatch: expected {inp.get('x402ServerCurrency')}, got {accepted.get('asset')}"
             )
+        # Extensions reject gate: when the route requires a payment-identifier,
+        # the echoed credential must carry a valid pay_-shaped id. Missing,
+        # empty, or pattern-violating ids are rejected (coinbase spec: HTTP 400).
+        # Layered after the accepted-vs-route checks, mirroring the rust spine
+        # and the TS reference verifyPaymentHeader gate.
+        extensions = env.get("extensions")
+        verify_payment_identifier(
+            extensions if isinstance(extensions, dict) else None,
+            required=bool(inp.get("x402ServerRequiresPaymentIdentifier")),
+        )
     elif version == X402_VERSION_V1:
         # Legacy arm: no ``accepted`` object. Bind only scheme + the plain
         # network slug (normalized to CAIP-2) against the route. Mirrors the v1
@@ -571,6 +624,10 @@ _REJECT_PATTERNS: list[tuple[str, str]] = [
     # likewise precedes the fallback. Mirrors harness/src/conformance/reject.ts.
     (r"unsupported x402 version", "unsupported-version"),
     (r"network mismatch", "wrong-network"),
+    # x402-exact extensions: the route required a payment-identifier id but the
+    # credential echoed none / an invalid one. Must precede the generic
+    # invalid/payload fallback. Mirrors harness/src/conformance/reject.ts.
+    (r"payment.identifier .*(required|missing|invalid)", "payment-identifier-required"),
 ]
 
 
