@@ -34,7 +34,6 @@ use Throwable;
  */
 final class Adapter
 {
-    private const PAYMENT_SIGNATURE_HEADER = 'payment-signature';
     // Legacy x402 client payment header (coinbase/x402 SVM). v1 carries the
     // credential here instead of PAYMENT-SIGNATURE; the server reads the v2
     // header first, then falls back to this one. Mirrors the rust spine
@@ -46,7 +45,6 @@ final class Adapter
     // X402_VERSION_V1 / X402_VERSION_V2 constants.
     private const X402_VERSION             = 2;
     private const X402_VERSION_V1          = 1;
-    private const TOKEN_PROGRAM            = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
     private const EXACT_SCHEME             = 'exact';
     private const REPLAY_KEY_PREFIX        = 'x402-svm-exact:consumed:';
 
