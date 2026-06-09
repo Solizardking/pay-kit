@@ -3,19 +3,19 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 60;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A1000010000000000000A001 /* iOSDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000000000000A001 /* iOSDemoApp.swift */; };
+		A1000010000000000000A001 /* PayKitDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000000000000A001 /* PayKitDemoApp.swift */; };
 		A1000010000000000000A002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000000000000A002 /* ContentView.swift */; };
 		A1000010000000000000A003 /* DemoSigner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000000000000A003 /* DemoSigner.swift */; };
 		A1000010000000000000A004 /* SolanaPayKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1000050000000000000A001 /* SolanaPayKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A1000020000000000000A000 /* iOSDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iOSDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		A1000020000000000000A001 /* iOSDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iOSDemoApp.swift; sourceTree = "<group>"; };
+		A1000020000000000000A000 /* PayKitDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PayKitDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1000020000000000000A001 /* PayKitDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PayKitDemoApp.swift; sourceTree = "<group>"; };
 		A1000020000000000000A002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A1000020000000000000A003 /* DemoSigner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoSigner.swift; sourceTree = "<group>"; };
 		A1000020000000000000A004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -37,21 +37,21 @@
 		A1000040000000000000A000 = {
 			isa = PBXGroup;
 			children = (
-				A1000040000000000000A001 /* iOSDemo */,
+				A1000040000000000000A001 /* PayKitDemo */,
 				A1000040000000000000A002 /* Packages */,
 				A1000040000000000000A003 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		A1000040000000000000A001 /* iOSDemo */ = {
+		A1000040000000000000A001 /* PayKitDemo */ = {
 			isa = PBXGroup;
 			children = (
-				A1000020000000000000A001 /* iOSDemoApp.swift */,
+				A1000020000000000000A001 /* PayKitDemoApp.swift */,
 				A1000020000000000000A002 /* ContentView.swift */,
 				A1000020000000000000A003 /* DemoSigner.swift */,
 				A1000020000000000000A004 /* Info.plist */,
 			);
-			path = iOSDemo;
+			path = PayKitDemo;
 			sourceTree = "<group>";
 		};
 		A1000040000000000000A002 /* Packages */ = {
@@ -65,7 +65,7 @@
 		A1000040000000000000A003 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				A1000020000000000000A000 /* iOSDemo.app */,
+				A1000020000000000000A000 /* PayKitDemo.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -73,9 +73,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A1000060000000000000A000 /* iOSDemo */ = {
+		A1000060000000000000A000 /* PayKitDemo */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = A1000080000000000000A000 /* Build configuration list for PBXNativeTarget "iOSDemo" */;
+			buildConfigurationList = A1000080000000000000A000 /* Build configuration list for PBXNativeTarget "PayKitDemo" */;
 			buildPhases = (
 				A1000070000000000000A000 /* Sources */,
 				A1000030000000000000A000 /* Frameworks */,
@@ -85,12 +85,12 @@
 			);
 			dependencies = (
 			);
-			name = iOSDemo;
+			name = PayKitDemo;
 			packageProductDependencies = (
 				A1000050000000000000A001 /* SolanaPayKit */,
 			);
-			productName = iOSDemo;
-			productReference = A1000020000000000000A000 /* iOSDemo.app */;
+			productName = PayKitDemo;
+			productReference = A1000020000000000000A000 /* PayKitDemo.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -108,7 +108,7 @@
 					};
 				};
 			};
-			buildConfigurationList = A1000080000000000000A001 /* Build configuration list for PBXProject "iOSDemo" */;
+			buildConfigurationList = A1000080000000000000A001 /* Build configuration list for PBXProject "PayKitDemo" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -124,7 +124,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A1000060000000000000A000 /* iOSDemo */,
+				A1000060000000000000A000 /* PayKitDemo */,
 			);
 		};
 /* End PBXProject section */
@@ -144,7 +144,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A1000010000000000000A001 /* iOSDemoApp.swift in Sources */,
+				A1000010000000000000A001 /* PayKitDemoApp.swift in Sources */,
 				A1000010000000000000A002 /* ContentView.swift in Sources */,
 				A1000010000000000000A003 /* DemoSigner.swift in Sources */,
 			);
@@ -271,10 +271,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = "";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 4HY7TSGF6M;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = iOSDemo/Info.plist;
+				INFOPLIST_FILE = PayKitDemo/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsControllers = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -283,7 +283,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "dev.solana-mpp.iosdemo";
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.solana-mpp.paykitdemo";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -298,10 +298,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = "";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 4HY7TSGF6M;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = iOSDemo/Info.plist;
+				INFOPLIST_FILE = PayKitDemo/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsControllers = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -310,7 +310,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "dev.solana-mpp.iosdemo";
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.solana-mpp.paykitdemo";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -321,7 +321,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A1000080000000000000A000 /* Build configuration list for PBXNativeTarget "iOSDemo" */ = {
+		A1000080000000000000A000 /* Build configuration list for PBXNativeTarget "PayKitDemo" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A10000B0000000000000A003 /* Debug */,
@@ -330,7 +330,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		A1000080000000000000A001 /* Build configuration list for PBXProject "iOSDemo" */ = {
+		A1000080000000000000A001 /* Build configuration list for PBXProject "PayKitDemo" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				A10000B0000000000000A001 /* Debug */,

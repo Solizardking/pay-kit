@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A1000060000000000000A000"
-               BuildableName = "iOSDemo.app"
-               BlueprintName = "iOSDemo"
-               ReferencedContainer = "container:iOSDemo.xcodeproj">
+               BuildableName = "PayKitDemo.app"
+               BlueprintName = "PayKitDemo"
+               ReferencedContainer = "container:PayKitDemo.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -45,9 +45,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A1000060000000000000A000"
-            BuildableName = "iOSDemo.app"
-            BlueprintName = "iOSDemo"
-            ReferencedContainer = "container:iOSDemo.xcodeproj">
+            BuildableName = "PayKitDemo.app"
+            BlueprintName = "PayKitDemo"
+            ReferencedContainer = "container:PayKitDemo.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -62,9 +62,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A1000060000000000000A000"
-            BuildableName = "iOSDemo.app"
-            BlueprintName = "iOSDemo"
-            ReferencedContainer = "container:iOSDemo.xcodeproj">
+            BuildableName = "PayKitDemo.app"
+            BlueprintName = "PayKitDemo"
+            ReferencedContainer = "container:PayKitDemo.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>
