@@ -112,7 +112,7 @@ The Solana charge intent, in both pull (client-signed) and push
 |---|:---:|:---:|
 | `mpp/charge/pull` | ✅ | ✅ |
 | `mpp/charge/push` | ✅ | ✅ |
-| `mpp/session` | — | — |
+| `mpp/session` | ✅ | ✅ |
 | `mpp/subscription` | — | — |
 
 For `mpp/charge/pull`: the server owns the full lifecycle. It issues
@@ -129,6 +129,64 @@ For `mpp/charge/push`: the server fetches the transaction by signature
 with `getTransaction`, rejects failed or missing metadata, reuses the
 same structural transaction verifier as pull mode, consumes the
 signature through replay storage, and emits the same receipt shape.
+
+For `mpp/session`: both sides ship.
+
+Client side:
+
+- session challenge parsing and selection (`ParseSessionChallenge`,
+  `SelectSessionChallenge` with network/currency/mode filters; omitted
+  or empty `modes` means push-only),
+- payment-channel open builders driven by the challenge (deposit
+  defaults to the cap, grace period 900s, random salt, token program
+  resolved from the currency so Token-2022 mints work, operator as fee
+  payer with a payer partial-sign, challenge `recentBlockhash` echo,
+  `PendingServerSignature` placeholder) for push and pull/clientVoucher,
+- `ActiveSession` voucher signing with the prepare/record watermark
+  split, `SessionConsumer` for metered deliveries, and the metered SSE
+  layer (`SseDecoder`, `MeteredSseSession`, `MeteredSseStream`,
+  `HTTPCommitTransport`).
+
+Server side (`NewSession`, mirroring the TypeScript `session()` method
+over the rust `SessionServer` core):
+
+- HMAC-bound 402 session challenges (`Session.Challenge`): cap clamped
+  to the server max, `minVoucherDelta` only when positive, `modes`
+  omitted when push-only, `pullVoucherStrategy` only when pull is
+  offered, optional `recentBlockhash` prefetch via the configured RPC
+  client,
+- credential verification (`Session.VerifyCredential`) dispatching the
+  open / voucher / commit / topUp / close actions over an atomic
+  per-channel `ChannelStore` with the harness-tested voucher check
+  order, idempotent open replays that never reset the watermark, and a
+  re-drivable close until a settlement signature is recorded,
+- on-chain open handling: structural `VerifyOpenTx` for client-broadcast
+  opens (legacy and v0 encodings, payload signature binding, channel
+  PDA re-derivation) and `SubmitOpenTx` server broadcast that completes
+  the fee-payer signature and waits for confirmation,
+- the reserve/commit metering side channel (`Session.Routes`) hosts
+  mount at `POST /__402/session/deliveries` and
+  `POST /__402/session/commit` (a TypeScript-server extension, not in
+  the rust crate), plus `SessionMiddleware` for `net/http` routes,
+- a server-side metered SSE writer (`MeteredStream`) emitting the
+  `mpp.metering` / `mpp.usage` / `[DONE]` frames the client decoder
+  consumes,
+- an idle-close watchdog (`CloseDelay`) and close settlement
+  (settle_and_finalize + Ed25519 precompile + distribute in one
+  merchant-signed transaction), both of which settle on-chain only when
+  a merchant `Signer` and an `RPC` client are configured; without them
+  payload claims are trusted as provided, matching rust with `rpc_url`
+  unset.
+
+Out of scope: pull/operatedVoucher (multi-delegate program builders) on
+both sides, including the `initMultiDelegateTx` submission seam in the
+TypeScript open handler, the SPL `approve` delegation transaction for
+non-channel pull opens (the on-chain delegation happens out of band),
+and a `SessionFetch`-style drop-in fetch wrapper. The TypeScript
+`SessionFetchClient` semantics that wrapper would own (per-channel
+commit watermark reset on re-open, failed-commit retryability without
+latching) therefore have no Go counterpart; the `ActiveSession`
+prepare/record split is the building block callers compose instead.
 
 ## Examples
 
