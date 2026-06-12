@@ -3,6 +3,7 @@ plugins {
     kotlin("plugin.serialization") version "2.3.21"
     `java-library`
     jacoco
+    id("org.jetbrains.dokka") version "1.9.20"
 }
 
 group = "com.solana.paykit"
@@ -21,7 +22,7 @@ dependencies {
     // functions, so coroutines is part of the SDK's exported API.
     api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
     // BouncyCastle gives a deterministic Ed25519 signer that takes the raw
-    // 32 byte seed format Solana keypair files (and the MPP interop
+    // 32 byte seed format Solana keypair files (and the MPP harness
     // harness) ship in. The JDK Ed25519 provider does not expose that
     // wire-level seed import path on every JVM.
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
@@ -76,4 +77,12 @@ tasks.jacocoTestCoverageVerification {
 
 tasks.check {
     dependsOn(tasks.jacocoTestCoverageVerification)
+}
+
+// Dokka GFM — emit GitHub-flavored markdown to the unified docs/api/kotlin/
+// tree alongside the other languages' MD output. Invoke via
+// `./gradlew dokkaGfm` or `just docs-kt`.
+tasks.named<org.jetbrains.dokka.gradle.DokkaTask>("dokkaGfm") {
+    outputDirectory.set(rootDir.parentFile.resolve("docs/api/kotlin"))
+    moduleName.set("com.solana.paykit")
 }
