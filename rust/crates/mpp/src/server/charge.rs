@@ -13,9 +13,17 @@
 //! // Generate a charge challenge (returns HTTP 402)
 //! let challenge = mpp.charge("0.10")?;
 //!
-//! // Verify a credential from Authorization header
+//! // Verify a credential from Authorization header. The expected ChargeRequest
+//! // pins the route's amount/currency/recipient so a credential paid for one
+//! // route can't be replayed against another (audit #2).
 //! let credential = solana_mpp::PaymentCredential::from_header(&auth_header)?;
-//! let receipt = mpp.verify_credential(&credential).await?;
+//! let expected = solana_mpp::ChargeRequest {
+//!     amount: "100000".to_string(),
+//!     currency: "USDC".to_string(),
+//!     recipient: Some("...".to_string()),
+//!     ..Default::default()
+//! };
+//! let receipt = mpp.verify_credential_with_expected(&credential, &expected).await?;
 //! ```
 
 use std::{collections::HashSet, sync::Arc};
@@ -43,10 +51,47 @@ const METHOD_NAME: &str = "solana";
 const COMPUTE_BUDGET_PROGRAM: &str = "ComputeBudget111111111111111111111111111111";
 const MAX_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 5_000_000;
+/// Tighter price cap applied when the *server* is the fee payer.
+///
+/// In fee-sponsored pull mode the server signs the transaction before it is
+/// broadcast, so the priority fee is paid out of the merchant's wallet. The
+/// global cap above (5_000_000) is fine when the client pays its own gas,
+/// but at that ceiling an attacker could burn `ceil(5_000_000 * 200_000 /
+/// 1_000_000)` = 1_000_000 lamports of merchant SOL per "valid" charge.
+/// 10_000 caps the worst case at ~2_000 lamports per request — about 20% of
+/// the 5_000-lamport base fee per signature, which leaves enough headroom
+/// for honest clients to bump priority during congestion without letting
+/// the merchant be drained.
+const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED: u64 = 10_000;
 const SIMULATION_MAX_ATTEMPTS: usize = 3;
 const SIMULATION_RETRY_DELAY_MS: u64 = 400;
 
-const DEFAULT_REALM: &str = "MPP Payment";
+/// Audit #15: derive a per-app default realm from the recipient pubkey.
+///
+/// `realm` is part of the HMAC ID input. With a fixed default of
+/// `"MPP Payment"`, two services that shared `MPP_SECRET_KEY` and both
+/// kept the default would participate in one shared credential namespace,
+/// enabling cross-service credential replay. Deriving from `recipient`
+/// (a Solana pubkey, unique per merchant) means two services with the
+/// same secret but different recipients automatically get different
+/// realms, so cross-service replay fails at HMAC verification.
+///
+/// Format: `"App Id - #<8-digit decimal>"`. Decimal is `u32::from_be_bytes`
+/// over the first 4 bytes of `SHA-256(recipient)`, modulo 10^8 for a
+/// compact display. Deterministic for a given recipient.
+fn derive_default_realm(recipient: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(recipient.as_bytes());
+    let first_four = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    let app_id = first_four % 100_000_000;
+    format!("App Id - #{app_id}")
+}
+
+/// Minimum length, in bytes, for the HMAC-SHA256 key used to bind
+/// challenge IDs. NIST SP 800-107 recommends a key at least as long as
+/// the hash output (256 bits = 32 bytes); below that the key is the
+/// weakest link, not the hash.
+const MIN_SECRET_KEY_BYTES: usize = 32;
 
 fn detect_challenge_binding_secret() -> Result<String, Error> {
     std::env::var(SECRET_KEY_ENV_VAR).map_err(|_| {
@@ -54,6 +99,68 @@ fn detect_challenge_binding_secret() -> Result<String, Error> {
             "Missing {SECRET_KEY_ENV_VAR} env var. Set it or pass challenge_binding_secret explicitly."
         ))
     })
+}
+
+/// Reject empty / short challenge-binding secrets before they are used as
+/// the HMAC key for challenge IDs. Audit #24: a weak key lets an attacker
+/// forge challenges. We require at least `MIN_SECRET_KEY_BYTES` bytes of
+/// input; callers SHOULD pass ≥32 bytes of cryptographically-random data
+/// (e.g. `openssl rand -base64 32`).
+fn validate_challenge_binding_secret(secret: &str) -> Result<(), Error> {
+    if secret.len() < MIN_SECRET_KEY_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "Secret key is too short ({} bytes): require at least {MIN_SECRET_KEY_BYTES} bytes \
+             of cryptographically-random data (e.g. `openssl rand -base64 32`)",
+            secret.len()
+        )));
+    }
+    Ok(())
+}
+
+// Audit #37: this used to be a private duplicate of the same function
+// in `protocol/solana.rs`. Consolidated — callers in this file now use
+// the public one via `crate::protocol::solana::default_rpc_url`.
+
+/// Resolve the SPL token program governing `currency`, once, at server
+/// boot. Returns `None` for native SOL. For well-known stablecoins the
+/// answer comes from the static table; for an arbitrary mint address the
+/// owner is fetched on-chain and validated, per spec §7.2 (rather than
+/// silently falling back to the legacy Token Program).
+fn resolve_server_token_program(
+    rpc: &RpcClient,
+    currency: &str,
+    network: Option<&str>,
+) -> Result<Option<&'static str>, Error> {
+    if currency.eq_ignore_ascii_case("SOL") {
+        return Ok(None);
+    }
+
+    if let Some(mint) = crate::protocol::solana::resolve_stablecoin_mint(currency, network) {
+        if crate::protocol::solana::is_known_stablecoin_mint(mint) {
+            return Ok(Some(
+                crate::protocol::solana::default_token_program_for_currency(currency, network),
+            ));
+        }
+    }
+
+    let mint_pk = Pubkey::from_str(currency).map_err(|e| {
+        Error::InvalidConfig(format!(
+            "Currency {currency} is neither a known symbol nor a valid mint address: {e}"
+        ))
+    })?;
+    let account = rpc.get_account(&mint_pk).map_err(|e| {
+        Error::InvalidConfig(format!(
+            "Failed to fetch mint account for currency {currency}: {e}"
+        ))
+    })?;
+    let owner = account.owner.to_string();
+    match owner.as_str() {
+        programs::TOKEN_PROGRAM => Ok(Some(programs::TOKEN_PROGRAM)),
+        programs::TOKEN_2022_PROGRAM => Ok(Some(programs::TOKEN_2022_PROGRAM)),
+        _ => Err(Error::InvalidConfig(format!(
+            "Mint {currency} is owned by unsupported program {owner}; expected the Token or Token-2022 program"
+        ))),
+    }
 }
 
 // ── Configuration ──
@@ -67,11 +174,18 @@ pub struct Config {
     pub currency: String,
     /// Token decimals (default: 6 for USDC-like tokens).
     pub decimals: u8,
-    /// Solana network: mainnet, devnet, or localnet.
+    /// Solana network: one of "mainnet", "devnet", "localnet" (spec §7.2).
+    /// Validated at `Mpp::new` time. "mainnet-beta" is the RPC hostname,
+    /// not a canonical slug.
     pub network: String,
     /// RPC URL (overrides default for the network).
     pub rpc_url: Option<String>,
-    /// Server secret key for HMAC challenge IDs.
+    /// Server challenge-binding secret for HMAC-SHA256 challenge IDs.
+    ///
+    /// MUST be at least 32 bytes of cryptographically-random data. Generate
+    /// with e.g. `openssl rand -base64 32`. Short or low-entropy keys are
+    /// rejected at `Mpp::new` time. If `None`, the value is read from the
+    /// `MPP_SECRET_KEY` environment variable.
     pub challenge_binding_secret: Option<String>,
     /// Server realm.
     pub realm: Option<String>,
@@ -83,6 +197,20 @@ pub struct Config {
     pub store: Option<Arc<dyn Store>>,
     /// Enable HTML payment link pages for browser requests.
     pub html: bool,
+    /// Audit #5: accept push-mode (`type=signature`) credentials.
+    ///
+    /// Push mode matches credentials to challenges by *shape* (recipient,
+    /// amount, currency, splits) — the on-chain tx is not bound to a
+    /// specific challenge id. Per spec §13.5 this is the accepted base
+    /// flow ("first accepted presentation wins"), but the lack of
+    /// cryptographic binding means any matching-shape transaction can
+    /// claim any matching-shape challenge. Routes that don't need push
+    /// mode should leave this off (default).
+    ///
+    /// Audit B34 already rejects push mode on fee-sponsored routes; this
+    /// gate runs first and covers the non-fee-sponsored case the audit
+    /// flagged.
+    pub accept_push_mode: bool,
 }
 
 impl Default for Config {
@@ -99,6 +227,7 @@ impl Default for Config {
             fee_payer_signer: None,
             store: None,
             html: false,
+            accept_push_mode: false,
         }
     }
 }
@@ -127,6 +256,12 @@ pub struct Mpp {
     realm: String,
     challenge_binding_secret: String,
     currency: String,
+    /// Token program governing `currency`. `None` for native SOL. Resolved
+    /// once at `Mpp::new` time — either from the hardcoded stablecoin table
+    /// or via an on-chain mint-owner lookup for arbitrary mint addresses
+    /// (spec §7.2). Reused at challenge generation and at verification so
+    /// the two sides stay in lockstep.
+    token_program: Option<&'static str>,
     recipient: String,
     decimals: u32,
     network: String,
@@ -134,6 +269,8 @@ pub struct Mpp {
     fee_payer_signer: Option<Arc<dyn solana_keychain::SolanaSigner>>,
     store: Arc<dyn Store>,
     html: bool,
+    /// Audit #5: opt-in for push-mode credentials.
+    accept_push_mode: bool,
 }
 
 impl Mpp {
@@ -145,21 +282,50 @@ impl Mpp {
         Pubkey::from_str(&config.recipient)
             .map_err(|e| Error::InvalidConfig(format!("Invalid recipient pubkey: {e}")))?;
 
+        // Audit #16: spec §7.2 requires `feePayerKey` when `feePayer` is
+        // true. Reject the boot-time misconfig at the source so
+        // `charge_with_options` can never emit a spec-violating challenge.
+        if config.fee_payer && config.fee_payer_signer.is_none() {
+            return Err(Error::InvalidConfig(
+                "Config.fee_payer is true but fee_payer_signer is None (spec §7.2 requires feePayerKey)".into(),
+            ));
+        }
+
+        // Audit #37: spec §7.2 allows only `mainnet`, `devnet`, `localnet`.
+        // Rejecting `mainnet-beta`/`testnet`/typos at boot keeps the wire
+        // format canonical and stops the silent "everything unknown
+        // defaults to mainnet" behaviour that used to live in default_rpc_url.
+        crate::protocol::solana::validate_network(&config.network)?;
+
         let rpc_url = config
             .rpc_url
             .unwrap_or_else(|| default_rpc_url(&config.network).to_string());
         let challenge_binding_secret = config
             .challenge_binding_secret
             .map_or_else(detect_challenge_binding_secret, Ok)?;
-        let realm = config.realm.unwrap_or_else(|| DEFAULT_REALM.to_string());
+        validate_challenge_binding_secret(&challenge_binding_secret)?;
+        let realm = match config.realm {
+            Some(r) if r.is_empty() => {
+                return Err(Error::InvalidConfig(
+                    "Config.realm must be non-empty when provided".into(),
+                ));
+            }
+            Some(r) => r,
+            None => derive_default_realm(&config.recipient),
+        };
         let store: Arc<dyn Store> = config.store.unwrap_or_else(|| Arc::new(MemoryStore::new()));
 
+        let rpc = Arc::new(RpcClient::new(rpc_url.clone()));
+        let token_program =
+            resolve_server_token_program(&rpc, &config.currency, Some(&config.network))?;
+
         Ok(Mpp {
-            rpc: Arc::new(RpcClient::new(rpc_url.clone())),
+            rpc,
             rpc_url,
             realm,
             challenge_binding_secret,
             currency: config.currency,
+            token_program,
             recipient: config.recipient,
             decimals: config.decimals as u32,
             network: config.network,
@@ -167,6 +333,7 @@ impl Mpp {
             fee_payer_signer: config.fee_payer_signer,
             store,
             html: config.html,
+            accept_push_mode: config.accept_push_mode,
         })
     }
 
@@ -245,14 +412,10 @@ impl Mpp {
         }
 
         // Include token program so the client doesn't need to look up the mint account.
-        if self.currency.to_uppercase() != "SOL" {
-            details.insert(
-                "tokenProgram".into(),
-                serde_json::json!(crate::protocol::solana::default_token_program_for_currency(
-                    &self.currency,
-                    Some(&self.network),
-                )),
-            );
+        // For arbitrary mints this was resolved on-chain at Mpp::new time and
+        // cached on the struct — never guessed from the currency string.
+        if let Some(token_program) = self.token_program {
+            details.insert("tokenProgram".into(), serde_json::json!(token_program));
         }
 
         // Embed payment splits so the client can build multi-transfer transactions.
@@ -301,6 +464,38 @@ impl Mpp {
     }
 
     fn validate_charge_options(&self, options: &ChargeOptions<'_>) -> Result<(), Error> {
+        // Audit #16: per-call fee-payer override is only honorable when a
+        // signer is configured on this server. Mpp::new already enforces
+        // the invariant for `self.fee_payer`; this catches the override
+        // case where Config.fee_payer is false but ChargeOptions.fee_payer
+        // is true.
+        if options.fee_payer && self.fee_payer_signer.is_none() {
+            return Err(Error::InvalidConfig(
+                "ChargeOptions.fee_payer is true but this server has no fee_payer_signer configured".into(),
+            ));
+        }
+
+        // Audit #21: validate the splits up-front so malformed entries
+        // (bad pubkey, unparseable/zero amount, overflowing aggregate,
+        // duplicate recipients, too many splits) fail at challenge issuance
+        // instead of at on-chain settlement.
+        crate::protocol::solana::validate_splits(&options.splits)?;
+
+        // Audit #38: spec §9.5 forbids fee-payer-funded ATA creation for the
+        // top-level recipient. A split that names the primary recipient AND
+        // sets `ataCreationRequired: true` is the misconfig shape that, in
+        // fee-sponsored mode, lets the recipient close/recreate its own ATA
+        // to keep draining server-funded rent. We still allow the primary
+        // recipient to appear in splits without the flag (legitimate when
+        // the merchant takes part of the funds as a regular split).
+        for (idx, split) in options.splits.iter().enumerate() {
+            if split.ata_creation_required == Some(true) && split.recipient == self.recipient {
+                return Err(Error::InvalidConfig(format!(
+                    "splits[{idx}]: ataCreationRequired must not be true for the top-level recipient"
+                )));
+            }
+        }
+
         let has_ata_creation_splits = options
             .splits
             .iter()
@@ -336,12 +531,23 @@ impl Mpp {
     }
 
     /// Generate a charge challenge from a full request with options.
+    ///
+    /// The override-point on the high-level `charge_with_options` path:
+    /// the caller supplies a fully-formed `ChargeRequest` and we issue a
+    /// challenge against *this* server's route. Audit #19: the request
+    /// is validated for internal consistency AND against the server's
+    /// own configuration before HMAC-signing, so a malformed or
+    /// off-route request cannot produce a cryptographically-valid
+    /// challenge. Callers who need to issue challenges for an unrelated
+    /// route should construct a `PaymentChallenge` directly via
+    /// `PaymentChallenge::with_secret_key_full`.
     pub fn charge_challenge_with_options(
         &self,
         request: &ChargeRequest,
         expires: Option<&str>,
         description: Option<&str>,
     ) -> Result<PaymentChallenge, Error> {
+        self.validate_charge_request(request)?;
         let encoded = Base64UrlJson::from_typed(request)?;
         let default_expires = crate::expires::minutes(5);
         let expires = expires.unwrap_or(&default_expires);
@@ -359,25 +565,89 @@ impl Mpp {
         ))
     }
 
-    // ── Verification ──
+    /// Audit #19: ensure a caller-built `ChargeRequest` parses and binds
+    /// to this server's route before we HMAC-sign it. Fields covered:
+    /// `amount`, `currency`, `recipient`, and the `methodDetails`
+    /// fragments that pin the server-side configuration
+    /// (`network`, `decimals`, `tokenProgram`, splits).
+    fn validate_charge_request(&self, request: &ChargeRequest) -> Result<(), Error> {
+        request.parse_amount()?;
 
-    /// Verify a payment credential (simple API).
-    ///
-    /// Decodes the charge request from the echoed challenge automatically.
-    pub async fn verify_credential(
-        &self,
-        credential: &PaymentCredential,
-    ) -> Result<Receipt, VerificationError> {
-        let request: ChargeRequest = credential
-            .challenge
-            .request
-            .decode()
-            .map_err(|e| VerificationError::new(format!("Failed to decode request: {e}")))?;
-        self.verify(credential, &request).await
+        if !request.currency.eq_ignore_ascii_case(&self.currency) {
+            return Err(Error::InvalidConfig(format!(
+                "ChargeRequest.currency `{}` does not match server-configured currency `{}`",
+                request.currency, self.currency
+            )));
+        }
+
+        let recipient = request
+            .recipient
+            .as_deref()
+            .ok_or_else(|| Error::InvalidConfig("ChargeRequest.recipient is required".into()))?;
+        Pubkey::from_str(recipient)
+            .map_err(|e| Error::InvalidConfig(format!("Invalid recipient pubkey: {e}")))?;
+
+        if let Some(md_value) = &request.method_details {
+            let md: MethodDetails = serde_json::from_value(md_value.clone())
+                .map_err(|e| Error::InvalidConfig(format!("Invalid methodDetails: {e}")))?;
+
+            if let Some(network) = md.network.as_deref() {
+                if network != self.network {
+                    return Err(Error::InvalidConfig(format!(
+                        "methodDetails.network `{network}` does not match server-configured network `{}`",
+                        self.network
+                    )));
+                }
+            }
+
+            if let Some(decimals) = md.decimals {
+                if u32::from(decimals) != self.decimals {
+                    return Err(Error::InvalidConfig(format!(
+                        "methodDetails.decimals {decimals} does not match server-configured decimals {}",
+                        self.decimals
+                    )));
+                }
+            }
+
+            if let Some(tp) = md.token_program.as_deref() {
+                if Some(tp) != self.token_program {
+                    return Err(Error::InvalidConfig(format!(
+                        "methodDetails.tokenProgram `{tp}` does not match server-resolved token program {:?}",
+                        self.token_program
+                    )));
+                }
+            }
+
+            // Audit #21: shared split validation with the
+            // `charge_with_options` path. Failure modes (bad pubkey,
+            // unparseable/zero amount, overflowing aggregate, duplicate
+            // recipients, too many splits) all surface here.
+            if let Some(splits) = md.splits.as_deref() {
+                crate::protocol::solana::validate_splits(splits)?;
+            }
+        }
+
+        Ok(())
     }
 
-    /// Verify with cross-route protection — ensures the credential matches
-    /// the expected charge parameters for this endpoint.
+    // ── Verification ──
+
+    /// Verify a payment credential against the expected charge for *this*
+    /// route. This is the canonical entry point for credential verification.
+    ///
+    /// **Audit #2 — why no simpler "trust the echoed challenge" variant.**
+    /// We deliberately do not offer a method that decodes the credential's
+    /// embedded request and verifies against *that*. A server that issues
+    /// multiple priced routes (the common case) would otherwise accept a
+    /// credential paid for the $1 route against the $100 route — same
+    /// currency, same recipient, same server-issued HMAC, but the wrong
+    /// resource. Callers must pass an `expected` `ChargeRequest` built
+    /// from this route's static configuration, so the amount and other
+    /// payment-constraining fields are pinned at the call site.
+    ///
+    /// Single-resource servers construct the same `expected` once and reuse
+    /// it; the boilerplate is small. The compile-time cost of the explicit
+    /// argument is the whole point.
     pub async fn verify_credential_with_expected(
         &self,
         credential: &PaymentCredential,
@@ -389,21 +659,7 @@ impl Mpp {
             .decode()
             .map_err(|e| VerificationError::new(format!("Failed to decode request: {e}")))?;
 
-        if request.amount != expected.amount {
-            return Err(VerificationError::credential_mismatch(format!(
-                "Amount mismatch: credential has {} but endpoint expects {}",
-                request.amount, expected.amount
-            )));
-        }
-        if request.currency != expected.currency {
-            return Err(VerificationError::credential_mismatch(format!(
-                "Currency mismatch: credential has {} but endpoint expects {}",
-                request.currency, expected.currency
-            )));
-        }
-        if request.recipient != expected.recipient {
-            return Err(VerificationError::credential_mismatch("Recipient mismatch"));
-        }
+        compare_expected_to_request(&request, expected)?;
 
         // Pass the route's expected request — not the credential-decoded one —
         // through to `verify`. From this point on, on-chain settlement checks
@@ -417,10 +673,10 @@ impl Mpp {
     ///
     /// After Tier 1 (HMAC) confirms the echoed challenge was issued by this
     /// server, this compares economically-significant fields against the
-    /// pinned `Mpp` configuration. It is the safety net for callers who use
-    /// the simple `verify_credential` API: even when the credential's
-    /// claimed request is trusted as-is, fields fixed at server construction
-    /// (method, intent, realm, currency, recipient) cannot silently diverge.
+    /// pinned `Mpp` configuration. Defense-in-depth against a route that
+    /// hands `verify` a request decoded from a tampered credential: fields
+    /// fixed at server construction (method, intent, realm, currency,
+    /// recipient) cannot silently diverge.
     fn verify_pinned_fields(
         &self,
         credential: &PaymentCredential,
@@ -483,7 +739,14 @@ impl Mpp {
             credential.challenge.digest.as_deref(),
             credential.challenge.opaque.as_ref().map(|o| o.raw()),
         );
-        if credential.challenge.id != expected_id {
+        // Audit #41: the HMAC id comparison must be constant-time —
+        // otherwise a timing oracle could leak how many leading bytes
+        // of an attacker-controlled `id` match an actually-issued one.
+        // The same helper backs `PaymentChallenge::verify`.
+        if !crate::protocol::core::challenge::constant_time_eq(
+            &credential.challenge.id,
+            &expected_id,
+        ) {
             return Err(VerificationError::credential_mismatch(
                 "Challenge ID mismatch — not issued by this server",
             ));
@@ -506,8 +769,22 @@ impl Mpp {
             }
         }
 
-        // Tier 2: Pinned-field backstop. Runs unconditionally so even simple
-        // `verify_credential` callers are protected against cross-route replay
+        // Audit #22: HMAC authenticates `credential.challenge.request` — the
+        // request the server originally issued. Settlement then runs against
+        // the caller-supplied `request`. Without binding the two, a direct
+        // caller could authenticate one request and verify settlement
+        // against a different one. Require equality on every
+        // payment-constraining field (reuses the audit #1 helper).
+        let credential_request: ChargeRequest =
+            credential.challenge.request.decode().map_err(|e| {
+                VerificationError::invalid_payload(format!(
+                    "Failed to decode credential request: {e}"
+                ))
+            })?;
+        compare_expected_to_request(&credential_request, request)?;
+
+        // Tier 2: Pinned-field backstop. Runs unconditionally so callers of
+        // the lower-level `verify` are protected against cross-route replay
         // for the fields that are pinned at `Mpp` construction time.
         self.verify_pinned_fields(credential, request)?;
 
@@ -543,6 +820,16 @@ impl Mpp {
                 signature
             }
             CredentialPayload::Signature { ref signature } => {
+                // Audit #5: push-mode acceptance is opt-in. Spec §13.5 names
+                // "first accepted presentation wins" as the model — any
+                // matching-shape on-chain tx can claim any matching-shape
+                // challenge. Servers that don't need push mode should leave
+                // `accept_push_mode = false` (default) to reduce surface.
+                if !self.accept_push_mode {
+                    return Err(VerificationError::credential_mismatch(
+                        "Push-mode credentials are disabled on this server (Config.accept_push_mode is false; spec §13.5)",
+                    ));
+                }
                 // B34: reject push-mode credentials (`type=signature`) on
                 // routes that require a server-side fee payer. A signature-
                 // only credential references an already-landed transaction
@@ -774,9 +1061,27 @@ impl Mpp {
                 _ => std::thread::sleep(std::time::Duration::from_millis(200)),
             }
         }
-        Err(VerificationError::network_error(
-            "Transaction not confirmed within timeout".to_string(),
-        ))
+
+        // Audit #3: the polling RPC may be lagging or load-balanced behind an
+        // endpoint that hasn't observed the signature yet, while the tx is
+        // actually on-chain. Do one definitive status check before declaring
+        // a timeout — otherwise we'd return network_error for a payment the
+        // user has already made (the signature is reserved in the replay
+        // store, so a retry would also fail).
+        let final_status = self
+            .rpc
+            .get_signature_status(&signature)
+            .map(|opt| opt.map(|inner| inner.map_err(|e| e.to_string())))
+            .map_err(|e| e.to_string());
+        let result = interpret_post_timeout_status(final_status);
+        if result.is_ok() {
+            tracing::info!(
+                elapsed_ms = %t0.elapsed().as_millis(),
+                step = "confirmed_via_status_recovery",
+                "await_pull_confirmation"
+            );
+        }
+        result
     }
 
     /// Push mode: fetch tx by signature, verify on-chain.
@@ -826,10 +1131,8 @@ impl Mpp {
         })?;
 
         let splits = method_details.splits.as_deref().unwrap_or(&[]);
-        let splits_total: u64 = splits
-            .iter()
-            .filter_map(|s| s.amount.parse::<u64>().ok())
-            .sum();
+        let splits_total = crate::protocol::solana::checked_sum_split_amounts(splits)
+            .ok_or_else(|| VerificationError::invalid_amount("Split amounts overflow u64"))?;
         let primary_amount = total_amount.checked_sub(splits_total).ok_or_else(|| {
             VerificationError::invalid_amount("Split amounts exceed total amount")
         })?;
@@ -880,7 +1183,13 @@ impl Mpp {
                     "ataCreationRequired requires an SPL token charge",
                 ));
             }
-            let matched = verify_sol_transfers(&instructions, recipient, primary_amount, splits)?;
+            let matched = verify_sol_transfers(
+                &instructions,
+                recipient,
+                primary_amount,
+                splits,
+                expected_ata_payer,
+            )?;
             let mut matched = matched;
             verify_parsed_memo_instructions(
                 &instructions,
@@ -900,18 +1209,30 @@ impl Mpp {
         } else {
             let expected_mint =
                 resolve_expected_mint(&request.currency, method_details.network.as_deref())?;
-            if !required_ata_owners.is_empty() && request.currency != expected_mint.to_string() {
+            // Audit #34: check the property we care about directly —
+            // `request.currency` must parse as a Pubkey (i.e. be an actual
+            // mint address, not a symbol). The previous "currency !=
+            // expected_mint" check was equivalent in outcome but expressed
+            // the intent obliquely.
+            if !required_ata_owners.is_empty() && Pubkey::from_str(&request.currency).is_err() {
                 return Err(VerificationError::invalid_payload(
                     "ataCreationRequired requires currency to be an SPL token mint address",
                 ));
             }
-            let expected_token_program =
-                method_details.token_program.as_deref().unwrap_or_else(|| {
-                    crate::protocol::solana::default_token_program_for_currency(
-                        &request.currency,
-                        method_details.network.as_deref(),
+            // Prefer the challenge's tokenProgram hint. If the credential
+            // came from a challenge we didn't sign (or one missing the
+            // hint), fall back to the boot-time resolution we did against
+            // our own currency — never to a guess based on the currency
+            // string (spec §7.2).
+            let expected_token_program = method_details
+                .token_program
+                .as_deref()
+                .or(self.token_program)
+                .ok_or_else(|| {
+                    VerificationError::invalid_payload(
+                        "Missing tokenProgram and server has no resolved token program for this currency",
                     )
-                });
+                })?;
             let mut matched = verify_spl_transfers(
                 &instructions,
                 recipient,
@@ -919,6 +1240,7 @@ impl Mpp {
                 primary_amount,
                 splits,
                 Some(expected_token_program),
+                expected_ata_payer,
             )?;
             verify_parsed_memo_instructions(
                 &instructions,
@@ -1020,20 +1342,19 @@ fn verify_versioned_transaction_pre_broadcast(
     reject_address_lookup_tables(tx)?;
 
     let splits = method_details.splits.as_deref().unwrap_or(&[]);
-    if splits.len() > 8 {
+    if splits.len() > crate::protocol::solana::MAX_SPLITS {
         return Err(VerificationError::too_many_splits(format!(
-            "Too many splits: {} (maximum 8)",
-            splits.len()
+            "Too many splits: {} (maximum {})",
+            splits.len(),
+            crate::protocol::solana::MAX_SPLITS,
         )));
     }
 
     let total_amount: u64 = request.amount.parse().map_err(|_| {
         VerificationError::invalid_amount(format!("Invalid amount: {}", request.amount))
     })?;
-    let splits_total: u64 = splits
-        .iter()
-        .filter_map(|s| s.amount.parse::<u64>().ok())
-        .sum();
+    let splits_total = crate::protocol::solana::checked_sum_split_amounts(splits)
+        .ok_or_else(|| VerificationError::invalid_amount("Split amounts overflow u64"))?;
     let primary_amount = total_amount
         .checked_sub(splits_total)
         .ok_or_else(|| VerificationError::invalid_amount("Split amounts exceed total amount"))?;
@@ -1113,7 +1434,9 @@ fn verify_versioned_transaction_pre_broadcast(
     } else {
         let expected_mint =
             resolve_expected_mint(&request.currency, method_details.network.as_deref())?;
-        if !ata_policy.required_owners.is_empty() && request.currency != expected_mint.to_string() {
+        // Audit #34: see the matching block above — check that
+        // `request.currency` parses as a Pubkey directly.
+        if !ata_policy.required_owners.is_empty() && Pubkey::from_str(&request.currency).is_err() {
             return Err(VerificationError::invalid_payload(
                 "ataCreationRequired requires currency to be an SPL token mint address",
             ));
@@ -1204,6 +1527,140 @@ fn expected_ata_creation_policy(
         allowed_owners,
         required_owners,
     })
+}
+
+/// Audit #1: exhaustively compare the credential's decoded request against
+/// the route's expected request before any settlement work.
+///
+/// Why up-front (when `verify_credential_with_expected` already passes
+/// `expected` to `verify` and on-chain settlement checks against it):
+/// 1. Earlier, clearer failure — `splits mismatch` beats `no matching SPL
+///    transferChecked instruction` for an operator chasing a bug.
+/// 2. Defense in depth — any field added to `ChargeRequest` or `MethodDetails`
+///    in the future is forced into this comparison, so a divergence cannot
+///    silently slip past the settlement layer.
+///
+/// `recent_blockhash` is deliberately *not* compared: it's per-challenge
+/// state, not per-route policy, and an `expected` built from a route's
+/// static config carries no blockhash.
+fn compare_expected_to_request(
+    request: &ChargeRequest,
+    expected: &ChargeRequest,
+) -> Result<(), VerificationError> {
+    if request.amount != expected.amount {
+        return Err(VerificationError::credential_mismatch(format!(
+            "Amount mismatch: credential has {} but endpoint expects {}",
+            request.amount, expected.amount
+        )));
+    }
+    if request.currency != expected.currency {
+        return Err(VerificationError::credential_mismatch(format!(
+            "Currency mismatch: credential has {} but endpoint expects {}",
+            request.currency, expected.currency
+        )));
+    }
+    if request.recipient != expected.recipient {
+        return Err(VerificationError::credential_mismatch("Recipient mismatch"));
+    }
+    if request.external_id != expected.external_id {
+        return Err(VerificationError::credential_mismatch(
+            "externalId mismatch",
+        ));
+    }
+    if request.description != expected.description {
+        return Err(VerificationError::credential_mismatch(
+            "description mismatch",
+        ));
+    }
+
+    let request_md = parse_method_details_for_compare(&request.method_details, "credential")?;
+    let expected_md = parse_method_details_for_compare(&expected.method_details, "expected")?;
+
+    if request_md.network != expected_md.network {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.network mismatch",
+        ));
+    }
+    if request_md.decimals != expected_md.decimals {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.decimals mismatch",
+        ));
+    }
+    if request_md.token_program != expected_md.token_program {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.tokenProgram mismatch",
+        ));
+    }
+    if request_md.fee_payer != expected_md.fee_payer {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.feePayer mismatch",
+        ));
+    }
+    if request_md.fee_payer_key != expected_md.fee_payer_key {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.feePayerKey mismatch",
+        ));
+    }
+    // Splits compared element-wise (order-sensitive). A route that pins
+    // `[A, B]` will reject a credential carrying `[B, A]`.
+    if !splits_eq(request_md.splits.as_deref(), expected_md.splits.as_deref()) {
+        return Err(VerificationError::credential_mismatch(
+            "methodDetails.splits mismatch",
+        ));
+    }
+    // recent_blockhash intentionally NOT compared — see helper docstring.
+
+    Ok(())
+}
+
+fn parse_method_details_for_compare(
+    md: &Option<serde_json::Value>,
+    label: &str,
+) -> Result<MethodDetails, VerificationError> {
+    match md {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            VerificationError::credential_mismatch(format!("Invalid {label} methodDetails: {e}"))
+        }),
+        None => Ok(MethodDetails::default()),
+    }
+}
+
+fn splits_eq(a: Option<&[Split]>, b: Option<&[Split]>) -> bool {
+    let a = a.unwrap_or(&[]);
+    let b = b.unwrap_or(&[]);
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        x.recipient == y.recipient
+            && x.amount == y.amount
+            && x.ata_creation_required == y.ata_creation_required
+            && x.label == y.label
+            && x.memo == y.memo
+    })
+}
+
+/// Audit #3: interpret a post-timeout `get_signature_status` result.
+///
+/// Pulled out as a pure function so the four cases — landed, landed-but-failed,
+/// not-found, RPC-error — can be unit-tested without needing a live RPC.
+/// Errors are stringified at the call site so this helper stays free of
+/// `solana-rpc-client` types.
+fn interpret_post_timeout_status(
+    status: Result<Option<Result<(), String>>, String>,
+) -> Result<(), VerificationError> {
+    match status {
+        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Err(on_chain_err))) => Err(VerificationError::transaction_failed(format!(
+            "Transaction landed on-chain but failed: {on_chain_err}"
+        ))),
+        Ok(None) => Err(VerificationError::network_error(
+            "Transaction not confirmed within timeout".to_string(),
+        )),
+        Err(rpc_err) => Err(VerificationError::network_error(format!(
+            "Transaction not confirmed within timeout; final status check failed: {rpc_err}"
+        ))),
+    }
 }
 
 fn reject_address_lookup_tables(tx: &VersionedTransaction) -> Result<(), VerificationError> {
@@ -1306,7 +1763,7 @@ fn validate_instruction_allowlist(
             .ok_or_else(|| VerificationError::invalid_payload("Invalid program_id_index"))?;
 
         if program_id == &compute_budget_program {
-            validate_compute_budget_instruction(ix)?;
+            validate_compute_budget_instruction(ix, fee_payer.is_some())?;
             continue;
         }
 
@@ -1366,7 +1823,10 @@ fn validate_instruction_allowlist(
     Ok(())
 }
 
-fn validate_compute_budget_instruction(ix: &CompiledInstruction) -> Result<(), VerificationError> {
+fn validate_compute_budget_instruction(
+    ix: &CompiledInstruction,
+    fee_sponsored: bool,
+) -> Result<(), VerificationError> {
     if !ix.accounts.is_empty() {
         return Err(VerificationError::invalid_payload(
             "Compute budget instruction must not have accounts",
@@ -1385,9 +1845,14 @@ fn validate_compute_budget_instruction(ix: &CompiledInstruction) -> Result<(), V
         }
         Some(3) if ix.data.len() == 9 => {
             let price = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
-            if price > MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS {
+            let max = if fee_sponsored {
+                MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED
+            } else {
+                MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS
+            };
+            if price > max {
                 return Err(VerificationError::invalid_payload(format!(
-                    "Compute unit price {price} exceeds maximum {MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS}"
+                    "Compute unit price {price} exceeds maximum {max}"
                 )));
             }
             Ok(())
@@ -1674,12 +2139,14 @@ fn verify_sol_transfers(
     recipient: &str,
     primary_amount: u64,
     splits: &[Split],
+    fee_payer: Option<&str>,
 ) -> Result<HashSet<usize>, VerificationError> {
     let mut matched_instruction_indexes = HashSet::new();
     find_sol_transfer(
         instructions,
         recipient,
         primary_amount,
+        fee_payer,
         &mut matched_instruction_indexes,
     )?;
     for split in splits {
@@ -1691,6 +2158,7 @@ fn verify_sol_transfers(
             instructions,
             &split.recipient,
             amt,
+            fee_payer,
             &mut matched_instruction_indexes,
         )
         .map_err(|_| {
@@ -1707,10 +2175,14 @@ fn find_sol_transfer(
     instructions: &[serde_json::Value],
     recipient: &str,
     amount: u64,
+    fee_payer: Option<&str>,
     matched_instruction_indexes: &mut HashSet<usize>,
 ) -> Result<(), VerificationError> {
     for (index, ix) in instructions.iter().enumerate() {
         if matched_instruction_indexes.contains(&index) {
+            continue;
+        }
+        if parsed_program_id(ix) != Some(programs::SYSTEM_PROGRAM) {
             continue;
         }
         if let Some(parsed) = ix.get("parsed").and_then(|p| p.as_object()) {
@@ -1722,8 +2194,14 @@ fn find_sol_transfer(
                     .get("destination")
                     .and_then(|d| d.as_str())
                     .unwrap_or("");
+                let source = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
                 let lamports = info.get("lamports").and_then(|l| l.as_u64()).unwrap_or(0);
                 if dest == recipient && lamports == amount {
+                    if fee_payer.is_some_and(|fp| source == fp) {
+                        return Err(VerificationError::invalid_payload(
+                            "Fee payer cannot fund the SOL payment transfer",
+                        ));
+                    }
                     matched_instruction_indexes.insert(index);
                     return Ok(());
                 }
@@ -1742,6 +2220,7 @@ fn verify_spl_transfers(
     primary_amount: u64,
     splits: &[Split],
     expected_token_program: Option<&str>,
+    fee_payer: Option<&str>,
 ) -> Result<HashSet<usize>, VerificationError> {
     let mut matched_instruction_indexes = HashSet::new();
     find_spl_transfer(
@@ -1750,6 +2229,7 @@ fn verify_spl_transfers(
         mint,
         primary_amount,
         expected_token_program,
+        fee_payer,
         &mut matched_instruction_indexes,
     )?;
     for split in splits {
@@ -1763,6 +2243,7 @@ fn verify_spl_transfers(
             mint,
             amt,
             expected_token_program,
+            fee_payer,
             &mut matched_instruction_indexes,
         )
         .map_err(|_| {
@@ -1781,8 +2262,10 @@ fn find_spl_transfer(
     expected_mint: &str,
     amount: u64,
     expected_token_program: Option<&str>,
+    fee_payer: Option<&str>,
     matched_instruction_indexes: &mut HashSet<usize>,
 ) -> Result<(), VerificationError> {
+    let ata_program = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
     for (index, ix) in instructions.iter().enumerate() {
         if matched_instruction_indexes.contains(&index) {
             continue;
@@ -1812,8 +2295,32 @@ fn find_spl_transfer(
                         .get("destination")
                         .and_then(|d| d.as_str())
                         .unwrap_or("");
+                    let source = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                    let authority = info.get("authority").and_then(|a| a.as_str()).unwrap_or("");
                     let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("");
                     if mint == expected_mint && verify_ata_owner(dest, recipient, mint, program) {
+                        if let Some(fee_payer) = fee_payer {
+                            if authority == fee_payer {
+                                return Err(VerificationError::invalid_payload(
+                                    "Fee payer cannot authorize the SPL payment transfer",
+                                ));
+                            }
+                            if let (Ok(fee_payer_pk), Ok(mint_pk), Ok(program_pk)) = (
+                                Pubkey::from_str(fee_payer),
+                                Pubkey::from_str(mint),
+                                Pubkey::from_str(program),
+                            ) {
+                                let (fee_payer_ata, _) = Pubkey::find_program_address(
+                                    &[fee_payer_pk.as_ref(), program_pk.as_ref(), mint_pk.as_ref()],
+                                    &ata_program,
+                                );
+                                if source == fee_payer_ata.to_string() {
+                                    return Err(VerificationError::invalid_payload(
+                                        "Fee payer token account cannot fund the SPL payment transfer",
+                                    ));
+                                }
+                            }
+                        }
                         matched_instruction_indexes.insert(index);
                         return Ok(());
                     }
@@ -2110,6 +2617,16 @@ fn string_field<'a>(
 ///   " | payer USDC balance: 0.00 (need 0.10), fee payer SOL: 0.005"
 ///
 /// Never fails — returns an empty string if any RPC call errors.
+/// Audit #8: convert a base-unit amount to a UI amount for diagnostic
+/// rendering. Returns `None` when `10u64.pow(decimals)` would overflow,
+/// so the caller can omit that diagnostic line instead of panicking
+/// (debug) or wrapping silently (release) — `diagnose_balances` only
+/// runs after settlement already failed and is best-effort.
+fn to_ui_amount(amount_base_units: u64, decimals: u8) -> Option<f64> {
+    let divisor = 10u64.checked_pow(decimals as u32)?;
+    Some(amount_base_units as f64 / divisor as f64)
+}
+
 fn diagnose_balances(
     rpc: &RpcClient,
     tx: &VersionedTransaction,
@@ -2131,35 +2648,56 @@ fn diagnose_balances(
         .or(tx.message.static_account_keys().first());
 
     // Check payer's token balance.
-    if let Some(payer) = payer_pk {
+    // Audit #13: derive the ATA against the actual token program for this
+    // currency, not a hardcoded TOKEN_PROGRAM. For Token-2022 mints (PYUSD,
+    // USDG on Token-2022, CASH, …) the legacy program produces the wrong
+    // ATA, so the diagnostic would silently lie about the payer's balance.
+    // The token program was already resolved at boot (audit #28) and
+    // embedded in `methodDetails.tokenProgram` for every SPL challenge this
+    // server issues; we just use it. If it's missing (lower-level
+    // ChargeRequest construction edge case), skip the token-balance hint —
+    // the fee-payer SOL diagnostic below still runs.
+    let token_program = method_details
+        .token_program
+        .as_deref()
+        .and_then(|s| Pubkey::from_str(s).ok());
+
+    if let (Some(payer), Some(token_program)) = (payer_pk, token_program.as_ref()) {
         if request.currency.to_uppercase() != "SOL" {
             if let Ok(mint) =
                 resolve_expected_mint(&request.currency, method_details.network.as_deref())
             {
-                let token_program = Pubkey::from_str(programs::TOKEN_PROGRAM).unwrap();
                 let ata_program = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
                 let (ata, _) = Pubkey::find_program_address(
                     &[payer.as_ref(), token_program.as_ref(), mint.as_ref()],
                     &ata_program,
                 );
-                let decimals = method_details.decimals.unwrap_or(6) as u32;
-                let divisor = 10u64.pow(decimals) as f64;
-                let needed = request.amount.parse::<u64>().unwrap_or(0) as f64 / divisor;
-                match rpc.get_token_account_balance(&ata) {
-                    Ok(bal) => {
-                        let actual: f64 = bal.ui_amount.unwrap_or(0.0);
-                        if actual < needed {
+                // Audit #42: spec mandates `decimals` on SPL challenges;
+                // pretending 6 would silently lie. Skip the diagnostic
+                // instead — fee-payer SOL hint below still runs.
+                // Audit #8: skip the token-balance hint when the divisor
+                // can't be represented — see `to_ui_amount` for the why.
+                let needed_base = request.amount.parse::<u64>().unwrap_or(0);
+                if let Some(needed) = method_details
+                    .decimals
+                    .and_then(|d| to_ui_amount(needed_base, d))
+                {
+                    match rpc.get_token_account_balance(&ata) {
+                        Ok(bal) => {
+                            let actual: f64 = bal.ui_amount.unwrap_or(0.0);
+                            if actual < needed {
+                                parts.push(format!(
+                                    "payer {} balance: {:.2} (need {:.2})",
+                                    request.currency, actual, needed,
+                                ));
+                            }
+                        }
+                        Err(_) => {
                             parts.push(format!(
-                                "payer {} balance: {:.2} (need {:.2})",
-                                request.currency, actual, needed,
+                                "payer {} token account not found (need {:.2})",
+                                request.currency, needed,
                             ));
                         }
-                    }
-                    Err(_) => {
-                        parts.push(format!(
-                            "payer {} token account not found (need {:.2})",
-                            request.currency, needed,
-                        ));
                     }
                 }
             }
@@ -2293,19 +2831,22 @@ impl VerificationError {
     }
 
     pub fn invalid_amount(msg: impl Into<String>) -> Self {
+        // Audit #11: title aligned to the function name. Code stays
+        // `verification-failed` so callers grouping by code keep working.
         Self::with_code(
             msg,
             "verification-failed",
-            "Verification Failed",
+            "Invalid Amount",
             "tag:paymentauth.org,2024:verification-failed",
         )
     }
 
     pub fn invalid_recipient(msg: impl Into<String>) -> Self {
+        // Audit #11: title aligned to the function name.
         Self::with_code(
             msg,
             "verification-failed",
-            "Verification Failed",
+            "Invalid Recipient",
             "tag:paymentauth.org,2024:verification-failed",
         )
     }
@@ -2339,10 +2880,12 @@ impl VerificationError {
     }
 
     pub fn credential_mismatch(msg: impl Into<String>) -> Self {
+        // Audit #11: title aligned to the function name. Code stays
+        // `malformed-credential` (shared with `invalid_payload`).
         Self::with_code(
             msg,
             "malformed-credential",
-            "Malformed Credential",
+            "Credential Mismatch",
             "tag:paymentauth.org,2024:malformed-credential",
         )
     }
@@ -2445,6 +2988,102 @@ mod tests {
         // The structured code is still available on the field for
         // callers that need to branch on it programmatically.
         assert_eq!(err.code, Some("wrong-network"));
+    }
+
+    // ── Audit #8: to_ui_amount ──
+
+    #[test]
+    fn to_ui_amount_typical_decimals() {
+        // 1 USDC = 1_000_000 base units with 6 decimals.
+        let v = to_ui_amount(1_000_000, 6).unwrap();
+        assert!((v - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn to_ui_amount_zero_decimals() {
+        // No fractional rendering — divisor is 1.
+        let v = to_ui_amount(42, 0).unwrap();
+        assert!((v - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn to_ui_amount_returns_none_when_divisor_overflows_u64() {
+        // 10^20 overflows u64. Helper must skip rather than panic.
+        assert!(to_ui_amount(1, 20).is_none());
+        assert!(to_ui_amount(0, 255).is_none());
+    }
+
+    #[test]
+    fn to_ui_amount_safe_high_decimals_succeed() {
+        // 10^19 fits in u64 (< 1.84e19); 10^20 doesn't.
+        assert!(to_ui_amount(1, 19).is_some());
+        assert!(to_ui_amount(1, 20).is_none());
+    }
+
+    // ── Audit #3: post-timeout status recovery ──
+
+    #[test]
+    fn interpret_post_timeout_status_landed_returns_ok() {
+        // Polling timed out but the final status check shows the tx landed
+        // successfully — recover and report success.
+        assert!(interpret_post_timeout_status(Ok(Some(Ok(())))).is_ok());
+    }
+
+    #[test]
+    fn interpret_post_timeout_status_landed_with_onchain_err_returns_failed() {
+        // Tx landed on-chain but the runtime rejected it. This is a real
+        // transaction failure, not a timeout — surface the on-chain error.
+        let err = interpret_post_timeout_status(Ok(Some(Err("InsufficientFundsForFee".into()))))
+            .err()
+            .expect("on-chain failure should be reported");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("landed on-chain but failed"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("InsufficientFundsForFee"),
+            "expected on-chain error to be propagated: {msg}"
+        );
+    }
+
+    #[test]
+    fn interpret_post_timeout_status_not_found_returns_timeout() {
+        // Final check confirms the tx is genuinely not on-chain — keep the
+        // timeout error.
+        let err = interpret_post_timeout_status(Ok(None))
+            .err()
+            .expect("not-found should still error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not confirmed within timeout"),
+            "unexpected error: {msg}"
+        );
+        // Must NOT claim landed-but-failed.
+        assert!(!msg.contains("landed on-chain"), "wrong shape: {msg}");
+    }
+
+    #[test]
+    fn interpret_post_timeout_status_rpc_error_returns_timeout_with_detail() {
+        // The final status call itself failed (e.g. RPC unreachable). We
+        // can't tell whether the tx landed, so we keep the timeout error
+        // but include the RPC failure in the message for ops.
+        let err = interpret_post_timeout_status(Err("connection refused".into()))
+            .err()
+            .expect("rpc failure should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not confirmed within timeout"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("final status check failed"),
+            "expected detail about the status RPC failure: {msg}"
+        );
+        assert!(
+            msg.contains("connection refused"),
+            "expected underlying RPC error to be propagated: {msg}"
+        );
     }
 
     #[test]
@@ -2877,6 +3516,85 @@ mod tests {
     }
 
     #[test]
+    fn compute_unit_price_fee_sponsored_under_tight_cap_passes() {
+        // Audit #25: in fee-sponsored mode the merchant pays the priority
+        // fee, so we apply MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED
+        // instead of the general cap. A price right at the tight cap is
+        // allowed.
+        let fee_payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let amount = 500_000u64;
+
+        let tx = dummy_tx(
+            vec![
+                compute_unit_price_ix(MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED),
+                system_transfer_ix(&sender, &recipient, amount),
+            ],
+            &fee_payer,
+        );
+        let request = charge_request(amount, "SOL", &recipient);
+        let method_details = MethodDetails {
+            fee_payer: Some(true),
+            fee_payer_key: Some(fee_payer.to_string()),
+            ..Default::default()
+        };
+
+        assert!(verify_transaction_pre_broadcast(&tx, &request, &method_details).is_ok());
+    }
+
+    #[test]
+    fn compute_unit_price_fee_sponsored_above_tight_cap_rejected() {
+        // Audit #25: a price between the tight fee-sponsored cap and the
+        // general cap is what an attacker would use to drain the merchant.
+        // Must be rejected before the server co-signs.
+        let fee_payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let amount = 500_000u64;
+
+        let tx = dummy_tx(
+            vec![
+                compute_unit_price_ix(MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED + 1),
+                system_transfer_ix(&sender, &recipient, amount),
+            ],
+            &fee_payer,
+        );
+        let request = charge_request(amount, "SOL", &recipient);
+        let method_details = MethodDetails {
+            fee_payer: Some(true),
+            fee_payer_key: Some(fee_payer.to_string()),
+            ..Default::default()
+        };
+
+        let err = verify_transaction_pre_broadcast(&tx, &request, &method_details).unwrap_err();
+        assert!(err.message.contains("Compute unit price"));
+    }
+
+    #[test]
+    fn compute_unit_price_client_paid_above_tight_cap_passes() {
+        // The tight cap only applies when the server is the fee payer.
+        // Without fee-sponsorship the client is paying their own gas, so
+        // the general (5_000_000) cap still applies and a price just above
+        // the tight cap must be accepted.
+        let sender = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let amount = 500_000u64;
+
+        let tx = dummy_tx(
+            vec![
+                compute_unit_price_ix(MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS_FEE_SPONSORED + 1),
+                system_transfer_ix(&sender, &recipient, amount),
+            ],
+            &sender,
+        );
+        let request = charge_request(amount, "SOL", &recipient);
+        let method_details = MethodDetails::default();
+
+        assert!(verify_transaction_pre_broadcast(&tx, &request, &method_details).is_ok());
+    }
+
+    #[test]
     fn fee_payer_must_be_transaction_fee_payer() {
         let sender = Pubkey::new_unique();
         let fee_payer = Pubkey::new_unique();
@@ -3303,7 +4021,7 @@ mod tests {
 
     // ── Helper: create an Mpp instance for testing ──
 
-    const TEST_SECRET: &str = "test-secret-key-for-unit-tests";
+    const TEST_SECRET: &str = "test-secret-key-for-unit-tests-with-32b-padding";
     const TEST_RECIPIENT: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
 
     fn test_mpp() -> Mpp {
@@ -3345,7 +4063,7 @@ mod tests {
     fn new_missing_recipient_errors() {
         let err = Mpp::new(Config {
             recipient: String::new(),
-            challenge_binding_secret: Some("key".to_string()),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
             ..Default::default()
         })
         .err()
@@ -3360,7 +4078,7 @@ mod tests {
     fn new_invalid_recipient_pubkey_errors() {
         let err = Mpp::new(Config {
             recipient: "not-a-valid-pubkey!!!".to_string(),
-            challenge_binding_secret: Some("key".to_string()),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
             ..Default::default()
         })
         .err()
@@ -3397,7 +4115,12 @@ mod tests {
     fn new_challenge_binding_secret_from_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var(SECRET_KEY_ENV_VAR).ok();
-        unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, "env-secret") };
+        unsafe {
+            std::env::set_var(
+                SECRET_KEY_ENV_VAR,
+                "env-secret-key-long-enough-for-hmac-binding-32b",
+            )
+        };
 
         let result = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
@@ -3416,9 +4139,80 @@ mod tests {
     }
 
     #[test]
+    fn new_rejects_empty_secret_key() {
+        // Audit #24: short keys weaken the HMAC binding.
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(String::new()),
+            ..Default::default()
+        })
+        .err()
+        .expect("should fail");
+        assert!(
+            err.to_string().contains("Secret key is too short"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_short_secret_key() {
+        // Just below the 32-byte minimum.
+        let short = "a".repeat(MIN_SECRET_KEY_BYTES - 1);
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(short),
+            ..Default::default()
+        })
+        .err()
+        .expect("should fail");
+        assert!(
+            err.to_string().contains("Secret key is too short"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_accepts_secret_key_at_minimum_length() {
+        let exact = "a".repeat(MIN_SECRET_KEY_BYTES);
+        let result = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(exact),
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn new_rejects_short_env_secret_key() {
+        // Env-var path must apply the same gate as the explicit-config path.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(SECRET_KEY_ENV_VAR).ok();
+        unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, "too-short") };
+
+        let result = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: None,
+            ..Default::default()
+        });
+
+        if let Some(v) = prev {
+            unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, v) };
+        } else {
+            unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
+        }
+
+        let err = result.err().expect("should fail");
+        assert!(
+            err.to_string().contains("Secret key is too short"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn new_valid_config_succeeds() {
         let mpp = test_mpp();
-        assert_eq!(mpp.realm(), DEFAULT_REALM);
+        // Audit #15: default realm now derives from recipient.
+        assert_eq!(mpp.realm(), derive_default_realm(TEST_RECIPIENT));
         assert_eq!(mpp.currency(), "USDC");
         assert_eq!(mpp.recipient(), TEST_RECIPIENT);
         assert_eq!(mpp.decimals(), 6);
@@ -3428,7 +4222,7 @@ mod tests {
     fn new_custom_realm() {
         let mpp = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
-            challenge_binding_secret: Some("key".to_string()),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
             realm: Some("Custom Realm".to_string()),
             ..Default::default()
         })
@@ -3436,12 +4230,127 @@ mod tests {
         assert_eq!(mpp.realm(), "Custom Realm");
     }
 
+    // ── Audit #15: derived default realm ──
+
+    #[test]
+    fn new_default_realm_format() {
+        // The derived default looks like "App Id - #<digits>" (max 8).
+        let realm = derive_default_realm(TEST_RECIPIENT);
+        assert!(
+            realm.starts_with("App Id - #"),
+            "unexpected realm format: {realm}"
+        );
+        let digits = realm.trim_start_matches("App Id - #");
+        assert!(digits.chars().all(|c| c.is_ascii_digit()), "got: {realm}");
+        assert!(!digits.is_empty() && digits.len() <= 8, "got: {realm}");
+    }
+
+    #[test]
+    fn new_default_realm_deterministic_for_same_recipient() {
+        // Restart-safe: same recipient must always derive to the same realm,
+        // otherwise in-flight challenges would fail to verify after a deploy.
+        let a = derive_default_realm(TEST_RECIPIENT);
+        let b = derive_default_realm(TEST_RECIPIENT);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn new_default_realm_differs_across_recipients() {
+        // Two servers with shared secret but different recipients must end
+        // up with different default realms — closes the audit threat shape
+        // (shared MPP_SECRET_KEY + shared default realm == shared
+        // credential namespace).
+        let other = "8tNDNRkk3JG1WK9NSRwUjytkGwY6Jq6gqQwNFmKt3pkP";
+        assert_ne!(
+            derive_default_realm(TEST_RECIPIENT),
+            derive_default_realm(other),
+        );
+    }
+
+    #[test]
+    fn new_rejects_empty_realm() {
+        // Explicitly providing an empty realm bypasses the derivation —
+        // reject so an operator can't reintroduce the audit threat with a
+        // typo.
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            realm: Some(String::new()),
+            ..Default::default()
+        })
+        .err()
+        .expect("empty realm should be rejected");
+        assert!(
+            err.to_string().contains("realm must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    // ── Audit #37: network allowlist + mainnet canonicalization ──
+
+    #[test]
+    fn new_accepts_canonical_networks() {
+        for net in ["mainnet", "devnet", "localnet"] {
+            Mpp::new(Config {
+                recipient: TEST_RECIPIENT.to_string(),
+                challenge_binding_secret: Some(TEST_SECRET.to_string()),
+                network: net.to_string(),
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("{net} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn new_rejects_unknown_network() {
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "testnet".to_string(),
+            ..Default::default()
+        })
+        .err()
+        .expect("testnet should be rejected");
+        assert!(err.to_string().contains("Unknown network"), "got: {err}");
+    }
+
+    #[test]
+    fn new_rejects_empty_network() {
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: String::new(),
+            ..Default::default()
+        })
+        .err()
+        .expect("empty network should be rejected");
+        assert!(
+            err.to_string().contains("network must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_mainnet_beta_slug() {
+        // Audit #37: canonicalize on "mainnet" — the legacy "mainnet-beta"
+        // is an RPC hostname, not a wire-format slug.
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "mainnet-beta".to_string(),
+            ..Default::default()
+        })
+        .err()
+        .expect("mainnet-beta should be rejected as a slug");
+        assert!(err.to_string().contains("Unknown network"), "got: {err}");
+    }
+
     #[test]
     fn new_custom_rpc_url() {
         // Should not fail — just verifying it accepts a custom RPC URL.
         let mpp = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
-            challenge_binding_secret: Some("key".to_string()),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
             rpc_url: Some("http://custom:8899".to_string()),
             ..Default::default()
         });
@@ -3453,23 +4362,86 @@ mod tests {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
         let result = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
-            challenge_binding_secret: Some("key".to_string()),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store),
             ..Default::default()
         });
         assert!(result.is_ok());
     }
 
-    // ── default_rpc_url tests ──
+    // ── resolve_server_token_program tests (sync branches only) ──
 
     #[test]
-    fn default_rpc_url_devnet() {
-        assert_eq!(default_rpc_url("devnet"), "https://api.devnet.solana.com");
+    fn new_resolves_token_program_for_sol_currency() {
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            decimals: 9,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(mpp.token_program, None);
     }
 
     #[test]
-    fn default_rpc_url_localnet() {
-        assert_eq!(default_rpc_url("localnet"), "http://localhost:8899");
+    fn new_resolves_token_program_for_usdc() {
+        // Default config is USDC.
+        let mpp = test_mpp();
+        assert_eq!(mpp.token_program, Some(programs::TOKEN_PROGRAM));
+    }
+
+    #[test]
+    fn new_resolves_token_program_for_pyusd_token_2022() {
+        // PYUSD is Token-2022; if this returns the legacy Token Program
+        // (the old bug), the regression is back.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "PYUSD".to_string(),
+            network: "mainnet".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(mpp.token_program, Some(programs::TOKEN_2022_PROGRAM));
+    }
+
+    #[test]
+    fn new_rejects_unparseable_currency_without_rpc() {
+        // Not a known symbol and not a valid base58 pubkey — must reject
+        // up front, never silently fall back to the legacy Token Program.
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "not-a-symbol-or-mint!!".to_string(),
+            ..Default::default()
+        })
+        .err()
+        .expect("should fail");
+        assert!(
+            err.to_string().contains("neither a known symbol nor"),
+            "got: {err}"
+        );
+    }
+
+    // ── Audit #16: fee_payer without signer ──
+
+    #[test]
+    fn new_rejects_fee_payer_true_without_signer() {
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            fee_payer: true,
+            fee_payer_signer: None,
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .err()
+        .expect("fee_payer=true without signer should be rejected");
+        assert!(
+            err.to_string().contains("fee_payer_signer is None"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -3488,12 +4460,82 @@ mod tests {
     }
 
     #[test]
-    fn default_rpc_url_unknown_defaults_to_mainnet() {
-        assert_eq!(
-            default_rpc_url("anything"),
-            "https://api.mainnet-beta.solana.com"
+    fn new_accepts_fee_payer_false_without_signer() {
+        // Regression: the default config has no signer and fee_payer=false;
+        // it must keep working.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            fee_payer: false,
+            fee_payer_signer: None,
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .expect("default fee_payer=false should be accepted");
+        assert!(!mpp.fee_payer);
+    }
+
+    #[test]
+    fn charge_options_rejects_fee_payer_without_signer() {
+        // Mpp is configured fee_payer=false, no signer. A per-call
+        // ChargeOptions.fee_payer = true override must be rejected.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            fee_payer: false,
+            fee_payer_signer: None,
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let err = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    fee_payer: true,
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("per-call fee_payer without signer should be rejected");
+        assert!(
+            err.to_string().contains("no fee_payer_signer"),
+            "got: {err}"
         );
     }
+
+    #[test]
+    fn charge_options_fee_payer_succeeds_when_signer_configured() {
+        // Happy path: server has a signer, per-call override works.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            fee_payer: false,
+            fee_payer_signer: Some(test_fee_payer_signer()),
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let challenge = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    fee_payer: true,
+                    ..Default::default()
+                },
+            )
+            .expect("per-call fee_payer with signer should succeed");
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let details: MethodDetails =
+            serde_json::from_value(request.method_details.unwrap()).unwrap();
+        assert_eq!(details.fee_payer, Some(true));
+        assert!(details.fee_payer_key.is_some(), "feePayerKey must be set");
+    }
+
+    // ── default_rpc_url ──
+    //
+    // The previous private duplicate is gone; tests for the canonical
+    // implementation live next to it in `protocol/solana.rs`.
 
     // ── charge() and charge_with_options() tests ──
 
@@ -3502,7 +4544,7 @@ mod tests {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
 
-        assert_eq!(challenge.realm, DEFAULT_REALM);
+        assert_eq!(challenge.realm, derive_default_realm(TEST_RECIPIENT));
         assert_eq!(challenge.method.as_str(), "solana");
         assert_eq!(challenge.intent.as_str(), "charge");
         assert!(!challenge.id.is_empty());
@@ -3570,16 +4612,21 @@ mod tests {
     #[test]
     fn charge_with_options_splits() {
         let mpp = test_mpp();
+        // Audit #21: split recipients must be parseable pubkeys; the old
+        // fixture strings were placeholders and now correctly fail
+        // validation. Use real base58 keypairs.
+        let vendor = Pubkey::new_unique().to_string();
+        let processor = Pubkey::new_unique().to_string();
         let splits = vec![
             crate::protocol::solana::Split {
-                recipient: "VendorPayoutsWaLLetxxxxxxxxxxxxxxxxxxxxxx1111".to_string(),
+                recipient: vendor.clone(),
                 amount: "500000".to_string(),
                 ata_creation_required: None,
                 label: None,
                 memo: Some("Vendor payout".to_string()),
             },
             crate::protocol::solana::Split {
-                recipient: "ProcessorFeeWaLLetxxxxxxxxxxxxxxxxxxxxxxx1111".to_string(),
+                recipient: processor.clone(),
                 amount: "29000".to_string(),
                 ata_creation_required: None,
                 label: None,
@@ -3606,6 +4653,152 @@ mod tests {
         assert_eq!(splits_arr[0]["amount"], "500000");
         assert_eq!(splits_arr[0]["memo"], "Vendor payout");
         assert_eq!(splits_arr[1]["amount"], "29000");
+    }
+
+    // ── Audit #21: split validation wired into both server entry points ──
+
+    fn split_helper(recipient: &str, amount: &str) -> crate::protocol::solana::Split {
+        crate::protocol::solana::Split {
+            recipient: recipient.to_string(),
+            amount: amount.to_string(),
+            ata_creation_required: None,
+            label: None,
+            memo: None,
+        }
+    }
+
+    #[test]
+    fn charge_with_options_rejects_invalid_split_recipient() {
+        let mpp = test_mpp();
+        let err = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    splits: vec![split_helper("not-a-pubkey!!", "1000")],
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("invalid split recipient should be rejected");
+        assert!(
+            format!("{err}").contains("invalid recipient pubkey"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn charge_with_options_rejects_zero_split_amount() {
+        let mpp = test_mpp();
+        let err = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    splits: vec![split_helper(&Pubkey::new_unique().to_string(), "0")],
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("zero split amount should be rejected");
+        assert!(format!("{err}").contains("greater than zero"), "got: {err}");
+    }
+
+    #[test]
+    fn charge_with_options_rejects_duplicate_split_recipient() {
+        let mpp = test_mpp();
+        let dup = Pubkey::new_unique().to_string();
+        let err = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    splits: vec![split_helper(&dup, "100"), split_helper(&dup, "200")],
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("duplicate split recipient should be rejected");
+        assert!(
+            format!("{err}").contains("duplicate recipient"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn charge_with_options_rejects_too_many_splits() {
+        let mpp = test_mpp();
+        let splits: Vec<_> = (0..(crate::protocol::solana::MAX_SPLITS + 1))
+            .map(|_| split_helper(&Pubkey::new_unique().to_string(), "1"))
+            .collect();
+        let err = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    splits,
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("too many splits should be rejected");
+        assert!(matches!(err, Error::TooManySplits));
+    }
+
+    #[test]
+    fn charge_with_options_rejects_primary_recipient_with_ata_creation_required() {
+        // Audit #38: a split whose recipient duplicates the top-level
+        // recipient AND requests `ataCreationRequired: true` is the misconfig
+        // shape that, in fee-sponsored mode, lets the primary recipient drain
+        // server-funded ATA rent by closing/recreating its own ATA.
+        let mpp = test_mpp();
+        let splits = vec![crate::protocol::solana::Split {
+            recipient: TEST_RECIPIENT.to_string(),
+            amount: "10000".to_string(),
+            ata_creation_required: Some(true),
+            label: None,
+            memo: None,
+        }];
+        let err = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    splits,
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("should reject primary recipient with ataCreationRequired");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("top-level recipient"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn charge_with_options_allows_primary_recipient_in_splits_without_ata_creation() {
+        // Legitimate use case the audit recommendation would have over-banned:
+        // the merchant takes part of the funds as a regular split alongside
+        // other payees. Allowed as long as the ATA-creation flag isn't set.
+        let mpp = test_mpp();
+        let splits = vec![crate::protocol::solana::Split {
+            recipient: TEST_RECIPIENT.to_string(),
+            amount: "10000".to_string(),
+            ata_creation_required: None,
+            label: None,
+            memo: Some("merchant cut".to_string()),
+        }];
+        let challenge = mpp
+            .charge_with_options(
+                "1.00",
+                ChargeOptions {
+                    splits,
+                    ..Default::default()
+                },
+            )
+            .expect("primary recipient as a regular split is allowed");
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let details = request.method_details.unwrap();
+        let splits_arr = details.get("splits").unwrap().as_array().unwrap();
+        assert_eq!(splits_arr.len(), 1);
+        assert_eq!(splits_arr[0]["recipient"], TEST_RECIPIENT);
     }
 
     #[test]
@@ -3692,6 +4885,124 @@ mod tests {
 
         assert_eq!(challenge.expires.as_deref(), Some(custom_expires.as_str()));
         assert_eq!(challenge.description.as_deref(), Some("Premium access"));
+    }
+
+    // ── charge_challenge validation (audit #19) ──
+
+    #[test]
+    fn charge_challenge_rejects_mismatched_currency() {
+        let mpp = test_mpp(); // USDC
+        let request = ChargeRequest {
+            amount: "100".to_string(),
+            currency: "USDT".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        assert!(format!("{err}").contains("does not match server-configured currency"));
+    }
+
+    #[test]
+    fn charge_challenge_rejects_missing_recipient() {
+        let mpp = test_mpp();
+        let request = ChargeRequest {
+            amount: "100".to_string(),
+            currency: "USDC".to_string(),
+            recipient: None,
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        assert!(format!("{err}").contains("recipient is required"));
+    }
+
+    #[test]
+    fn charge_challenge_rejects_invalid_recipient() {
+        let mpp = test_mpp();
+        let request = ChargeRequest {
+            amount: "100".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some("not-a-pubkey!!".to_string()),
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        assert!(format!("{err}").contains("Invalid recipient pubkey"));
+    }
+
+    #[test]
+    fn charge_challenge_rejects_unparseable_amount() {
+        let mpp = test_mpp();
+        let request = ChargeRequest {
+            amount: "abc".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        assert!(format!("{err}").contains("Invalid amount"));
+    }
+
+    #[test]
+    fn charge_challenge_rejects_mismatched_network_in_method_details() {
+        let mpp = test_mpp(); // network: devnet
+        let md = MethodDetails {
+            network: Some("mainnet".to_string()),
+            ..Default::default()
+        };
+        let request = ChargeRequest {
+            amount: "100".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            method_details: Some(serde_json::to_value(md).unwrap()),
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        assert!(format!("{err}").contains("does not match server-configured network"));
+    }
+
+    #[test]
+    fn charge_challenge_rejects_mismatched_token_program() {
+        let mpp = test_mpp(); // USDC -> TOKEN_PROGRAM
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
+            ..Default::default()
+        };
+        let request = ChargeRequest {
+            amount: "100".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            method_details: Some(serde_json::to_value(md).unwrap()),
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        assert!(format!("{err}").contains("does not match server-resolved token program"));
+    }
+
+    #[test]
+    fn charge_challenge_rejects_invalid_split_recipient() {
+        let mpp = test_mpp();
+        let md = MethodDetails {
+            splits: Some(vec![Split {
+                recipient: "not-a-pubkey!!".to_string(),
+                amount: "10".to_string(),
+                ata_creation_required: None,
+                label: None,
+                memo: None,
+            }]),
+            ..Default::default()
+        };
+        let request = ChargeRequest {
+            amount: "100".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            method_details: Some(serde_json::to_value(md).unwrap()),
+            ..Default::default()
+        };
+        let err = mpp.charge_challenge(&request).unwrap_err();
+        // Audit #21 unified the error string via the shared validate_splits helper.
+        assert!(
+            format!("{err}").contains("splits[0]: invalid recipient pubkey"),
+            "got: {err}"
+        );
     }
 
     // ── Challenge HMAC verification tests ──
@@ -3875,12 +5186,13 @@ mod tests {
         assert!(err.message.contains("Invalid credential payload"));
     }
 
-    // ── verify_credential() tests ──
+    // ── verify() tier-1 (HMAC) tests ──
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn verify_credential_rejects_tampered_id() {
+    async fn verify_rejects_tampered_id() {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
         let mut cred = PaymentCredential {
             challenge: challenge.to_echo(),
             source: None,
@@ -3888,8 +5200,42 @@ mod tests {
         };
         cred.challenge.id = "bad".to_string();
 
-        let err = mpp.verify_credential(&cred).await.unwrap_err();
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
+    }
+
+    /// Audit #22: `verify` must reject when the caller-supplied request
+    /// diverges from the request HMAC-authenticated by the credential —
+    /// otherwise direct callers could authenticate one request shape and
+    /// settle against a different one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rejects_request_diverging_from_credential() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap(); // credential carries amount=100000
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+
+        // Caller passes a request with a different amount than what the
+        // credential's HMAC-authenticated request carries. HMAC tier-1
+        // still passes (we didn't tamper with the credential), so the
+        // audit #22 binding check is the only thing that catches the
+        // divergence.
+        let divergent = ChargeRequest {
+            amount: "999999".to_string(),
+            currency: "USDC".to_string(),
+            recipient: Some(TEST_RECIPIENT.to_string()),
+            ..Default::default()
+        };
+
+        let err = mpp.verify(&cred, &divergent).await.unwrap_err();
+        assert_eq!(err.code, Some("malformed-credential"));
+        assert!(
+            err.message.contains("Amount mismatch"),
+            "expected amount mismatch from the binding check, got: {err:?}"
+        );
     }
 
     // ── verify_credential_with_expected() tests ──
@@ -3944,6 +5290,255 @@ mod tests {
         assert!(err.message.contains("Currency mismatch"));
     }
 
+    // Audit #1: every payment-constraining field comparison.
+
+    fn expected_from_challenge(challenge: &PaymentChallenge) -> ChargeRequest {
+        challenge.request.decode().unwrap()
+    }
+
+    fn mutate_method_details(
+        req: &mut ChargeRequest,
+        f: impl FnOnce(&mut crate::protocol::solana::MethodDetails),
+    ) {
+        use crate::protocol::solana::MethodDetails;
+        let mut md: MethodDetails = req
+            .method_details
+            .as_ref()
+            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        f(&mut md);
+        req.method_details = Some(serde_json::to_value(&md).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_external_id_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp
+            .charge_with_options(
+                "0.10",
+                ChargeOptions {
+                    external_id: Some("order-1"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        expected.external_id = Some("order-2".to_string());
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("externalId mismatch"), "got: {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_description_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp
+            .charge_with_options(
+                "0.10",
+                ChargeOptions {
+                    description: Some("A"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        expected.description = Some("B".to_string());
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("description mismatch"), "got: {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_network_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        mutate_method_details(&mut expected, |md| md.network = Some("mainnet".into()));
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.network mismatch"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_decimals_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        mutate_method_details(&mut expected, |md| md.decimals = Some(9));
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.decimals mismatch"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_token_program_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        mutate_method_details(&mut expected, |md| {
+            md.token_program = Some("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".into())
+        });
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.tokenProgram mismatch"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_fee_payer_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        mutate_method_details(&mut expected, |md| md.fee_payer = Some(true));
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.feePayer mismatch"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_fee_payer_key_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        mutate_method_details(&mut expected, |md| {
+            md.fee_payer_key = Some(Pubkey::new_unique().to_string())
+        });
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.feePayerKey mismatch"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_splits_mismatch() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        mutate_method_details(&mut expected, |md| {
+            md.splits = Some(vec![crate::protocol::solana::Split {
+                recipient: Pubkey::new_unique().to_string(),
+                amount: "1".to_string(),
+                ata_creation_required: None,
+                label: None,
+                memo: None,
+            }])
+        });
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("methodDetails.splits mismatch"),
+            "got: {err:?}"
+        );
+    }
+
+    /// Audit #1: `recent_blockhash` is per-challenge state, not per-route
+    /// policy. A mismatch must NOT trigger a rejection, otherwise honest
+    /// flows (where the route's expected has no blockhash and the
+    /// credential's request has a fresh one) would break.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_credential_with_expected_ignores_recent_blockhash() {
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "x"}),
+        };
+        let mut expected = expected_from_challenge(&challenge);
+        // Strip the blockhash from `expected` even though the credential
+        // carries one. The comparison must pass; downstream `verify` will
+        // fail on the dummy signature payload, which is fine — we only care
+        // that we got *past* the comparison layer.
+        mutate_method_details(&mut expected, |md| md.recent_blockhash = None);
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        let msg = format!("{}", err.message);
+        assert!(
+            !msg.contains("recentBlockhash mismatch") && !msg.contains("recent_blockhash mismatch"),
+            "comparison should not reject on blockhash, got: {err:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn verify_credential_with_expected_recipient_mismatch() {
         let mpp = test_mpp();
@@ -3994,8 +5589,12 @@ mod tests {
             .verify_credential_with_expected(&cred, &expected)
             .await
             .unwrap_err();
+        // Audit #1 now catches the bad expected.method_details at the
+        // up-front comparison layer (before settlement); the error string
+        // changed accordingly. The point of the test still holds: `expected`
+        // (not the credential's request) is being parsed.
         assert!(
-            err.message.contains("Invalid method details"),
+            err.message.contains("Invalid expected methodDetails"),
             "expected `expected` request to be parsed, got: {err:?}"
         );
     }
@@ -4004,8 +5603,9 @@ mod tests {
     //
     // Each test forges a credential where one pinned field differs from what
     // the server has configured, then re-signs the HMAC so Tier-1 passes. The
-    // Tier-2 backstop must reject every case even via the simple
-    // `verify_credential` API.
+    // Tier-2 backstop must reject every case. Called via `verify` directly
+    // (the lowest-level public API) so the pinned-field layer is exercised
+    // in isolation regardless of the higher-level convenience entry points.
 
     fn resign_challenge(
         secret: &str,
@@ -4028,6 +5628,7 @@ mod tests {
     async fn tier2_rejects_tampered_realm() {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
         let mut echo = challenge.to_echo();
         echo.realm = "Attacker Realm".to_string();
         // HMAC uses the *server's* realm, not the echoed one, so re-signing
@@ -4039,7 +5640,7 @@ mod tests {
             source: None,
             payload: serde_json::json!({"type": "signature", "signature": "x"}),
         };
-        let err = mpp.verify_credential(&cred).await.unwrap_err();
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
         assert!(err.message.to_lowercase().contains("realm"), "got: {err:?}");
     }
@@ -4061,7 +5662,7 @@ mod tests {
             source: None,
             payload: serde_json::json!({"type": "signature", "signature": "x"}),
         };
-        let err = mpp.verify_credential(&cred).await.unwrap_err();
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
         assert!(err.message.contains("currency"), "got: {err:?}");
     }
@@ -4083,7 +5684,7 @@ mod tests {
             source: None,
             payload: serde_json::json!({"type": "signature", "signature": "x"}),
         };
-        let err = mpp.verify_credential(&cred).await.unwrap_err();
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
         assert!(err.message.contains("recipient"), "got: {err:?}");
     }
@@ -4092,6 +5693,7 @@ mod tests {
     async fn tier2_rejects_tampered_method() {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
         let mut echo = challenge.to_echo();
         echo.method = "stripe".into();
         resign_challenge(TEST_SECRET, &mpp.realm, &mut echo);
@@ -4101,7 +5703,7 @@ mod tests {
             source: None,
             payload: serde_json::json!({"type": "signature", "signature": "x"}),
         };
-        let err = mpp.verify_credential(&cred).await.unwrap_err();
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
         assert!(err.message.contains("method"), "got: {err:?}");
     }
@@ -4110,6 +5712,7 @@ mod tests {
     async fn tier2_rejects_non_charge_intent() {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
         let mut echo = challenge.to_echo();
         echo.intent = "session".into();
         resign_challenge(TEST_SECRET, &mpp.realm, &mut echo);
@@ -4119,9 +5722,76 @@ mod tests {
             source: None,
             payload: serde_json::json!({"type": "signature", "signature": "x"}),
         };
-        let err = mpp.verify_credential(&cred).await.unwrap_err();
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
         assert_eq!(err.code, Some("malformed-credential"));
         assert!(err.message.contains("intent"), "got: {err:?}");
+    }
+
+    // ── Audit #5: push-mode acceptance is opt-in ──
+    //
+    // Spec §13.5: push mode matches by shape; any matching-shape on-chain
+    // transaction can claim any matching-shape challenge. Gate runs before
+    // B34 (which catches the narrower fee-payer-route case).
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rejects_push_credential_when_accept_push_mode_off() {
+        // Default config: accept_push_mode is false. No fee-sponsor either,
+        // so B34 wouldn't fire — only the audit #5 gate should reject.
+        let mpp = test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({
+                "type": "signature",
+                "signature": "3yZe7d2X1bxYjP6kJtNJzC8mFqLgK6vQ9zR3hT5wXdAfVjY8nW1qB4uHpM2sC3rTzJtNeWfDqRmKxYjP6kJtNJzC",
+            }),
+        };
+
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
+        assert_eq!(err.code, Some("malformed-credential"));
+        assert!(
+            err.message.contains("Push-mode credentials are disabled"),
+            "got: {err:?}"
+        );
+        // The error message should also point at the spec for ops triage.
+        assert!(
+            err.message.contains("§13.5"),
+            "expected spec §13.5 callout, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_passes_audit_5_gate_when_accept_push_mode_on() {
+        // Opt in. The audit #5 gate should NOT fire — any later error
+        // (e.g. on-chain verification against a fake signature) is fine,
+        // just not the "Push-mode credentials are disabled" one.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: crate::protocol::solana::mints::USDC_DEVNET.to_string(),
+            network: "devnet".to_string(),
+            accept_push_mode: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let challenge = mpp.charge("0.10").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({
+                "type": "signature",
+                "signature": "3yZe7d2X1bxYjP6kJtNJzC8mFqLgK6vQ9zR3hT5wXdAfVjY8nW1qB4uHpM2sC3rTzJtNeWfDqRmKxYjP6kJtNJzC",
+            }),
+        };
+
+        let err = mpp.verify(&cred, &request).await.unwrap_err();
+        assert!(
+            !err.message.contains("Push-mode credentials are disabled"),
+            "audit #5 gate should not fire when opted in: {err:?}"
+        );
     }
 
     // ── B34: push-mode credentials rejected on fee-payer routes ──
@@ -4137,6 +5807,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn b34_rejects_push_credential_on_fee_payer_route() {
+        // Audit #5 added an earlier `accept_push_mode` gate. To exercise
+        // the B34 fee-payer-specific path in isolation, opt push mode in
+        // here so the audit #5 gate passes and B34 fires.
         let mpp = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
@@ -4144,6 +5817,7 @@ mod tests {
             fee_payer: true,
             fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
+            accept_push_mode: true,
             ..Default::default()
         })
         .unwrap();
@@ -4348,74 +6022,154 @@ mod tests {
     fn find_sol_transfer_success() {
         let mut matched = HashSet::new();
         let instructions = vec![serde_json::json!({
+            "program": "system",
             "parsed": {
                 "type": "transfer",
                 "info": {
+                    "source": "PayerPubkey",
                     "destination": "RecipientPubkey",
                     "lamports": 1000000
                 }
             }
         })];
-        assert!(
-            find_sol_transfer(&instructions, "RecipientPubkey", 1_000_000, &mut matched).is_ok()
-        );
+        assert!(find_sol_transfer(
+            &instructions,
+            "RecipientPubkey",
+            1_000_000,
+            None,
+            &mut matched
+        )
+        .is_ok());
     }
 
     #[test]
     fn find_sol_transfer_wrong_amount() {
         let mut matched = HashSet::new();
         let instructions = vec![serde_json::json!({
+            "program": "system",
             "parsed": {
                 "type": "transfer",
                 "info": {
+                    "source": "PayerPubkey",
                     "destination": "RecipientPubkey",
                     "lamports": 500000
                 }
             }
         })];
-        assert!(
-            find_sol_transfer(&instructions, "RecipientPubkey", 1_000_000, &mut matched).is_err()
-        );
+        assert!(find_sol_transfer(
+            &instructions,
+            "RecipientPubkey",
+            1_000_000,
+            None,
+            &mut matched
+        )
+        .is_err());
     }
 
     #[test]
     fn find_sol_transfer_wrong_recipient() {
         let mut matched = HashSet::new();
         let instructions = vec![serde_json::json!({
+            "program": "system",
             "parsed": {
                 "type": "transfer",
                 "info": {
+                    "source": "PayerPubkey",
                     "destination": "WrongPubkey",
                     "lamports": 1000000
                 }
             }
         })];
-        assert!(
-            find_sol_transfer(&instructions, "RecipientPubkey", 1_000_000, &mut matched).is_err()
-        );
+        assert!(find_sol_transfer(
+            &instructions,
+            "RecipientPubkey",
+            1_000_000,
+            None,
+            &mut matched
+        )
+        .is_err());
     }
 
     #[test]
     fn find_sol_transfer_empty_instructions() {
         let mut matched = HashSet::new();
-        assert!(find_sol_transfer(&[], "RecipientPubkey", 1_000_000, &mut matched).is_err());
+        assert!(find_sol_transfer(&[], "RecipientPubkey", 1_000_000, None, &mut matched).is_err());
     }
 
     #[test]
     fn find_sol_transfer_ignores_non_transfer_types() {
         let mut matched = HashSet::new();
         let instructions = vec![serde_json::json!({
+            "program": "system",
             "parsed": {
                 "type": "createAccount",
                 "info": {
+                    "source": "PayerPubkey",
                     "destination": "RecipientPubkey",
                     "lamports": 1000000
                 }
             }
         })];
-        assert!(
-            find_sol_transfer(&instructions, "RecipientPubkey", 1_000_000, &mut matched).is_err()
-        );
+        assert!(find_sol_transfer(
+            &instructions,
+            "RecipientPubkey",
+            1_000_000,
+            None,
+            &mut matched
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn find_sol_transfer_rejects_non_system_program() {
+        let mut matched = HashSet::new();
+        // A "transfer" with a lamports field, but on the wrong program. The
+        // legacy implementation matched on parsed.type + info.lamports alone
+        // and would accept this; the hardened implementation must not.
+        let instructions = vec![serde_json::json!({
+            "programId": programs::TOKEN_PROGRAM,
+            "parsed": {
+                "type": "transfer",
+                "info": {
+                    "source": "PayerPubkey",
+                    "destination": "RecipientPubkey",
+                    "lamports": 1_000_000
+                }
+            }
+        })];
+        assert!(find_sol_transfer(
+            &instructions,
+            "RecipientPubkey",
+            1_000_000,
+            None,
+            &mut matched
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn find_sol_transfer_rejects_source_equals_fee_payer() {
+        let mut matched = HashSet::new();
+        let instructions = vec![serde_json::json!({
+            "program": "system",
+            "parsed": {
+                "type": "transfer",
+                "info": {
+                    "source": "FeePayerPubkey",
+                    "destination": "RecipientPubkey",
+                    "lamports": 1_000_000
+                }
+            }
+        })];
+        let err = find_sol_transfer(
+            &instructions,
+            "RecipientPubkey",
+            1_000_000,
+            Some("FeePayerPubkey"),
+            &mut matched,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("Fee payer cannot fund"));
     }
 
     #[test]
@@ -4424,18 +6178,22 @@ mod tests {
         let split_recipient = "SplitRecipient";
         let instructions = vec![
             serde_json::json!({
+                "program": "system",
                 "parsed": {
                     "type": "transfer",
                     "info": {
+                        "source": "PayerPubkey",
                         "destination": primary_recipient,
                         "lamports": 800000
                     }
                 }
             }),
             serde_json::json!({
+                "program": "system",
                 "parsed": {
                     "type": "transfer",
                     "info": {
+                        "source": "PayerPubkey",
                         "destination": split_recipient,
                         "lamports": 200000
                     }
@@ -4451,15 +6209,19 @@ mod tests {
             memo: None,
         }];
 
-        assert!(verify_sol_transfers(&instructions, primary_recipient, 800000, &splits).is_ok());
+        assert!(
+            verify_sol_transfers(&instructions, primary_recipient, 800000, &splits, None).is_ok()
+        );
     }
 
     #[test]
     fn verify_sol_transfers_missing_split() {
         let instructions = vec![serde_json::json!({
+            "program": "system",
             "parsed": {
                 "type": "transfer",
                 "info": {
+                    "source": "PayerPubkey",
                     "destination": "PrimaryRecipient",
                     "lamports": 800000
                 }
@@ -4474,8 +6236,8 @@ mod tests {
             memo: None,
         }];
 
-        let err =
-            verify_sol_transfers(&instructions, "PrimaryRecipient", 800000, &splits).unwrap_err();
+        let err = verify_sol_transfers(&instructions, "PrimaryRecipient", 800000, &splits, None)
+            .unwrap_err();
         assert!(err.message.contains("Missing split transfer"));
     }
 
@@ -4483,18 +6245,22 @@ mod tests {
     fn verify_sol_transfers_rejects_reusing_single_instruction_for_duplicate_splits() {
         let instructions = vec![
             serde_json::json!({
+                "program": "system",
                 "parsed": {
                     "type": "transfer",
                     "info": {
+                        "source": "PayerPubkey",
                         "destination": "PrimaryRecipient",
                         "lamports": 800000
                     }
                 }
             }),
             serde_json::json!({
+                "program": "system",
                 "parsed": {
                     "type": "transfer",
                     "info": {
+                        "source": "PayerPubkey",
                         "destination": "SplitRecipient",
                         "lamports": 100000
                     }
@@ -4519,8 +6285,8 @@ mod tests {
             },
         ];
 
-        let err =
-            verify_sol_transfers(&instructions, "PrimaryRecipient", 800000, &splits).unwrap_err();
+        let err = verify_sol_transfers(&instructions, "PrimaryRecipient", 800000, &splits, None)
+            .unwrap_err();
         assert!(err.message.contains("Missing split transfer"));
     }
 
@@ -4732,9 +6498,16 @@ mod tests {
             }
         })];
 
-        assert!(
-            find_spl_transfer(&instructions, owner, mint, 1_000_000, None, &mut matched).is_ok()
-        );
+        assert!(find_spl_transfer(
+            &instructions,
+            owner,
+            mint,
+            1_000_000,
+            None,
+            None,
+            &mut matched
+        )
+        .is_ok());
     }
 
     #[test]
@@ -4758,6 +6531,7 @@ mod tests {
             "SomeOwner",
             "SomeMint",
             1_000_000,
+            None,
             None,
             &mut matched
         )
@@ -4785,6 +6559,7 @@ mod tests {
             "SomeOwner",
             "SomeMint",
             1_000_000,
+            None,
             None,
             &mut matched
         )
@@ -4827,6 +6602,7 @@ mod tests {
             owner,
             wrong_mint,
             1_000_000,
+            None,
             None,
             &mut matched
         )
@@ -4900,9 +6676,104 @@ mod tests {
             },
         ];
 
-        let err =
-            verify_spl_transfers(&instructions, owner, mint, 800000, &splits, None).unwrap_err();
+        let err = verify_spl_transfers(&instructions, owner, mint, 800000, &splits, None, None)
+            .unwrap_err();
         assert!(err.message.contains("Missing split SPL transfer"));
+    }
+
+    #[test]
+    fn find_spl_transfer_rejects_authority_equals_fee_payer() {
+        let mut matched = HashSet::new();
+        let owner = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let fee_payer = "9XHRopERTd4LfQ8b6e3p9bN2WhxgQzDxFRtbq1XwQ4mP";
+        let tp = programs::TOKEN_PROGRAM;
+
+        let owner_pk = Pubkey::from_str(owner).unwrap();
+        let mint_pk = Pubkey::from_str(mint).unwrap();
+        let tp_pk = Pubkey::from_str(tp).unwrap();
+        let ata_program = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
+        let (dest_ata, _) = Pubkey::find_program_address(
+            &[owner_pk.as_ref(), tp_pk.as_ref(), mint_pk.as_ref()],
+            &ata_program,
+        );
+
+        let instructions = vec![serde_json::json!({
+            "programId": tp,
+            "parsed": {
+                "type": "transferChecked",
+                "info": {
+                    "source": "SomeSourceAta1111111111111111111111111111111",
+                    "authority": fee_payer,
+                    "destination": dest_ata.to_string(),
+                    "mint": mint,
+                    "tokenAmount": { "amount": "1000000" }
+                }
+            }
+        })];
+
+        let err = find_spl_transfer(
+            &instructions,
+            owner,
+            mint,
+            1_000_000,
+            None,
+            Some(fee_payer),
+            &mut matched,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("Fee payer cannot authorize"));
+    }
+
+    #[test]
+    fn find_spl_transfer_rejects_source_equals_fee_payer_ata() {
+        let mut matched = HashSet::new();
+        let owner = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let fee_payer = "9XHRopERTd4LfQ8b6e3p9bN2WhxgQzDxFRtbq1XwQ4mP";
+        let tp = programs::TOKEN_PROGRAM;
+
+        let owner_pk = Pubkey::from_str(owner).unwrap();
+        let fee_payer_pk = Pubkey::from_str(fee_payer).unwrap();
+        let mint_pk = Pubkey::from_str(mint).unwrap();
+        let tp_pk = Pubkey::from_str(tp).unwrap();
+        let ata_program = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
+        let (dest_ata, _) = Pubkey::find_program_address(
+            &[owner_pk.as_ref(), tp_pk.as_ref(), mint_pk.as_ref()],
+            &ata_program,
+        );
+        let (fee_payer_ata, _) = Pubkey::find_program_address(
+            &[fee_payer_pk.as_ref(), tp_pk.as_ref(), mint_pk.as_ref()],
+            &ata_program,
+        );
+
+        let instructions = vec![serde_json::json!({
+            "programId": tp,
+            "parsed": {
+                "type": "transferChecked",
+                "info": {
+                    "source": fee_payer_ata.to_string(),
+                    // Authority is a different account (e.g. a delegate) so the
+                    // first check passes; the source-ATA check must still fire.
+                    "authority": owner,
+                    "destination": dest_ata.to_string(),
+                    "mint": mint,
+                    "tokenAmount": { "amount": "1000000" }
+                }
+            }
+        })];
+
+        let err = find_spl_transfer(
+            &instructions,
+            owner,
+            mint,
+            1_000_000,
+            None,
+            Some(fee_payer),
+            &mut matched,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("Fee payer token account cannot fund"));
     }
 
     #[test]
@@ -4943,7 +6814,8 @@ mod tests {
             }),
         ];
         let matched =
-            verify_spl_transfers(&instructions, owner, mint, 1_000_000, &[], Some(tp)).unwrap();
+            verify_spl_transfers(&instructions, owner, mint, 1_000_000, &[], Some(tp), None)
+                .unwrap();
         let allowed_ata_owners = HashSet::from([owner.to_string()]);
         let required_ata_owners = HashSet::new();
 
@@ -5444,6 +7316,8 @@ mod tests {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: true,
+            // Audit #16: signer is now required alongside fee_payer = true.
+            fee_payer_signer: Some(test_fee_payer_signer()),
             network: "devnet".to_string(),
             ..Default::default()
         })
@@ -5458,7 +7332,16 @@ mod tests {
 
     #[test]
     fn charge_options_fee_payer_flag() {
-        let mpp = test_mpp();
+        // Audit #16: per-call ChargeOptions.fee_payer requires the server
+        // to have a signer configured.
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            fee_payer_signer: Some(test_fee_payer_signer()),
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
         let challenge = mpp
             .charge_with_options(
                 "1.00",

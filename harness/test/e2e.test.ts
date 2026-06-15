@@ -281,7 +281,10 @@ beforeAll(async () => {
     MPP_HARNESS_NETWORK: baseScenario.network,
     MPP_HARNESS_MINT: baseScenario.asset,
     MPP_HARNESS_PRICE: baseScenario.price,
-    MPP_HARNESS_SECRET_KEY: "mpp-harness-secret-key",
+    // Rust audit #24 requires ≥32-byte HMAC secrets (NIST SP 800-107 for
+    // HMAC-SHA256). Padded with `-pad` to clear the threshold without
+    // changing the test's intent.
+    MPP_HARNESS_SECRET_KEY: "mpp-harness-secret-key-with-32b-pad",
     MPP_HARNESS_PAY_TO: payTo.publicKey,
     MPP_HARNESS_CLIENT_SECRET_KEY: JSON.stringify(Array.from(client.secretKey)),
     MPP_HARNESS_FEE_PAYER_SECRET_KEY: JSON.stringify(
@@ -593,7 +596,8 @@ describe("mpp harness", () => {
             const envA = environmentForScenario(harnessEnv, scenario);
             const envB = {
               ...environmentForScenario(harnessEnv, scenario),
-              MPP_HARNESS_SECRET_KEY: "mpp-harness-secret-key-server-b",
+              // Rust audit #24: 32-byte minimum.
+              MPP_HARNESS_SECRET_KEY: "mpp-harness-secret-key-server-b-pad",
             };
             const a = await startServer(serverA, envA);
             runningServers.push(a);

@@ -27,15 +27,47 @@ pub mod mints {
     pub const CASH_MAINNET: &str = "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH";
 }
 
+/// Canonical Solana network slugs per spec §7.2.
+///
+/// `mainnet` is the canonical form. The literal `mainnet-beta` is a Solana
+/// RPC hostname convention and MUST NOT appear as a wire-format network
+/// slug — `validate_network` rejects it explicitly to prevent the
+/// non-canonical name from drifting back in.
+pub const NETWORK_MAINNET: &str = "mainnet";
+pub const NETWORK_DEVNET: &str = "devnet";
+pub const NETWORK_LOCALNET: &str = "localnet";
+
+/// Default network when callers omit it. Matches the spec's "defaults to
+/// mainnet if omitted" guidance.
+pub const DEFAULT_NETWORK: &str = NETWORK_MAINNET;
+
 /// Maximum byte length of an SPL Memo instruction payload.
 pub const MAX_MEMO_BYTES: usize = 566;
 
-/// Default RPC URLs per network.
+/// Audit #37: allowlist the network slug per spec §7.2. Rejects anything
+/// that isn't `mainnet`, `devnet`, or `localnet`, so a typo or stale name
+/// (e.g. `mainnet-beta`, `testnet`) surfaces at the boundary instead of
+/// silently mapping to a default cluster.
+pub fn validate_network(network: &str) -> Result<(), crate::error::Error> {
+    match network {
+        NETWORK_MAINNET | NETWORK_DEVNET | NETWORK_LOCALNET => Ok(()),
+        "" => Err(crate::error::Error::InvalidConfig(
+            "network must not be empty (one of `mainnet`, `devnet`, `localnet`)".into(),
+        )),
+        other => Err(crate::error::Error::InvalidConfig(format!(
+            "Unknown network `{other}` (allowed: `mainnet`, `devnet`, `localnet`)"
+        ))),
+    }
+}
+
+/// Default RPC URLs per network. Inputs are expected to be canonical
+/// slugs (see `validate_network`); unknown slugs fall through to the
+/// mainnet RPC for backwards compatibility, but `validate_network` at
+/// `Mpp::new` ensures servers can never reach the fallback path.
 pub fn default_rpc_url(network: &str) -> &'static str {
     match network {
-        "devnet" => "https://api.devnet.solana.com",
-        "testnet" => "https://api.testnet.solana.com",
-        "localnet" => "http://localhost:8899",
+        NETWORK_DEVNET => "https://api.devnet.solana.com",
+        NETWORK_LOCALNET => "http://localhost:8899",
         _ => "https://api.mainnet-beta.solana.com",
     }
 }
@@ -78,7 +110,28 @@ fn stablecoin_uses_token_2022(mint: &str) -> bool {
     )
 }
 
+/// Whether `mint` is one of the well-known stablecoin mints whose token
+/// program is hardcoded. Returning `false` for an arbitrary mint means
+/// callers must do an on-chain mint-owner lookup to find the program.
+pub fn is_known_stablecoin_mint(mint: &str) -> bool {
+    matches!(
+        mint,
+        mints::USDC_MAINNET
+            | mints::USDC_DEVNET
+            | mints::USDT_MAINNET
+            | mints::USDG_MAINNET
+            | mints::USDG_DEVNET
+            | mints::PYUSD_MAINNET
+            | mints::PYUSD_DEVNET
+            | mints::CASH_MAINNET
+    )
+}
+
 /// Default token program for a currency or mint.
+///
+/// Only valid for well-known stablecoins. Callers handling arbitrary mints
+/// MUST resolve the token program via an on-chain mint-owner lookup
+/// (spec §7.2) rather than relying on this fallback.
 pub fn default_token_program_for_currency(currency: &str, network: Option<&str>) -> &'static str {
     match resolve_stablecoin_mint(currency, network) {
         Some(mint) if stablecoin_uses_token_2022(mint) => programs::TOKEN_2022_PROGRAM,
@@ -106,11 +159,6 @@ mod tests {
             default_rpc_url("mainnet"),
             "https://api.mainnet-beta.solana.com"
         );
-    }
-
-    #[test]
-    fn default_rpc_url_testnet() {
-        assert_eq!(default_rpc_url("testnet"), "https://api.testnet.solana.com");
     }
 
     #[test]
@@ -375,6 +423,150 @@ mod tests {
         let deserialized: Split = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.ata_creation_required, Some(true));
     }
+
+    // ── Audit #30: checked_sum_split_amounts ──
+
+    fn split_with_amount(amt: &str) -> Split {
+        Split {
+            recipient: "R".to_string(),
+            amount: amt.to_string(),
+            ata_creation_required: None,
+            label: None,
+            memo: None,
+        }
+    }
+
+    #[test]
+    fn checked_sum_split_amounts_within_u64_sums_correctly() {
+        let splits = [
+            split_with_amount("100"),
+            split_with_amount("200"),
+            split_with_amount("3"),
+        ];
+        assert_eq!(checked_sum_split_amounts(&splits), Some(303));
+    }
+
+    #[test]
+    fn checked_sum_split_amounts_overflows_returns_none() {
+        let near_max = (u64::MAX / 2) + 1;
+        let splits = [
+            split_with_amount(&near_max.to_string()),
+            split_with_amount(&near_max.to_string()),
+        ];
+        // Sum would be u64::MAX + 1 — must report overflow.
+        assert_eq!(checked_sum_split_amounts(&splits), None);
+    }
+
+    #[test]
+    fn checked_sum_split_amounts_unparseable_treated_as_zero() {
+        // Strict parseability is audit #21's concern; here we just check
+        // that an unparseable amount doesn't break the arithmetic.
+        let splits = [
+            split_with_amount("100"),
+            split_with_amount("not-a-number"),
+            split_with_amount("50"),
+        ];
+        assert_eq!(checked_sum_split_amounts(&splits), Some(150));
+    }
+
+    #[test]
+    fn checked_sum_split_amounts_empty_is_zero() {
+        let splits: [Split; 0] = [];
+        assert_eq!(checked_sum_split_amounts(&splits), Some(0));
+    }
+
+    // ── Audit #21: validate_splits ──
+
+    fn split(recipient: &str, amount: &str) -> Split {
+        Split {
+            recipient: recipient.to_string(),
+            amount: amount.to_string(),
+            ata_creation_required: None,
+            label: None,
+            memo: None,
+        }
+    }
+
+    fn unique_pubkey() -> String {
+        solana_pubkey::Pubkey::new_unique().to_string()
+    }
+
+    #[test]
+    fn validate_splits_accepts_valid_set() {
+        let splits = vec![
+            split(&unique_pubkey(), "100"),
+            split(&unique_pubkey(), "200"),
+            split(&unique_pubkey(), "300"),
+        ];
+        validate_splits(&splits).expect("valid splits should be accepted");
+    }
+
+    #[test]
+    fn validate_splits_accepts_empty() {
+        let splits: Vec<Split> = vec![];
+        validate_splits(&splits).expect("empty list is allowed");
+    }
+
+    #[test]
+    fn validate_splits_rejects_count_above_max() {
+        let splits: Vec<Split> = (0..(MAX_SPLITS + 1))
+            .map(|_| split(&unique_pubkey(), "1"))
+            .collect();
+        let err = validate_splits(&splits).err().expect("too many splits");
+        assert!(matches!(err, crate::error::Error::TooManySplits));
+    }
+
+    #[test]
+    fn validate_splits_rejects_invalid_recipient() {
+        let splits = vec![split("not-a-pubkey!!", "100")];
+        let err = validate_splits(&splits).err().expect("bad recipient");
+        assert!(
+            format!("{err}").contains("splits[0]: invalid recipient pubkey"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_splits_rejects_unparseable_amount() {
+        let splits = vec![split(&unique_pubkey(), "not-a-number")];
+        let err = validate_splits(&splits).err().expect("bad amount");
+        assert!(
+            format!("{err}").contains("is not a valid u64"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_splits_rejects_zero_amount() {
+        let splits = vec![split(&unique_pubkey(), "0")];
+        let err = validate_splits(&splits).err().expect("zero amount");
+        assert!(
+            format!("{err}").contains("amount must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_splits_rejects_overflowing_aggregate() {
+        let near_max = (u64::MAX / 2) + 1;
+        let splits = vec![
+            split(&unique_pubkey(), &near_max.to_string()),
+            split(&unique_pubkey(), &near_max.to_string()),
+        ];
+        let err = validate_splits(&splits).err().expect("aggregate overflow");
+        assert!(format!("{err}").contains("overflows u64"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_splits_rejects_duplicate_recipient() {
+        let dup = unique_pubkey();
+        let splits = vec![split(&dup, "100"), split(&dup, "200")];
+        let err = validate_splits(&splits).err().expect("duplicate recipient");
+        assert!(
+            format!("{err}").contains("duplicate recipient"),
+            "got: {err}"
+        );
+    }
 }
 
 /// Solana-specific method details in the challenge request.
@@ -398,7 +590,7 @@ pub struct MethodDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_payer_key: Option<String>,
 
-    /// Additional payment splits (max 8).
+    /// Additional payment splits (max `MAX_SPLITS`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub splits: Option<Vec<Split>>,
 
@@ -426,6 +618,85 @@ pub struct Split {
     /// Optional memo (max 566 bytes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
+}
+
+/// Maximum number of payment splits per challenge.
+///
+/// Mirrors the upper bound enforced by the TS SDK and the wire-format
+/// guidance from the MPP spec. Single source of truth for both client-side
+/// (pre-build) and server-side (pre-broadcast) cap checks.
+pub const MAX_SPLITS: usize = 8;
+
+/// Audit #21: validate a list of payment splits at challenge issuance.
+///
+/// Single source of truth for both server entry points (`charge_with_options`
+/// and `charge_challenge_with_options`). Without this gate, malformed
+/// splits would otherwise only surface at the chain — too late for the
+/// merchant to recover and bad UX for the payer.
+///
+/// Checks (each callsite gets the same error shape):
+/// 1. `splits.len() <= MAX_SPLITS`.
+/// 2. Each `split.recipient` parses as a `Pubkey`.
+/// 3. Each `split.amount` parses as `u64` AND is non-zero.
+/// 4. The aggregate sum fits in `u64` (`checked_sum_split_amounts` is `Some`).
+/// 5. No duplicate `recipient` across splits.
+///
+/// Application-level recipient allowlists are out of scope — an SDK
+/// shouldn't bake in domain-specific policy.
+pub fn validate_splits(splits: &[Split]) -> Result<(), crate::error::Error> {
+    use crate::error::Error;
+    use std::collections::HashSet;
+    use std::str::FromStr;
+
+    if splits.len() > MAX_SPLITS {
+        return Err(Error::TooManySplits);
+    }
+
+    let mut seen_recipients: HashSet<&str> = HashSet::with_capacity(splits.len());
+    for (idx, split) in splits.iter().enumerate() {
+        solana_pubkey::Pubkey::from_str(&split.recipient).map_err(|e| {
+            Error::InvalidConfig(format!("splits[{idx}]: invalid recipient pubkey: {e}"))
+        })?;
+        let amount = split.amount.parse::<u64>().map_err(|_| {
+            Error::InvalidConfig(format!(
+                "splits[{idx}]: amount `{}` is not a valid u64",
+                split.amount
+            ))
+        })?;
+        if amount == 0 {
+            return Err(Error::InvalidConfig(format!(
+                "splits[{idx}]: amount must be greater than zero"
+            )));
+        }
+        if !seen_recipients.insert(split.recipient.as_str()) {
+            return Err(Error::InvalidConfig(format!(
+                "splits[{idx}]: duplicate recipient `{}`",
+                split.recipient
+            )));
+        }
+    }
+
+    if checked_sum_split_amounts(splits).is_none() {
+        return Err(Error::InvalidConfig(
+            "Sum of split amounts overflows u64".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Audit #30: sum split amounts in base units with overflow detection.
+///
+/// Returns `None` if the running total would overflow `u64`. Unparseable
+/// `amount` strings are treated as 0 — strict parseability is audit #21's
+/// concern; here we only address the *arithmetic* overflow shape so a
+/// stuffed split list cannot panic (debug) or wrap (release) downstream
+/// callers that derive the primary amount via `total - splits_total`.
+pub fn checked_sum_split_amounts(splits: &[Split]) -> Option<u64> {
+    splits
+        .iter()
+        .map(|s| s.amount.parse::<u64>().unwrap_or(0))
+        .try_fold(0u64, |acc, x| acc.checked_add(x))
 }
 
 /// Credential payload — what the client sends in the Authorization header.

@@ -56,7 +56,9 @@ use solana_mpp::{
 const DEFAULT_RESOURCE_PATH: &str = "/protected";
 const HEALTH_PATH: &str = "/health";
 const DEFAULT_PRICE: &str = "0.001";
-const DEFAULT_SECRET_KEY: &str = "mpp-harness-secret-key";
+// Audit #24: ≥32 bytes for HMAC-SHA256 keys. Pad to keep the harness
+// default usable when no MPP_HARNESS_SECRET_KEY is set in the env.
+const DEFAULT_SECRET_KEY: &str = "mpp-harness-secret-key-with-32b-pad";
 const DEFAULT_SETTLEMENT_HEADER: &str = "x-fixture-settlement";
 const DEFAULT_TOKEN_DECIMALS: u8 = 6;
 
@@ -144,6 +146,11 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
         _ => DEFAULT_TOKEN_DECIMALS,
     };
     let splits = read_splits()?;
+    // Refuse to boot with invalid splits (audit #21). The harness
+    // misconfig scenario depends on this — every server SDK should
+    // reject the misconfig consistently, and refusing to start is the
+    // earliest possible signal.
+    solana_mpp::protocol::solana::validate_splits(&splits)?;
 
     Ok(HarnessState {
         mpp: Mpp::new(Config {
@@ -158,6 +165,9 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
             fee_payer_signer: if push_mode { None } else { Some(fee_payer) },
             store: None,
             html: false,
+            // Interop tests exercise push mode end-to-end; the gate is
+            // opt-in (audit #5) so we set it explicitly here.
+            accept_push_mode: push_mode,
         })?,
         price,
         push_mode,

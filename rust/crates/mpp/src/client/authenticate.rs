@@ -193,13 +193,15 @@ mod tests {
             currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             decimals: 6,
             network: "mainnet".into(),
-            challenge_binding_secret: Some("test-secret".into()),
+            // ≥32 bytes to satisfy the audit #24 secret-length check at Mpp::new.
+            challenge_binding_secret: Some("test-secret-key-for-authenticate-32b-pad".into()),
             ..Default::default()
         })
         .expect("mpp")
         .charge_challenge(&crate::ChargeRequest {
             amount: "1000".into(),
             currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            recipient: Some(signer.pubkey().to_string()),
             ..Default::default()
         })
         .expect("charge challenge");

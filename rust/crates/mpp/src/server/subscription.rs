@@ -1170,7 +1170,6 @@ mod tests {
     #[test]
     fn default_rpc_url_covers_each_network() {
         assert_eq!(default_rpc_url("devnet"), "https://api.devnet.solana.com");
-        assert_eq!(default_rpc_url("testnet"), "https://api.testnet.solana.com");
         assert_eq!(default_rpc_url("localnet"), "http://localhost:8899");
         // `mainnet` is the canonical slug; the legacy `mainnet-beta`
         // alias still resolves so existing clients don't break.

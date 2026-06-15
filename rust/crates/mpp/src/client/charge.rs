@@ -45,17 +45,53 @@ pub async fn build_charge_transaction(
 pub struct BuildChargeTransactionOptions {
     /// Optional root payment memo. Spec-aligned callers pass `ChargeRequest.externalId`.
     pub external_id: Option<String>,
+    /// Opt-in: sign for an unknown Token-2022 mint.
+    ///
+    /// Token-2022 supports transfer hooks that run arbitrary program code on
+    /// every transfer. We refuse to sign for mints outside the known
+    /// stablecoin allowlist when they live on Token-2022 unless the caller
+    /// explicitly accepts that risk by setting this flag. The vanilla Token
+    /// Program has no hooks, so arbitrary mints there are always allowed.
+    pub allow_unknown_token_2022: bool,
+    /// Audit #10: client-side cap on what the wallet will sign.
+    ///
+    /// When set, the builder refuses to sign a challenge whose `amount`
+    /// (in base units) exceeds this value. Intended for auto-pay
+    /// integrations where the user can't review each challenge by hand
+    /// and the server is therefore implicitly untrusted.
+    pub max_amount_base_units: Option<u64>,
+    /// Audit #10: client-side pin on the network the wallet will sign for.
+    ///
+    /// When set, the builder refuses to sign a challenge whose
+    /// `methodDetails.network` does not match this value. Prevents an
+    /// auto-pay agent meant for one network from being lured into
+    /// signing a transaction for another.
+    pub expected_network: Option<String>,
 }
 
 /// Options for selecting one Solana charge challenge from a challenge set.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SelectChargeChallengeOptions<'a> {
     /// Currency symbol or mint address the client wants to pay with.
+    ///
+    /// Audit #14: this is the *fallback* preference — if
+    /// `currency_preferences` is non-empty it takes priority and this
+    /// field is ignored. Set one or the other, not both.
     pub currency: Option<&'a str>,
     /// Currency symbols or mint addresses in client preference order.
+    ///
+    /// Audit #14: when non-empty, takes priority over `currency`.
     pub currency_preferences: &'a [&'a str],
-    /// Solana network identifier, e.g. "mainnet", "devnet", or "localnet".
+    /// Solana network identifier, one of "mainnet", "devnet", or "localnet"
+    /// (spec §7.2). The legacy "mainnet-beta" name is the RPC hostname, not
+    /// a canonical slug.
     pub network: Option<&'a str>,
+    /// Opt-in: select challenges whose currency is an unknown Token-2022 mint.
+    /// See `BuildChargeTransactionOptions::allow_unknown_token_2022` for the
+    /// underlying threat model. Default `false` — unknown Token-2022
+    /// challenges (and challenges whose token program we can't determine
+    /// from `methodDetails`) are skipped.
+    pub allow_unknown_token_2022: bool,
 }
 
 /// Build a charge transaction from challenge parameters and additional client options.
@@ -72,15 +108,31 @@ pub async fn build_charge_transaction_with_options(
         .parse()
         .map_err(|_| Error::Other(format!("Invalid amount: {amount}")))?;
 
+    // Audit #10: client-side policy gates. Run before any signing work so
+    // we never produce a signature for an out-of-policy challenge.
+    if let Some(cap) = options.max_amount_base_units {
+        if total_amount > cap {
+            return Err(Error::Other(format!(
+                "Challenge amount {total_amount} exceeds client max_amount_base_units {cap}"
+            )));
+        }
+    }
+    if let Some(expected) = options.expected_network.as_deref() {
+        let actual = method_details.network.as_deref().unwrap_or("");
+        if actual != expected {
+            return Err(Error::Other(format!(
+                "Challenge network `{actual}` does not match client expected_network `{expected}`"
+            )));
+        }
+    }
+
     let splits = method_details.splits.as_deref().unwrap_or(&[]);
-    if splits.len() > 8 {
+    if splits.len() > crate::protocol::solana::MAX_SPLITS {
         return Err(Error::TooManySplits);
     }
 
-    let splits_total: u64 = splits
-        .iter()
-        .filter_map(|s| s.amount.parse::<u64>().ok())
-        .sum();
+    let splits_total = crate::protocol::solana::checked_sum_split_amounts(splits)
+        .ok_or(Error::SplitsExceedAmount)?;
     let primary_amount = total_amount
         .checked_sub(splits_total)
         .ok_or(Error::SplitsExceedAmount)?;
@@ -139,6 +191,7 @@ pub async fn build_charge_transaction_with_options(
             options.external_id.as_deref(),
             splits,
             fee_payer_pubkey.as_ref(),
+            options.allow_unknown_token_2022,
         )?;
     } else {
         build_sol_instructions(
@@ -155,7 +208,14 @@ pub async fn build_charge_transaction_with_options(
     let blockhash = if let Some(bh) = &method_details.recent_blockhash {
         Hash::from_str(bh).map_err(|e| Error::Other(format!("Invalid blockhash: {e}")))?
     } else {
-        rpc.get_latest_blockhash()
+        // Audit #36: ask for `confirmed` explicitly instead of leaning on
+        // the RPC client's default commitment. Solana's client guidance
+        // recommends `confirmed` for blockhash fetches — a `processed`
+        // hash can disappear under reorgs and produce signed transactions
+        // that fail with BlockhashNotFound after broadcast.
+        use solana_commitment_config::CommitmentConfig;
+        rpc.get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .map(|(hash, _last_valid_block_height)| hash)
             .map_err(|e| Error::Rpc(e.to_string()))?
     };
 
@@ -194,6 +254,43 @@ pub async fn build_credential_header(
     rpc: &RpcClient,
     challenge: &PaymentChallenge,
 ) -> Result<String, Error> {
+    build_credential_header_with_options(signer, rpc, challenge, Default::default()).await
+}
+
+/// Like `build_credential_header`, but lets the caller pass
+/// `BuildChargeTransactionOptions` — in particular
+/// `allow_unknown_token_2022` to opt into signing for unknown Token-2022
+/// mints (see that field's docs).
+pub async fn build_credential_header_with_options(
+    signer: &dyn SolanaSigner,
+    rpc: &RpcClient,
+    challenge: &PaymentChallenge,
+    mut options: BuildChargeTransactionOptions,
+) -> Result<String, Error> {
+    // Audit #17: refuse to sign anything but a `solana`/`charge`
+    // challenge. The lower-level `build_charge_transaction_with_options`
+    // takes already-decoded fields and has no notion of method/intent,
+    // so the trust boundary belongs at this `PaymentChallenge` entry
+    // point. `select_charge_challenge` already filters via the same
+    // helper; this gate catches callers who skip it.
+    if !is_solana_charge_challenge_name(challenge) {
+        return Err(Error::Other(format!(
+            "Refusing to sign: challenge is not a solana/charge challenge \
+             (method=`{}`, intent=`{}`)",
+            challenge.method.as_str(),
+            challenge.intent.as_str(),
+        )));
+    }
+
+    // Audit #10: refuse to sign expired challenges. The protocol allows
+    // `expires` to be absent — when it is, we let the challenge through
+    // (no client-side anchor to check against).
+    if challenge.is_expired() {
+        return Err(Error::Other(
+            "Challenge has expired; refusing to sign".into(),
+        ));
+    }
+
     // Decode the request to get Solana-specific fields.
     let request: crate::protocol::intents::ChargeRequest = challenge
         .request
@@ -213,6 +310,12 @@ pub async fn build_credential_header(
         .as_deref()
         .ok_or_else(|| Error::Other("No recipient in challenge".into()))?;
 
+    // Default external_id to the challenge's value if the caller didn't
+    // override it (preserves prior build_credential_header behavior).
+    if options.external_id.is_none() {
+        options.external_id = request.external_id.clone();
+    }
+
     let payload = build_charge_transaction_with_options(
         signer,
         rpc,
@@ -220,9 +323,7 @@ pub async fn build_credential_header(
         &request.currency,
         recipient,
         &method_details,
-        BuildChargeTransactionOptions {
-            external_id: request.external_id.clone(),
-        },
+        options,
     )
     .await?;
 
@@ -260,6 +361,12 @@ pub fn select_charge_challenge<'a>(
             continue;
         }
 
+        if !options.allow_unknown_token_2022
+            && challenge_is_unknown_token_2022(&request, &method_details)
+        {
+            continue;
+        }
+
         candidates.push((challenge, request, method_details));
     }
 
@@ -280,6 +387,34 @@ pub fn select_charge_challenge<'a>(
     }
 
     Ok(None)
+}
+
+/// Returns true if the challenge's currency is an arbitrary mint address
+/// (not a recognized stablecoin) AND we cannot confirm its token program
+/// is the vanilla Token Program. In both the explicit Token-2022 case and
+/// the "no `tokenProgram` hint" case we fail closed — see
+/// `BuildChargeTransactionOptions::allow_unknown_token_2022`.
+fn challenge_is_unknown_token_2022(
+    request: &ChargeRequest,
+    method_details: &MethodDetails,
+) -> bool {
+    if request.currency.eq_ignore_ascii_case("SOL") {
+        return false;
+    }
+    let mint = match crate::protocol::solana::resolve_stablecoin_mint(
+        &request.currency,
+        method_details.network.as_deref(),
+    ) {
+        Some(m) => m,
+        None => return false,
+    };
+    if crate::protocol::solana::is_known_stablecoin_mint(mint) {
+        return false;
+    }
+    // Arbitrary mint. Vanilla Token Program is hookless, so accept it; for
+    // anything else (Token-2022 or unspecified) we cannot tell that
+    // signing is safe.
+    !matches!(method_details.token_program.as_deref(), Some(p) if p == programs::TOKEN_PROGRAM)
 }
 
 /// Returns true when a challenge is a schema-valid Solana charge challenge.
@@ -358,10 +493,33 @@ fn build_spl_instructions(
     external_id: Option<&str>,
     splits: &[Split],
     fee_payer: Option<&Pubkey>,
+    allow_unknown_token_2022: bool,
 ) -> Result<(), Error> {
     let mint = Pubkey::from_str(spl).map_err(|e| Error::Other(format!("Invalid mint: {e}")))?;
     let token_program = resolve_token_program(rpc, &mint, method_details)?;
-    let decimals = method_details.decimals.unwrap_or(6);
+
+    // Spec §13.3: refuse to sign for an arbitrary Token-2022 mint unless
+    // the caller opted in. Transfer hooks run on every transfer and can
+    // execute arbitrary program code; the server's pre-broadcast checks
+    // do not simulate inner instructions in pull mode. The vanilla Token
+    // Program has no hooks, so unknown mints there are allowed.
+    if token_program.to_string() == programs::TOKEN_2022_PROGRAM
+        && !crate::protocol::solana::is_known_stablecoin_mint(spl)
+        && !allow_unknown_token_2022
+    {
+        return Err(Error::Other(format!(
+            "Refusing to sign for unknown Token-2022 mint {spl}: \
+             set BuildChargeTransactionOptions::allow_unknown_token_2022 \
+             to opt in (Token-2022 supports transfer hooks)"
+        )));
+    }
+
+    // Audit #42: spec §7.2 requires `decimals` to be present when `currency`
+    // is a mint address (i.e. always on this SPL path). Defaulting to 6
+    // silently produced wrong-decimals transfers for non-6-decimal tokens.
+    let decimals = method_details.decimals.ok_or_else(|| {
+        Error::Other("methodDetails.decimals is required for SPL charges (spec §7.2)".into())
+    })?;
 
     let source_ata = get_associated_token_address(signer_pubkey, &mint, &token_program);
 
@@ -406,11 +564,17 @@ fn build_spl_instructions(
             .amount
             .parse()
             .map_err(|_| Error::Other(format!("Invalid split amount: {}", split.amount)))?;
+        // Audit #20: only create the split ATA when the challenge
+        // explicitly flags it. The old behaviour auto-created in
+        // client-paid mode, letting a hostile server drain the client
+        // with N dust splits × ATA rent. Spec §7.2 says the client MUST
+        // include the ATA-create ix when `ataCreationRequired` is true;
+        // it does not authorize creation otherwise.
         add_spl_transfer(
             instructions,
             &split_recipient,
             split_amount,
-            fee_payer.is_none() || split.ata_creation_required == Some(true),
+            split.ata_creation_required == Some(true),
         )?;
         push_memo_instruction(instructions, split.memo.as_deref())?;
     }
@@ -524,7 +688,13 @@ fn transfer_checked_ix(
 
 /// Resolve a currency to an optional mint address.
 ///
-/// Returns `None` for native SOL, or `Some(mint_address)` for SPL tokens.
+/// Returns `None` for native SOL.
+/// Returns `Some(mint_address)` for known stablecoin symbols (e.g.
+/// `"USDC"` → the network's USDC mint).
+/// Returns `Some(currency)` (passthrough) for anything else — symbol or
+/// mint string we don't recognize. Callers handling arbitrary mints MUST
+/// validate parseability separately; audit #27 calls out the docstring
+/// drift from "Some(mint_address)" alone.
 fn resolve_mint<'a>(currency: &'a str, network: Option<&str>) -> Option<&'a str> {
     crate::protocol::solana::resolve_stablecoin_mint(currency, network)
 }
@@ -554,9 +724,17 @@ fn decode_charge_challenge(
 }
 
 fn matches_network(method_details: &MethodDetails, network: Option<&str>) -> bool {
+    // Audit #37: when methodDetails omits `network`, spec §7.2 says it
+    // defaults to `mainnet` — not the legacy "mainnet-beta" RPC hostname.
     match network {
         None => true,
-        Some(expected) => method_details.network.as_deref().unwrap_or("mainnet") == expected,
+        Some(expected) => {
+            method_details
+                .network
+                .as_deref()
+                .unwrap_or(crate::protocol::solana::DEFAULT_NETWORK)
+                == expected
+        }
     }
 }
 
@@ -717,6 +895,106 @@ mod tests {
         .unwrap();
 
         assert!(selected.is_none());
+    }
+
+    fn unknown_token_2022_selection_challenge(token_program: Option<&str>) -> PaymentChallenge {
+        // A made-up base58 mint address that is NOT in the known stablecoin
+        // allowlist. Used to exercise the Token-2022 gate.
+        // Valid base58 pubkey not in the stablecoin allowlist.
+        const UNKNOWN_MINT: &str = "9XHRopERTd4LfQ8b6e3p9bN2WhxgQzDxFRtbq1XwQ4mP";
+        let details = MethodDetails {
+            decimals: Some(6),
+            network: Some("mainnet".to_string()),
+            token_program: token_program.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        let request = ChargeRequest {
+            amount: "1000".to_string(),
+            currency: UNKNOWN_MINT.to_string(),
+            method_details: Some(serde_json::to_value(details).unwrap()),
+            recipient: Some(RECIPIENT.to_string()),
+            ..Default::default()
+        };
+        PaymentChallenge::new(
+            "unknown-2022",
+            "test",
+            "solana",
+            "charge",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn select_charge_challenge_skips_unknown_token_2022_by_default() {
+        let challenges = vec![unknown_token_2022_selection_challenge(Some(
+            programs::TOKEN_2022_PROGRAM,
+        ))];
+        let selected =
+            select_charge_challenge(&challenges, SelectChargeChallengeOptions::default()).unwrap();
+        assert!(selected.is_none(), "default must skip unknown Token-2022");
+    }
+
+    #[test]
+    fn select_charge_challenge_skips_unknown_mint_with_no_token_program_hint() {
+        // No tokenProgram in methodDetails — we cannot prove it isn't
+        // Token-2022, so default must fail closed.
+        let challenges = vec![unknown_token_2022_selection_challenge(None)];
+        let selected =
+            select_charge_challenge(&challenges, SelectChargeChallengeOptions::default()).unwrap();
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_charge_challenge_accepts_unknown_vanilla_token_mint() {
+        // Same unknown mint but explicitly on the vanilla Token Program —
+        // no transfer hooks, so the gate does not apply.
+        let challenges = vec![unknown_token_2022_selection_challenge(Some(
+            programs::TOKEN_PROGRAM,
+        ))];
+        let selected =
+            select_charge_challenge(&challenges, SelectChargeChallengeOptions::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.id, "unknown-2022");
+    }
+
+    #[test]
+    fn select_charge_challenge_allows_unknown_token_2022_with_opt_in() {
+        let challenges = vec![unknown_token_2022_selection_challenge(Some(
+            programs::TOKEN_2022_PROGRAM,
+        ))];
+        let selected = select_charge_challenge(
+            &challenges,
+            SelectChargeChallengeOptions {
+                allow_unknown_token_2022: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.id, "unknown-2022");
+    }
+
+    #[test]
+    fn select_charge_challenge_does_not_gate_known_token_2022_stablecoin() {
+        // PYUSD is Token-2022 but in the known allowlist; default selection
+        // must still pick it.
+        let challenges = vec![selection_challenge(
+            "pyusd-mainnet",
+            "solana",
+            mints::PYUSD_MAINNET,
+            "mainnet",
+        )];
+        let selected = select_charge_challenge(
+            &challenges,
+            SelectChargeChallengeOptions {
+                network: Some("mainnet"),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.id, "pyusd-mainnet");
     }
 
     #[test]
@@ -1499,9 +1777,44 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .unwrap();
         assert_eq!(ixs.len(), 1);
+    }
+
+    #[test]
+    fn build_spl_rejects_missing_decimals() {
+        // Audit #42: spec §7.2 requires `decimals` for SPL challenges;
+        // we now error instead of silently defaulting to 6.
+        let signer_pk = Pubkey::new_unique();
+        let recipient = Pubkey::from_str(RECIPIENT).unwrap();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_PROGRAM.to_string()),
+            decimals: None, // missing — must reject
+            ..Default::default()
+        };
+        let mut ixs = vec![];
+        let err = build_spl_instructions(
+            &mut ixs,
+            &signer_pk,
+            &recipient,
+            &rpc,
+            USDC_MINT,
+            &md,
+            1_000_000,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .err()
+        .expect("missing decimals should be rejected");
+        assert!(
+            format!("{err}").contains("decimals is required"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1526,6 +1839,7 @@ mod tests {
             Some("order-123"),
             &[],
             None,
+            false,
         )
         .unwrap();
 
@@ -1561,6 +1875,7 @@ mod tests {
             None,
             &[],
             Some(&fee_payer),
+            false,
         )
         .unwrap();
         assert_eq!(ixs.len(), 1);
@@ -1568,6 +1883,8 @@ mod tests {
 
     #[test]
     fn build_spl_with_splits() {
+        // Audit #20: with ata_creation_required=None the client must NOT
+        // emit the ATA-create instruction (even in client-paid mode).
         let signer_pk = Pubkey::new_unique();
         let recipient = Pubkey::from_str(RECIPIENT).unwrap();
         let split_recipient = Pubkey::new_unique();
@@ -1587,9 +1904,40 @@ mod tests {
         let mut ixs = vec![];
         build_spl_instructions(
             &mut ixs, &signer_pk, &recipient, &rpc, USDC_MINT, &md, 1_000_000, None, &splits, None,
+            false,
         )
         .unwrap();
-        // Primary recipient ATA creation is out of scope; split ATA creation is allowed.
+        // 1 primary transfer + 1 split transfer. No split ATA create.
+        assert_eq!(ixs.len(), 2);
+    }
+
+    #[test]
+    fn build_spl_creates_split_ata_only_when_flagged() {
+        // Audit #20: ata_creation_required = Some(true) means the client
+        // MUST include the ATA-create ix.
+        let signer_pk = Pubkey::new_unique();
+        let recipient = Pubkey::from_str(RECIPIENT).unwrap();
+        let split_recipient = Pubkey::new_unique();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_PROGRAM.to_string()),
+            decimals: Some(6),
+            ..Default::default()
+        };
+        let splits = vec![Split {
+            recipient: split_recipient.to_string(),
+            amount: "1000".to_string(),
+            ata_creation_required: Some(true),
+            label: None,
+            memo: None,
+        }];
+        let mut ixs = vec![];
+        build_spl_instructions(
+            &mut ixs, &signer_pk, &recipient, &rpc, USDC_MINT, &md, 1_000_000, None, &splits, None,
+            false,
+        )
+        .unwrap();
+        // 1 primary transfer + 1 ATA create + 1 split transfer.
         assert_eq!(ixs.len(), 3);
     }
 
@@ -1614,16 +1962,18 @@ mod tests {
         let mut ixs = vec![];
         build_spl_instructions(
             &mut ixs, &signer_pk, &recipient, &rpc, USDC_MINT, &md, 1_000_000, None, &splits, None,
+            false,
         )
         .unwrap();
 
-        assert_eq!(ixs.len(), 4);
+        // 1 primary transfer + 1 split transfer + 1 split memo (no ATA create).
+        assert_eq!(ixs.len(), 3);
         assert_eq!(
-            ixs[3].program_id,
+            ixs[2].program_id,
             Pubkey::from_str(programs::MEMO_PROGRAM).unwrap()
         );
-        assert!(ixs[3].accounts.is_empty());
-        assert_eq!(ixs[3].data, b"platform fee");
+        assert!(ixs[2].accounts.is_empty());
+        assert_eq!(ixs[2].data, b"platform fee");
     }
 
     #[test]
@@ -1647,6 +1997,7 @@ mod tests {
         let mut ixs = vec![];
         let err = build_spl_instructions(
             &mut ixs, &signer_pk, &recipient, &rpc, USDC_MINT, &md, 1_000_000, None, &splits, None,
+            false,
         )
         .unwrap_err();
 
@@ -1686,6 +2037,7 @@ mod tests {
             None,
             &splits,
             Some(&fee_payer),
+            false,
         )
         .unwrap();
 
@@ -1727,9 +2079,140 @@ mod tests {
             None,
             &splits,
             Some(&fee_payer),
+            false,
         )
         .unwrap();
         assert_eq!(ixs.len(), 2);
+    }
+
+    #[test]
+    fn build_spl_refuses_unknown_token_2022_without_opt_in() {
+        // A made-up base58 mint NOT in the known stablecoin allowlist,
+        // explicitly placed on Token-2022. Default (allow_unknown_token_2022
+        // = false) must refuse.
+        // Valid base58 pubkey not in the stablecoin allowlist.
+        const UNKNOWN_MINT: &str = "9XHRopERTd4LfQ8b6e3p9bN2WhxgQzDxFRtbq1XwQ4mP";
+        let signer_pk = Pubkey::new_unique();
+        let recipient = Pubkey::from_str(RECIPIENT).unwrap();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
+            decimals: Some(6),
+            ..Default::default()
+        };
+        let mut ixs = vec![];
+        let err = build_spl_instructions(
+            &mut ixs,
+            &signer_pk,
+            &recipient,
+            &rpc,
+            UNKNOWN_MINT,
+            &md,
+            1_000_000,
+            None,
+            &[],
+            None,
+            false,
+        );
+        let err = err.expect_err("should refuse unknown Token-2022 mint");
+        assert!(
+            format!("{err}").contains("unknown Token-2022 mint"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_spl_allows_unknown_token_2022_with_opt_in() {
+        // Same setup as above but with the opt-in flag set — gate passes
+        // and the function builds successfully.
+        // Valid base58 pubkey not in the stablecoin allowlist.
+        const UNKNOWN_MINT: &str = "9XHRopERTd4LfQ8b6e3p9bN2WhxgQzDxFRtbq1XwQ4mP";
+        let signer_pk = Pubkey::new_unique();
+        let recipient = Pubkey::from_str(RECIPIENT).unwrap();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
+            decimals: Some(6),
+            ..Default::default()
+        };
+        let mut ixs = vec![];
+        build_spl_instructions(
+            &mut ixs,
+            &signer_pk,
+            &recipient,
+            &rpc,
+            UNKNOWN_MINT,
+            &md,
+            1_000_000,
+            None,
+            &[],
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!ixs.is_empty());
+    }
+
+    #[test]
+    fn build_spl_allows_unknown_vanilla_token_mint() {
+        // Arbitrary mint on the vanilla Token Program (no transfer hooks)
+        // — gate does not apply.
+        // Valid base58 pubkey not in the stablecoin allowlist.
+        const UNKNOWN_MINT: &str = "9XHRopERTd4LfQ8b6e3p9bN2WhxgQzDxFRtbq1XwQ4mP";
+        let signer_pk = Pubkey::new_unique();
+        let recipient = Pubkey::from_str(RECIPIENT).unwrap();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_PROGRAM.to_string()),
+            decimals: Some(6),
+            ..Default::default()
+        };
+        let mut ixs = vec![];
+        build_spl_instructions(
+            &mut ixs,
+            &signer_pk,
+            &recipient,
+            &rpc,
+            UNKNOWN_MINT,
+            &md,
+            1_000_000,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!ixs.is_empty());
+    }
+
+    #[test]
+    fn build_spl_does_not_gate_known_token_2022_stablecoin() {
+        // PYUSD is Token-2022 but in the known allowlist — gate must not
+        // fire even with allow_unknown_token_2022 = false.
+        let signer_pk = Pubkey::new_unique();
+        let recipient = Pubkey::from_str(RECIPIENT).unwrap();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            token_program: Some(programs::TOKEN_2022_PROGRAM.to_string()),
+            decimals: Some(6),
+            ..Default::default()
+        };
+        let mut ixs = vec![];
+        build_spl_instructions(
+            &mut ixs,
+            &signer_pk,
+            &recipient,
+            &rpc,
+            mints::PYUSD_MAINNET,
+            &md,
+            1_000_000,
+            None,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!ixs.is_empty());
     }
 
     #[test]
@@ -1753,6 +2236,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
         assert!(err.is_err());
         assert!(format!("{}", err.unwrap_err()).contains("Invalid mint"));
@@ -1778,6 +2262,7 @@ mod tests {
         let mut ixs = vec![];
         let err = build_spl_instructions(
             &mut ixs, &signer_pk, &recipient, &rpc, USDC_MINT, &md, 1_000_000, None, &splits, None,
+            false,
         );
         assert!(err.is_err());
         assert!(format!("{}", err.unwrap_err()).contains("Invalid split recipient"));
@@ -1804,6 +2289,7 @@ mod tests {
         let mut ixs = vec![];
         let err = build_spl_instructions(
             &mut ixs, &signer_pk, &recipient, &rpc, USDC_MINT, &md, 1_000_000, None, &splits, None,
+            false,
         );
         assert!(err.is_err());
         assert!(format!("{}", err.unwrap_err()).contains("Invalid split amount"));
@@ -1868,6 +2354,258 @@ mod tests {
         let err = build_credential_header(signer.as_ref(), &rpc, &challenge).await;
         assert!(err.is_err());
         assert!(format!("{}", err.unwrap_err()).contains("No recipient"));
+    }
+
+    // ── Audit #10: client-side policy gates ──
+
+    #[tokio::test]
+    async fn build_charge_transaction_rejects_amount_above_max() {
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            recent_blockhash: Some(ZERO_HASH.to_string()),
+            ..Default::default()
+        };
+        let err = build_charge_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            "5000000",
+            "SOL",
+            RECIPIENT,
+            &md,
+            BuildChargeTransactionOptions {
+                max_amount_base_units: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .expect("amount above cap should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds client max_amount_base_units"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_charge_transaction_accepts_amount_at_max() {
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            recent_blockhash: Some(ZERO_HASH.to_string()),
+            ..Default::default()
+        };
+        build_charge_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            "1000000",
+            "SOL",
+            RECIPIENT,
+            &md,
+            BuildChargeTransactionOptions {
+                max_amount_base_units: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("amount equal to cap should be allowed");
+    }
+
+    #[tokio::test]
+    async fn build_charge_transaction_rejects_unexpected_network() {
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            network: Some("mainnet".to_string()),
+            recent_blockhash: Some(ZERO_HASH.to_string()),
+            ..Default::default()
+        };
+        let err = build_charge_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            "1000000",
+            "SOL",
+            RECIPIENT,
+            &md,
+            BuildChargeTransactionOptions {
+                expected_network: Some("devnet".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .expect("network mismatch should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not match client expected_network"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_charge_transaction_accepts_matching_network() {
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let md = MethodDetails {
+            network: Some("devnet".to_string()),
+            recent_blockhash: Some(ZERO_HASH.to_string()),
+            ..Default::default()
+        };
+        build_charge_transaction_with_options(
+            signer.as_ref(),
+            &rpc,
+            "1000000",
+            "SOL",
+            RECIPIENT,
+            &md,
+            BuildChargeTransactionOptions {
+                expected_network: Some("devnet".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("matching network should be allowed");
+    }
+
+    #[tokio::test]
+    async fn build_credential_header_rejects_expired_challenge() {
+        use crate::protocol::core::Base64UrlJson;
+        use crate::protocol::intents::ChargeRequest;
+
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let request = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "SOL".to_string(),
+            recipient: Some(RECIPIENT.to_string()),
+            method_details: Some(
+                serde_json::to_value(MethodDetails {
+                    recent_blockhash: Some(ZERO_HASH.to_string()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let request_b64 = Base64UrlJson::from_typed(&request).unwrap();
+        let mut challenge =
+            PaymentChallenge::new("test-id", "test-realm", "solana", "charge", request_b64);
+        // RFC3339 timestamp in the distant past.
+        challenge.expires = Some("1970-01-01T00:00:00Z".to_string());
+
+        let err = build_credential_header(signer.as_ref(), &rpc, &challenge)
+            .await
+            .err()
+            .expect("expired challenge should be rejected");
+        assert!(
+            format!("{err}").contains("expired"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_credential_header_accepts_future_expiry() {
+        use crate::protocol::core::Base64UrlJson;
+        use crate::protocol::intents::ChargeRequest;
+
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let request = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "SOL".to_string(),
+            recipient: Some(RECIPIENT.to_string()),
+            method_details: Some(
+                serde_json::to_value(MethodDetails {
+                    recent_blockhash: Some(ZERO_HASH.to_string()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let request_b64 = Base64UrlJson::from_typed(&request).unwrap();
+        let mut challenge =
+            PaymentChallenge::new("test-id", "test-realm", "solana", "charge", request_b64);
+        challenge.expires = Some("2999-01-01T00:00:00Z".to_string());
+
+        build_credential_header(signer.as_ref(), &rpc, &challenge)
+            .await
+            .expect("future expiry should be accepted");
+    }
+
+    // ── Audit #17: method/intent gate on the credential builder ──
+
+    #[tokio::test]
+    async fn build_credential_header_rejects_non_solana_method() {
+        use crate::protocol::core::Base64UrlJson;
+        use crate::protocol::intents::ChargeRequest;
+
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let request = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "SOL".to_string(),
+            recipient: Some(RECIPIENT.to_string()),
+            method_details: Some(
+                serde_json::to_value(MethodDetails {
+                    recent_blockhash: Some(ZERO_HASH.to_string()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let request_b64 = Base64UrlJson::from_typed(&request).unwrap();
+        // Wrong method — would otherwise be accepted by the builder.
+        let challenge =
+            PaymentChallenge::new("test-id", "test-realm", "stripe", "charge", request_b64);
+
+        let err = build_credential_header(signer.as_ref(), &rpc, &challenge)
+            .await
+            .err()
+            .expect("non-solana method should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a solana/charge challenge") && msg.contains("method=`stripe`"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_credential_header_rejects_non_charge_intent() {
+        use crate::protocol::core::Base64UrlJson;
+        use crate::protocol::intents::ChargeRequest;
+
+        let signer = make_signer();
+        let rpc = dummy_rpc();
+        let request = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "SOL".to_string(),
+            recipient: Some(RECIPIENT.to_string()),
+            method_details: Some(
+                serde_json::to_value(MethodDetails {
+                    recent_blockhash: Some(ZERO_HASH.to_string()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let request_b64 = Base64UrlJson::from_typed(&request).unwrap();
+        // Wrong intent.
+        let challenge =
+            PaymentChallenge::new("test-id", "test-realm", "solana", "session", request_b64);
+
+        let err = build_credential_header(signer.as_ref(), &rpc, &challenge)
+            .await
+            .err()
+            .expect("non-charge intent should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a solana/charge challenge") && msg.contains("intent=`session`"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]
