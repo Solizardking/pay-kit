@@ -16,6 +16,13 @@ export type MppOptions = {
     readonly challengeBindingSecret?: string;
     /** Challenge TTL in seconds. `0` means never expires (dev only). */
     readonly expiresIn?: number;
+    /**
+     * Serve the interactive HTML payment page (the "Continue with Solana"
+     * pay.sh experience) on `402`s for browser requests (`Accept: text/html`),
+     * plus its service worker. API clients (JSON) still get the JSON `402`.
+     * Default `false`.
+     */
+    readonly html?: boolean;
     readonly realm?: string;
 };
 
@@ -60,7 +67,12 @@ export type ConfigureParams = {
 /** Resolved, immutable boot configuration. */
 export type PayKitConfig = {
     readonly accept: readonly Protocol[];
-    readonly mpp: { readonly challengeBindingSecret: string; readonly expiresIn: number; readonly realm: string };
+    readonly mpp: {
+        readonly challengeBindingSecret: string;
+        readonly expiresIn: number;
+        readonly html: boolean;
+        readonly realm: string;
+    };
     readonly network: Network;
     readonly operator: Operator;
     readonly preflight: boolean;
@@ -109,9 +121,9 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
     const accept = params.accept ?? ['mpp'];
     if (accept.length === 0) throw new ConfigurationError('accept must list at least one protocol.');
     for (const protocol of accept) {
-        if (protocol !== 'mpp') {
+        if (protocol !== 'mpp' && protocol !== 'x402') {
             throw new ProtocolNotSupportedError(
-                `Protocol "${protocol}" is not available in the TypeScript SDK yet (MPP only).`,
+                `Protocol "${String(protocol)}" is not available in the TypeScript SDK yet (MPP and x402 only).`,
             );
         }
     }
@@ -147,11 +159,18 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         throw new ConfigurationError('mpp.expiresIn must be a non-negative integer number of seconds.');
     }
 
+    // The MPP challenge-binding secret is only meaningful when MPP is accepted;
+    // an x402-only server must not be forced to provide one.
+    const challengeBindingSecret = accept.includes('mpp')
+        ? resolveChallengeBindingSecret(network, params.mpp?.challengeBindingSecret)
+        : (params.mpp?.challengeBindingSecret ?? '');
+
     return Object.freeze({
         accept: Object.freeze([...accept]),
         mpp: Object.freeze({
-            challengeBindingSecret: resolveChallengeBindingSecret(network, params.mpp?.challengeBindingSecret),
+            challengeBindingSecret,
             expiresIn,
+            html: params.mpp?.html ?? false,
             realm: params.mpp?.realm ?? 'App',
         }),
         network,
