@@ -30,12 +30,11 @@ use payment_channels_client::generated::instructions::{
     SettleBuilder, TopUpBuilder,
 };
 use payment_channels_client::generated::types::{
-    DistributeArgs, DistributionEntry, OpenArgs, SettleAndFinalizeArgs, SettleArgs, TopUpArgs,
-    VoucherArgs,
+    DistributeArgs, DistributionEntry, OpenArgs, SettleAndFinalizeArgs, TopUpArgs, VoucherArgs,
 };
 
 /// Canonical payment-channels program ID deployed to Surfnet.
-pub const PAYMENT_CHANNELS_PROGRAM_ID: &str = "GuoKrzaBiZnW5DvJ3yZVE7xHqbcBvaX9SH6P6Cn9gNvc";
+pub const PAYMENT_CHANNELS_PROGRAM_ID: &str = "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX";
 
 /// Associated Token Account program ID.
 pub const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
@@ -59,9 +58,12 @@ pub const INSTRUCTIONS_SYSVAR_ID: &str = "Sysvar1nstructions11111111111111111111
 pub const RENT_SYSVAR_ID: &str = "SysvarRent111111111111111111111111111111111";
 
 /// Treasury owner used by the current payment-channels program deployment.
+// Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP — the treasury owner baked into
+// the deployed (mainnet-build) payment-channels program; `distribute` checks the
+// treasury ATA against ATA(TREASURY_OWNER, mint, token_program).
 pub const TREASURY_OWNER: [u8; 32] = [
-    0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
-    0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
+    0xB0, 0x41, 0xD9, 0xD3, 0x37, 0xB7, 0x21, 0xBE, 0x57, 0x89, 0x4E, 0xB6, 0x9C, 0x3B, 0x68, 0x09,
+    0xA5, 0x3A, 0x0E, 0x2B, 0x6A, 0x23, 0x99, 0xFC, 0x7D, 0x5B, 0x7E, 0xDA, 0x8C, 0xAC, 0x89, 0xAA,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,14 +208,19 @@ pub fn derive_channel_addresses(params: &OpenChannelParams) -> ChannelAddresses 
     }
 }
 
+/// SHA-256 of the distribution preimage `count(u32 LE) ‖ [recipient(32) ‖
+/// bps(u16 LE)]…`, byte-for-byte matching what the on-chain program commits at
+/// `open` (it uses `sol_sha256` over the same layout). MUST stay sha256: the
+/// program rejects a mismatched commitment with `InvalidDistributionHash`.
 pub fn distribution_hash(recipients: &[Distribution]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(recipients.len() as u32).to_le_bytes());
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((recipients.len() as u32).to_le_bytes());
     for recipient in recipients {
         hasher.update(recipient.recipient.as_ref());
-        hasher.update(&recipient.bps.to_le_bytes());
+        hasher.update(recipient.bps.to_le_bytes());
     }
-    *hasher.finalize().as_bytes()
+    hasher.finalize().into()
 }
 
 pub fn voucher_message_bytes(
@@ -333,18 +340,13 @@ pub fn build_settle_instructions(
     expires_at: i64,
     program_id: &Pubkey,
 ) -> Result<Vec<Instruction>> {
+    // The program reads the voucher from the ed25519 precompile instruction, so
+    // `settle` itself carries no in-data args beyond its discriminator.
     let message = voucher_message_bytes(channel, cumulative_amount, expires_at)?;
     let verify = build_ed25519_verify_instruction(authorized_signer, signature, &message);
     let mut settle = SettleBuilder::new()
         .channel(to_address(channel))
         .instructions_sysvar(to_address(&instructions_sysvar_id()))
-        .settle_args(SettleArgs {
-            voucher: VoucherArgs {
-                channel_id: to_address(channel),
-                cumulative_amount,
-                expires_at,
-            },
-        })
         .instruction();
     settle.program_id = to_address(program_id);
     Ok(vec![verify, settle])
@@ -375,14 +377,7 @@ pub fn build_settle_and_finalize_instructions(
         .merchant(to_address(merchant))
         .channel(to_address(channel))
         .instructions_sysvar(to_address(&instructions_sysvar_id()))
-        .settle_and_finalize_args(SettleAndFinalizeArgs {
-            voucher: VoucherArgs {
-                channel_id: to_address(channel),
-                cumulative_amount,
-                expires_at,
-            },
-            has_voucher,
-        })
+        .settle_and_finalize_args(SettleAndFinalizeArgs { has_voucher })
         .instruction();
     settle_and_finalize.program_id = to_address(program_id);
     instructions.push(settle_and_finalize);
@@ -450,6 +445,7 @@ pub fn build_distribute_instruction(
         .treasury_token_account(to_address(&treasury_token_account))
         .mint(to_address(mint))
         .token_program(to_address(token_program))
+        .event_authority(to_address(&find_event_authority_pda(program_id).0))
         .add_remaining_accounts(&recipient_token_accounts)
         .distribute_args(DistributeArgs { recipients })
         .instruction();
@@ -517,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn distribution_hash_matches_program_preimage_shape() {
+    fn distribution_hash_matches_program_sha256_golden() {
         let recipients = vec![
             Distribution {
                 recipient: pk(1),
@@ -529,17 +525,16 @@ mod tests {
             },
         ];
 
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&2u32.to_le_bytes());
-        hasher.update(pk(1).as_ref());
-        hasher.update(&7_500u16.to_le_bytes());
-        hasher.update(pk(2).as_ref());
-        hasher.update(&2_500u16.to_le_bytes());
-
-        assert_eq!(
-            distribution_hash(&recipients),
-            *hasher.finalize().as_bytes()
-        );
+        // Golden vector pinned as a literal (NOT re-derived in-test, so it would
+        // catch a hash-algorithm or preimage drift): SHA-256 of
+        // `count=2 (u32 LE) ‖ pk(1) ‖ 7500 (u16 LE) ‖ pk(2) ‖ 2500 (u16 LE)`,
+        // the exact bytes the on-chain program commits via `sol_sha256`.
+        let expected: [u8; 32] = [
+            0x54, 0xc8, 0x97, 0x55, 0x87, 0x75, 0x0e, 0x88, 0x21, 0xe9, 0x3f, 0x5d, 0x4a, 0xf6,
+            0x07, 0xd2, 0x0d, 0x55, 0xa5, 0x8b, 0xa1, 0xb9, 0xa4, 0xb4, 0x9f, 0x72, 0xa5, 0x42,
+            0xed, 0x87, 0x4a, 0x3f,
+        ];
+        assert_eq!(distribution_hash(&recipients), expected);
     }
 
     #[test]

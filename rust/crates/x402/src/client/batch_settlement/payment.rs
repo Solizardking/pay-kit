@@ -78,7 +78,7 @@ pub async fn build_deposit(
     let payer = payer_signer.pubkey();
     let payee = resolve_pubkey(&requirements.pay_to, "payTo")?;
     let mint = resolve_pubkey(&requirements.asset, "asset mint")?;
-    let operator = resolve_pubkey(&requirements.extra.facilitator, "facilitator")?;
+    let operator = resolve_pubkey(&requirements.extra.fee_payer, "feePayer")?;
     let program_id = resolve_pubkey(&requirements.extra.channel_program, "channelProgram")?;
     let token_program = match &requirements.extra.token_program {
         Some(tp) => resolve_pubkey(tp, "tokenProgram")?,
@@ -272,11 +272,11 @@ mod tests {
             max_timeout_seconds: 3600,
             extra: BatchExtra {
                 profiles: vec![PROFILE_PAYMENT_CHANNEL.to_string()],
-                channel_program: "GuoKrzaBiZnW5DvJ3yZVE7xHqbcBvaX9SH6P6Cn9gNvc".to_string(),
+                channel_program: "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX".to_string(),
                 grace_period_seconds: 900,
                 decimals: Some(6),
                 token_program: None,
-                facilitator: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+                fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
                 recent_blockhash: Some(Hash::default().to_string()),
                 suggested_deposit: None,
                 minimum_deposit: None,

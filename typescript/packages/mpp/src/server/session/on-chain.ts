@@ -44,6 +44,7 @@ import { getDistributeInstruction } from '../../generated/payment-channels/instr
 import { getSettleAndFinalizeInstruction } from '../../generated/payment-channels/instructions/settleAndFinalize.js';
 import { getTopUpInstruction } from '../../generated/payment-channels/instructions/topUp.js';
 import { findEventAuthorityPda } from '../../generated/payment-channels/pdas/eventAuthority.js';
+import { PAYMENT_CHANNELS_PROGRAM_ADDRESS } from '../../generated/payment-channels/programs/paymentChannels.js';
 import type { OpenPayload, SignedVoucher } from '../../shared/session-types.js';
 import { coSignBase64Transaction } from '../../utils/transactions.js';
 
@@ -66,31 +67,26 @@ export const ED25519_PROGRAM_ADDRESS =
     'Ed25519SigVerify111111111111111111111111111' as Address<'Ed25519SigVerify111111111111111111111111111'>;
 
 /**
- * Canonical payment-channels program ID. The Rust crate uses the Surfnet
- * deployment id; the vendored Codama tree bakes in the upstream
- * canonical id. We default to the Surfnet id here so server behavior
- * matches the Rust mirror; callers can override per-call.
+ * Canonical payment-channels program ID, re-exported from the generated client
+ * so there's a single source of truth that updates on IDL regeneration.
+ * Callers can override per-call.
  */
-export const PAYMENT_CHANNELS_PROGRAM_ID =
-    'GuoKrzaBiZnW5DvJ3yZVE7xHqbcBvaX9SH6P6Cn9gNvc' as Address<'GuoKrzaBiZnW5DvJ3yZVE7xHqbcBvaX9SH6P6Cn9gNvc'>;
+export const PAYMENT_CHANNELS_PROGRAM_ID = PAYMENT_CHANNELS_PROGRAM_ADDRESS;
 
 /** Canonical multi-delegator program ID. */
 export const MULTI_DELEGATOR_PROGRAM_ID =
     'EPEUTog1kptYkthDJF6MuB1aM4aDAwHYwoF32Rzv5rqg' as Address<'EPEUTog1kptYkthDJF6MuB1aM4aDAwHYwoF32Rzv5rqg'>;
 
 /**
- * Treasury owner used by the current payment-channels program deployment.
- * Pattern: 32 bytes of repeated 0xBE 0xEF; mirrors `TREASURY_OWNER` in
- * `rust/crates/mpp/src/program/payment_channels.rs`.
+ * Treasury owner baked into the deployed (mainnet-build) payment-channels
+ * program — Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP. The treasury ATA is
+ * ATA(TREASURY_OWNER, mint, tokenProgram). Mirrors `TREASURY_OWNER` in
+ * `rust/crates/core/src/payment_channels.rs`.
  */
-const TREASURY_OWNER_BYTES = (() => {
-    const bytes = new Uint8Array(32);
-    for (let i = 0; i < 32; i += 2) {
-        bytes[i] = 0xbe;
-        bytes[i + 1] = 0xef;
-    }
-    return bytes;
-})();
+const TREASURY_OWNER_BYTES = new Uint8Array([
+    0xb0, 0x41, 0xd9, 0xd3, 0x37, 0xb7, 0x21, 0xbe, 0x57, 0x89, 0x4e, 0xb6, 0x9c, 0x3b, 0x68, 0x09, 0xa5, 0x3a, 0x0e,
+    0x2b, 0x6a, 0x23, 0x99, 0xfc, 0x7d, 0x5b, 0x7e, 0xda, 0x8c, 0xac, 0x89, 0xaa,
+]);
 
 /** Payment-channel open instruction discriminator. */
 const OPEN_DISCRIMINATOR = 1;
@@ -255,14 +251,9 @@ export function buildSettleAndFinalizeInstructions(args: SettleAndFinalizeBuildA
             channel,
             instructionsSysvar: INSTRUCTIONS_SYSVAR_ADDRESS,
             merchant: args.merchantSigner,
-            settleAndFinalizeArgs: {
-                hasVoucher,
-                voucher: {
-                    channelId: channel,
-                    cumulativeAmount,
-                    expiresAt,
-                },
-            },
+            // The program reads the voucher from the ed25519 precompile; the
+            // settle_and_finalize args carry only the hasVoucher flag.
+            settleAndFinalizeArgs: { hasVoucher },
         },
         { programAddress: programId },
     );

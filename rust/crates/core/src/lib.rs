@@ -15,8 +15,11 @@
 //!   acceptance, shared by the MPP `session` intent and the x402
 //!   `batch-settlement` scheme.
 
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod payment_channels;
 pub mod session;
+pub mod settlement;
 pub mod store;
 pub mod units;
 pub mod voucher;

@@ -6,7 +6,7 @@ set shell := ["bash", "-uc"]
 subscriptions_repo     := "solana-foundation/subscriptions"
 subscriptions_ref      := "30a6f7cbd1c53862cc598d93cb771c2c86a10cbf"
 payment_channels_repo  := "Moonsong-Labs/solana-payment-channels"
-payment_channels_ref   := "f1b5e91482553fd1dce33aab4ff2a71cb6e734f8"
+payment_channels_ref   := "8d1ef8453366ae1d552913c9fffa02016d1b0700"
 
 default:
     @just --list
@@ -60,10 +60,21 @@ payment-channels-pull-idl:
 
 # Render the Rust client from the vendored IDL. Wipes
 # `rust/crates/programs/payment-channels/src/generated/` and rewrites
-# it in place — see {{codegen_dir}}/generate-payment-channels-client.ts.
+# it in place — see {{codegen_dir}}/generate-payment-channels-client-rs.ts.
 payment-channels-generate-rs: codegen-install
     cd {{codegen_dir}} && pnpm run payment-channels:rust
     cd rust && cargo fmt -p payment-channels-client
+
+# Render the Go client from the vendored IDL into
+# `go/protocols/programs/paymentchannels/` (see the matching codegen script).
+payment-channels-generate-go: codegen-install
+    cd {{codegen_dir}} && pnpm run payment-channels:go
+
+# Render the TypeScript client from the vendored IDL into
+# `typescript/packages/mpp/src/generated/payment-channels/` (see the matching
+# codegen script). Replaces the previously hand-vendored subset.
+payment-channels-generate-ts: codegen-install
+    cd {{codegen_dir}} && pnpm run payment-channels:ts
 
 # Render the Python client from the vendored IDL. Wipes
 # `python/src/pay_kit/protocols/programs/paymentchannels/` and rewrites
@@ -71,8 +82,8 @@ payment-channels-generate-rs: codegen-install
 payment-channels-generate-py: codegen-install
     cd {{codegen_dir}} && pnpm run payment-channels:python
 
-# Full refresh: pull IDL + regenerate Rust and Python clients.
-payment-channels-sync: payment-channels-pull-idl payment-channels-generate-rs payment-channels-generate-py
+# Full refresh: pull IDL + regenerate every client (Rust, Go, TypeScript, Python).
+payment-channels-sync: payment-channels-pull-idl payment-channels-generate-rs payment-channels-generate-go payment-channels-generate-ts payment-channels-generate-py
 
 # ── TypeScript ──
 

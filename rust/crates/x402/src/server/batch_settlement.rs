@@ -25,6 +25,9 @@ use solana_transaction::Transaction;
 use solana_pay_core::payment_channels as pc;
 use solana_pay_core::payment_channels::generated::accounts::Channel;
 use solana_pay_core::session::accept_voucher;
+use solana_pay_core::settlement::packing::{
+    pack, ChannelInstructions, DEFAULT_MAX_CHANNELS_PER_TX,
+};
 use solana_pay_core::store::{ChannelState, ChannelStore, MemoryChannelStore, StoreError};
 use solana_pay_core::voucher::verify_voucher_signature;
 
@@ -48,11 +51,6 @@ const CHANNEL_STATUS_OPEN: u8 = 0;
 
 /// Default forced-close grace period (seconds).
 const DEFAULT_GRACE_PERIOD_SECONDS: u32 = 900;
-
-/// Conservative number of channel `settle`s packed into one Solana transaction.
-/// Each channel needs its own Ed25519-precompile + `settle` instruction, so a
-/// legacy transaction (~1232 bytes) fits only a handful.
-const MAX_CHANNELS_PER_SETTLE_TX: usize = 3;
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -231,7 +229,7 @@ impl X402BatchSettlement {
                 grace_period_seconds: self.config.grace_period_seconds,
                 decimals: Some(self.config.decimals),
                 token_program: Some(pc::pubkey_string(&self.token_program()?)),
-                facilitator: self.operator(),
+                fee_payer: self.operator(),
                 recent_blockhash: None,
                 suggested_deposit: None,
                 minimum_deposit: None,
@@ -657,9 +655,10 @@ impl X402BatchSettlement {
         })
     }
 
-    /// Redeem the latest voucher of each channel on-chain, packing
-    /// [`MAX_CHANNELS_PER_SETTLE_TX`] channels per transaction. Returns the
-    /// broadcast signatures. Channels without an accepted voucher are skipped.
+    /// Redeem the latest voucher of each channel on-chain, packing channels into
+    /// `<=1232`-byte transactions via the shared
+    /// [`solana_pay_core::settlement::packing::pack`]. Returns the broadcast
+    /// signatures. Channels without an accepted voucher are skipped.
     pub async fn settle_batch(&self, channel_ids: &[String]) -> Result<Vec<String>, Error> {
         let program_id = self.program_id()?;
         let mut pending = Vec::new();
@@ -704,12 +703,17 @@ impl X402BatchSettlement {
                 expires_at,
                 &program_id,
             )?;
-            pending.push(ixs);
+            pending.push(ChannelInstructions {
+                channel_id: state.channel_id.clone(),
+                instructions: ixs,
+            });
         }
 
+        // Shared, byte-bounded packing (same as the mpp settlement worker) —
+        // groups channels into <=1232-byte legacy transactions.
         let mut signatures = Vec::new();
-        for chunk in pending.chunks(MAX_CHANNELS_PER_SETTLE_TX) {
-            let instructions: Vec<_> = chunk.iter().flatten().cloned().collect();
+        for group in pack(pending, &self.operator, DEFAULT_MAX_CHANNELS_PER_TX) {
+            let instructions: Vec<_> = group.into_iter().flat_map(|c| c.instructions).collect();
             let blockhash = self
                 .rpc
                 .get_latest_blockhash()

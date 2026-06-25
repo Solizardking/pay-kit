@@ -43,6 +43,10 @@ pub mod program;
 pub mod protocol;
 pub mod store;
 
+/// Batched on-chain settlement — packing always; the background worker under
+/// the `settlement` feature. Shared with x402 via `solana-pay-core`.
+pub use solana_pay_core::settlement;
+
 #[cfg(feature = "client")]
 pub mod client;
 
@@ -93,3 +97,8 @@ pub use store::{
 // Re-export crates callers need to use with the charge builder.
 pub use solana_keychain;
 pub use solana_rpc_client;
+
+/// Reusable OpenTelemetry init (feature `otel`), shared with x402/pay so spans
+/// + metrics from every layer land in one collector.
+#[cfg(feature = "otel")]
+pub use solana_pay_core::otel;
