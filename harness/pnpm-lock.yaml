@@ -21,7 +21,7 @@ importers:
         specifier: file:../typescript/packages/pay-kit
         version: file:../typescript/packages/pay-kit(@solana/addresses@6.10.0(typescript@5.9.3))(@solana/codecs-core@6.10.0(typescript@5.9.3))(@solana/codecs-strings@6.10.0(typescript@5.9.3))(@solana/keys@6.10.0(typescript@5.9.3))(@solana/kit@6.8.0(typescript@5.9.3))(@solana/mpp@file:../typescript/packages/mpp(@solana/kit@6.8.0(typescript@5.9.3))(mppx@0.5.17(express@4.22.2)(typescript@5.9.3)(viem@2.48.4(typescript@5.9.3)(zod@4.3.6)))(typescript@5.9.3))(@solana/signers@6.10.0(typescript@5.9.3))(@solana/sysvars@6.8.0(typescript@5.9.3))(@solana/transactions@6.10.0(typescript@5.9.3))(mppx@0.5.17(express@4.22.2)(typescript@5.9.3)(viem@2.48.4(typescript@5.9.3)(zod@4.3.6)))
       '@solana/surfpool':
-        specifier: ^1.4.0
+        specifier: 1.4.0
         version: 1.4.0
       mppx:
         specifier: ^0.5.5

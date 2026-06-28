@@ -352,6 +352,7 @@ impl X402BatchSettlement {
         }
         let program_id = self.program_id()?;
         let expected_mint = self.mint()?;
+        let token_program = self.token_program()?;
         let expected_payee = Pubkey::from_str(&self.config.recipient)
             .map_err(|e| Error::Other(format!("invalid recipient: {e}")))?;
         let payer = Pubkey::from_str(&config.payer)
@@ -389,6 +390,7 @@ impl X402BatchSettlement {
             &payer,
             &expected_payee,
             &expected_mint,
+            &token_program,
             &channel_id,
         )?;
         cosign_operator_fee_payer(

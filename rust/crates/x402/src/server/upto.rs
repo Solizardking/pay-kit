@@ -9,7 +9,7 @@
 //!    channel state back to bind deposit/payee/mint/signer on-chain.
 //! 3. The route handler runs and determines the actual metered amount.
 //! 4. [`X402Upto::settle_actual`] signs a single operator voucher for the actual
-//!    amount and submits `settle_and_finalize` + `distribute`, refunding
+//!    amount and submits `settle_and_finalize` + ATA setup + `distribute`, refunding
 //!    `deposit − actual` to the payer.
 
 use std::collections::HashSet;
@@ -70,7 +70,7 @@ pub struct UptoConfig {
     pub token_program: Option<String>,
     /// Channel program id override (defaults to the canonical deployment).
     pub program_id: Option<String>,
-    /// Operator signer — co-signs the open as fee payer and signs settlement
+    /// Operator signer - co-signs the open as fee payer and signs settlement
     /// vouchers + transactions. Its pubkey is the advertised facilitator.
     pub operator_signer: Arc<dyn SolanaSigner>,
 }
@@ -84,6 +84,7 @@ pub struct UptoConfig {
 pub struct VerifiedUptoOpen {
     pub channel_id: Pubkey,
     pub payer: Pubkey,
+    pub rent_payer: Pubkey,
     pub mint: Pubkey,
     pub token_program: Pubkey,
     pub program_id: Pubkey,
@@ -97,7 +98,7 @@ pub struct VerifiedUptoOpen {
 
 /// RAII guard removing a channel id from [`X402Upto`]'s in-flight set on drop,
 /// so a channel being processed can't be served concurrently (replay), and the
-/// slot is always freed — including on early-return errors or a handler panic.
+/// slot is always freed - including on early-return errors or a handler panic.
 #[derive(Debug)]
 struct InFlightGuard {
     set: Arc<Mutex<HashSet<Pubkey>>>,
@@ -184,7 +185,7 @@ impl X402Upto {
     /// Build the `upto` payment requirement for the given authorized maximum.
     ///
     /// `max_amount` is a human-decimal amount (e.g. `"0.10"`), converted to base
-    /// units using the configured decimals — same convention as the `exact`
+    /// units using the configured decimals - same convention as the `exact`
     /// scheme, so the gate passes one dollar string everywhere.
     ///
     /// Pure (no RPC): `extra.recent_blockhash` is left `None` and filled in by
@@ -291,9 +292,16 @@ impl X402Upto {
         let payload = &envelope.payload;
 
         verify_upto_payload(payload, &requirements, &self.operator(), now_unix())?;
+        if envelope.network.as_deref() != Some(requirements.network.as_str()) {
+            return Err(Error::Other(format!(
+                "network mismatch: payload {:?}, expected {}",
+                envelope.network, requirements.network
+            )));
+        }
 
         let program_id = self.program_id()?;
         let expected_mint = self.mint()?;
+        let token_program = self.token_program()?;
         let expected_payee = Pubkey::from_str(&self.config.recipient)
             .map_err(|e| Error::Other(format!("invalid recipient: {e}")))?;
         let channel_id = Pubkey::from_str(&payload.channel_id)
@@ -304,7 +312,7 @@ impl X402Upto {
 
         // In-flight dedup: reject a concurrent request replaying the same
         // channel before its first settlement finalizes. The guard releases the
-        // slot on drop — including every early-return below and a handler panic.
+        // slot on drop - including every early-return below and a handler panic.
         let in_flight = {
             let mut set = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
             if !set.insert(channel_id) {
@@ -325,10 +333,17 @@ impl X402Upto {
         })?;
         let mut tx = decode_transaction(open_tx_b64)?;
         // SECURITY: the operator co-signs as fee payer, so it must only ever
-        // sign the expected channel-open instruction — never an arbitrary
+        // sign the expected channel-open instruction - never an arbitrary
         // operator-authorized instruction (e.g. a SystemProgram transfer that
         // drains the operator). Validate before co-signing/broadcasting.
-        self.validate_open_transaction(&tx, &payer, &expected_payee, &expected_mint, &channel_id)?;
+        self.validate_open_transaction(
+            &tx,
+            &payer,
+            &expected_payee,
+            &expected_mint,
+            &token_program,
+            &channel_id,
+        )?;
         self.cosign_fee_payer(&mut tx).await?;
         self.rpc
             .send_and_confirm_transaction(&tx)
@@ -361,11 +376,16 @@ impl X402Upto {
                 "channel authorized_signer is not the operator".to_string(),
             ));
         }
+        if pc::from_address(&channel.rent_payer) != self.operator {
+            return Err(Error::Other(
+                "channel rent_payer is not the operator".to_string(),
+            ));
+        }
         if channel.deposit != max {
             return Err(Error::Other(format!(
                 "on-chain deposit {} != authorized maximum {max}: the deposit is the \
                  enforced ceiling and `topUp` can raise an open channel's deposit, so it \
-                 must equal the authorized amount exactly — `>=` would leave the x402 \
+                 must equal the authorized amount exactly - `>=` would leave the x402 \
                  ceiling advisory rather than enforced",
                 channel.deposit
             )));
@@ -384,8 +404,9 @@ impl X402Upto {
         Ok(VerifiedUptoOpen {
             channel_id,
             payer,
+            rent_payer: pc::from_address(&channel.rent_payer),
             mint: expected_mint,
-            token_program: self.token_program()?,
+            token_program,
             program_id,
             deposit: channel.deposit,
             max_amount: max,
@@ -396,8 +417,7 @@ impl X402Upto {
     }
 
     /// Settle the actual metered amount (`actual ≤ max`) against a verified
-    /// open: operator-signed voucher, `settle_and_finalize` + `distribute`,
-    /// refunding the remainder. `actual == 0` still finalizes (full refund).
+    /// open: `settle_and_finalize`, ATA setup, and `distribute`.
     pub async fn settle_actual(
         &self,
         open: &VerifiedUptoOpen,
@@ -436,13 +456,25 @@ impl X402Upto {
             )?
         };
 
+        let payee = Pubkey::from_str(&self.config.recipient)
+            .map_err(|e| Error::Other(format!("invalid recipient: {e}")))?;
+        instructions.push(pc::build_create_associated_token_account_instruction(
+            &self.operator,
+            &payee,
+            &open.mint,
+            &open.token_program,
+        ));
+        instructions.push(pc::build_create_associated_token_account_instruction(
+            &self.operator,
+            &pc::treasury_owner(),
+            &open.mint,
+            &open.token_program,
+        ));
         instructions.push(pc::build_distribute_instruction(
             &open.channel_id,
             &open.payer,
-            // rentPayer is pinned to the operator (the fee payer).
-            &self.operator,
-            &Pubkey::from_str(&self.config.recipient)
-                .map_err(|e| Error::Other(format!("invalid recipient: {e}")))?,
+            &open.rent_payer,
+            &payee,
             &pc::treasury_owner(),
             &open.mint,
             &[],
@@ -491,11 +523,13 @@ impl X402Upto {
         payer: &Pubkey,
         payee: &Pubkey,
         mint: &Pubkey,
+        token_program: &Pubkey,
         channel_id: &Pubkey,
     ) -> Result<(), Error> {
+        let program_id = self.program_id()?;
         validate_open_instruction(
             tx,
-            &self.program_id()?,
+            &program_id,
             // upto is gasless + delegated: the operator funds the rent and signs
             // the voucher, so it is both the rentPayer and the authorized_signer.
             &self.operator,
@@ -503,6 +537,7 @@ impl X402Upto {
             payer,
             payee,
             mint,
+            token_program,
             channel_id,
         )
     }
@@ -529,6 +564,11 @@ pub(crate) async fn cosign_operator_fee_payer(
     tx: &mut VersionedTransaction,
 ) -> Result<(), Error> {
     let account_keys = tx.message.static_account_keys();
+    if account_keys.first() != Some(operator) {
+        return Err(Error::Other(
+            "open transaction fee payer must be the advertised operator".into(),
+        ));
+    }
     let idx = account_keys
         .iter()
         .position(|k| k == operator)
@@ -572,7 +612,7 @@ fn validate_empty_recipient_distribution_hash(distribution_hash: &[u8; 32]) -> R
 /// operator can safely co-sign it as fee payer (see [`X402Upto::validate_open_transaction`]).
 // Each account slot is an independent expected key (rentPayer vs
 // authorized_signer are distinct roles), so they are passed individually
-// rather than bundled — the arity is inherent to the open account layout.
+// rather than bundled. The arity is inherent to the open account layout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_open_instruction(
     tx: &VersionedTransaction,
@@ -582,13 +622,14 @@ pub(crate) fn validate_open_instruction(
     payer: &Pubkey,
     payee: &Pubkey,
     mint: &Pubkey,
+    token_program: &Pubkey,
     channel_id: &Pubkey,
 ) -> Result<(), Error> {
     // Reject v0 transactions that pull accounts from address lookup tables.
     // This validator (and the fee-payer co-sign) resolves every account via
     // `static_account_keys()`; an `open` needs only static accounts, so a
     // non-empty ALT lookup could smuggle in accounts the guards below cannot
-    // see — and the operator would blindly co-sign. Mirrors the mpp charge-tx
+    // see - and the operator would blindly co-sign. Mirrors the mpp charge-tx
     // verifier's `reject_address_lookup_tables`.
     if tx
         .message
@@ -628,7 +669,7 @@ pub(crate) fn validate_open_instruction(
     // co-signs as fee payer; authorized_signer (slot 4) is the voucher signer.
     // These are independent roles (mirrors the mpp-session `verifyOpenTx`): in
     // gasless `upto` both are the operator, in gasless `batch` rentPayer is the
-    // operator while authorized_signer is the payer — so each slot is checked
+    // operator while authorized_signer is the payer, so each slot is checked
     // against its own expected key rather than a single conflated one.
     let account_at = |pos: usize| -> Option<Pubkey> {
         ix.accounts
@@ -654,15 +695,59 @@ pub(crate) fn validate_open_instruction(
     expect(3, mint, "mint")?;
     expect(4, authorized_signer, "authorized_signer")?;
     expect(5, channel_id, "channel")?;
+    let (payer_token, _) = pc::find_associated_token_address(payer, mint, token_program);
+    let (channel_token, _) = pc::find_associated_token_address(channel_id, mint, token_program);
+    expect(6, &payer_token, "payer_token_account")?;
+    expect(7, &channel_token, "channel_token_account")?;
+    expect(8, token_program, "token_program")?;
+    expect(9, &pc::system_program_id(), "system_program")?;
+    expect(10, &pc::rent_sysvar_id(), "rent_sysvar")?;
+    expect(
+        11,
+        &pc::associated_token_program_id(),
+        "associated_token_program",
+    )?;
+    expect(
+        12,
+        &pc::find_event_authority_pda(program_id).0,
+        "event_authority",
+    )?;
+    expect(13, program_id, "self_program")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use solana_keychain::{SignTransactionResult, SignerError};
     use solana_pay_core::payment_channels::{
         build_open_instruction, derive_channel_addresses, OpenChannelParams,
     };
+
+    struct TestSigner(Pubkey);
+
+    #[async_trait]
+    impl SolanaSigner for TestSigner {
+        fn pubkey(&self) -> Pubkey {
+            self.0
+        }
+
+        async fn sign_transaction(
+            &self,
+            _tx: &mut Transaction,
+        ) -> Result<SignTransactionResult, SignerError> {
+            Err(SignerError::Other("unused".to_string()))
+        }
+
+        async fn sign_message(&self, _message: &[u8]) -> Result<Signature, SignerError> {
+            Ok(Signature::from([7u8; 64]))
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
 
     fn token_program() -> Pubkey {
         Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap()
@@ -695,6 +780,14 @@ mod tests {
         VersionedTransaction::from(Transaction::new_unsigned(msg))
     }
 
+    fn unsigned_tx_with_fee_payer(
+        instructions: &[solana_instruction::Instruction],
+        fee_payer: Pubkey,
+    ) -> VersionedTransaction {
+        let msg = Message::new(instructions, Some(&fee_payer));
+        VersionedTransaction::from(Transaction::new_unsigned(msg))
+    }
+
     #[test]
     fn accepts_a_well_formed_open() {
         let (payer, payee, mint, operator) = (
@@ -715,6 +808,7 @@ mod tests {
             &payer,
             &payee,
             &mint,
+            &token_program(),
             &channel,
         )
         .is_ok());
@@ -724,7 +818,7 @@ mod tests {
     fn validates_distinct_rent_payer_and_authorized_signer() {
         // Gasless batch / client-voucher (matrix combo 2): the operator funds
         // the rent (rentPayer) while the payer signs vouchers (authorized_signer)
-        // — two distinct keys. The old conflated validator rejected this open.
+        // - two distinct keys. The old conflated validator rejected this open.
         let (payer, payee, mint, operator) = (
             Pubkey::new_unique(),
             Pubkey::new_unique(),
@@ -756,11 +850,12 @@ mod tests {
             &payer,
             &payee,
             &mint,
+            &token_program(),
             &channel,
         )
         .is_ok());
 
-        // Swapping the two expected keys must fail — proves the slots are
+        // Swapping the two expected keys must fail - proves the slots are
         // validated independently rather than against one conflated key.
         assert!(validate_open_instruction(
             &tx,
@@ -770,6 +865,7 @@ mod tests {
             &payer,
             &payee,
             &mint,
+            &token_program(),
             &channel,
         )
         .is_err());
@@ -786,15 +882,20 @@ mod tests {
             data: vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // transfer-ish
         };
         let tx = unsigned_tx(&[evil]);
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let channel = Pubkey::new_unique();
         assert!(validate_open_instruction(
             &tx,
             &pc::default_program_id(),
             &operator,
             &operator,
-            &Pubkey::new_unique(),
-            &Pubkey::new_unique(),
-            &Pubkey::new_unique(),
-            &Pubkey::new_unique(),
+            &payer,
+            &payee,
+            &mint,
+            &token_program(),
+            &channel,
         )
         .is_err());
     }
@@ -826,20 +927,51 @@ mod tests {
             &payer,
             &payee,
             &mint,
+            &token_program(),
             &channel,
         )
         .is_err());
 
         // Right shape, wrong expected payee.
         let one = unsigned_tx(&[open]);
+        let wrong_payee = Pubkey::new_unique();
         assert!(validate_open_instruction(
             &one,
             &pc::default_program_id(),
             &operator,
             &operator,
             &payer,
-            &Pubkey::new_unique(),
+            &wrong_payee,
             &mint,
+            &token_program(),
+            &channel,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_token_program_binding() {
+        let (payer, payee, mint, operator) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let params = open_params(payer, payee, mint, operator);
+        let channel = derive_channel_addresses(&params).channel;
+        let tx = unsigned_tx(&[build_open_instruction(&params)]);
+        let wrong_token_program =
+            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+
+        assert!(validate_open_instruction(
+            &tx,
+            &pc::default_program_id(),
+            &operator,
+            &operator,
+            &payer,
+            &payee,
+            &mint,
+            &wrong_token_program,
             &channel,
         )
         .is_err());
@@ -857,9 +989,71 @@ mod tests {
         assert!(validate_empty_recipient_distribution_hash(&non_empty).is_err());
     }
 
+    #[test]
+    fn new_accepts_recipient_different_from_operator() {
+        let operator = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let engine = X402Upto::new(UptoConfig {
+            recipient: pc::pubkey_string(&recipient),
+            currency: "USDC".to_string(),
+            decimals: 6,
+            cluster: "localnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:8899".to_string()),
+            resource: "/usage".to_string(),
+            description: None,
+            max_timeout_seconds: 300,
+            token_program: None,
+            program_id: None,
+            operator_signer: std::sync::Arc::new(TestSigner(operator)),
+        })
+        .expect("distinct recipient should be accepted");
+        let req = engine
+            .upto_requirements("1.00")
+            .expect("requirements should build");
+        assert_eq!(req.pay_to, pc::pubkey_string(&recipient));
+        assert_eq!(req.extra.fee_payer, pc::pubkey_string(&operator));
+    }
+
+    #[tokio::test]
+    async fn cosign_rejects_operator_when_not_fee_payer() {
+        let operator = Pubkey::new_unique();
+        let fee_payer = Pubkey::new_unique();
+        let ix = solana_instruction::Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![solana_instruction::AccountMeta::new_readonly(
+                operator, true,
+            )],
+            data: vec![],
+        };
+        let mut tx = unsigned_tx_with_fee_payer(&[ix], fee_payer);
+
+        let err = cosign_operator_fee_payer(&TestSigner(operator), &operator, &mut tx)
+            .await
+            .expect_err("operator signer must not be accepted outside fee-payer slot");
+        assert!(err
+            .to_string()
+            .contains("fee payer must be the advertised operator"));
+    }
+
+    #[tokio::test]
+    async fn cosign_accepts_operator_fee_payer() {
+        let operator = Pubkey::new_unique();
+        let ix = solana_instruction::Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![],
+            data: vec![],
+        };
+        let mut tx = unsigned_tx_with_fee_payer(&[ix], operator);
+
+        cosign_operator_fee_payer(&TestSigner(operator), &operator, &mut tx)
+            .await
+            .expect("operator fee-payer transaction should sign");
+        assert_eq!(tx.signatures[0], Signature::from([7u8; 64]));
+    }
+
     // FIX #7: an `open` needs only static accounts, so a v0 transaction that
     // pulls accounts from an address lookup table must be rejected before the
-    // operator co-signs as fee payer — otherwise it could smuggle in accounts
+    // operator co-signs as fee payer - otherwise it could smuggle in accounts
     // the static-key guards above cannot inspect.
     #[test]
     fn rejects_open_with_address_lookup_tables() {
@@ -901,6 +1095,7 @@ mod tests {
             &payer,
             &payee,
             &mint,
+            &token_program(),
             &channel,
         )
         .unwrap_err();
