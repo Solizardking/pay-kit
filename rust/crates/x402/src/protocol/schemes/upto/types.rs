@@ -49,6 +49,12 @@ pub struct UptoExtra {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recent_blockhash: Option<String>,
 
+    /// Last block height at which `recent_blockhash` is valid (decimal string),
+    /// bounding the open transaction's validity window. See
+    /// x402-foundation/x402#2693.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_valid_block_height: Option<String>,
+
     /// Earliest activation time (Unix seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_after: Option<i64>,
@@ -181,13 +187,15 @@ impl UptoPayload {
 pub struct UptoSignatureEnvelope {
     pub x402_version: u64,
 
-    pub scheme: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accepted: Option<serde_json::Value>,
+    /// The chosen `PaymentRequirements` (x402 v2 spec §5.2). Required — this is
+    /// where `scheme` and `network` live; the canonical `PaymentPayload` has no
+    /// envelope-level scheme/network.
+    ///
+    /// Kept as opaque JSON rather than a typed `UptoRequirements` so a
+    /// canonical-compatible client that echoes an `accepted` object omitting
+    /// fields the server never reads still parses; the server pulls `scheme`
+    /// and `network` from it.
+    pub accepted: serde_json::Value,
 
     pub payload: UptoPayload,
 }
@@ -232,6 +240,7 @@ mod tests {
                 fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
                 channel_program: None,
                 recent_blockhash: None,
+                last_valid_block_height: None,
                 valid_after: None,
             },
         }
@@ -273,6 +282,65 @@ mod tests {
         assert!(!json.contains("\"signature\""));
         assert_eq!(payload.max_amount().unwrap(), 1_000_000);
         assert_eq!(payload.deposit().unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn parses_canonical_envelope_without_top_level_scheme() {
+        // The canonical x402 v2 client (the TS playground via `@x402/core`)
+        // emits `{ x402Version, payload, accepted }` with NO top-level `scheme`
+        // or `network` — they live in `accepted`. Earlier this failed to parse
+        // with `missing field scheme`; assert it now round-trips.
+        let req = requirements();
+        let canonical = serde_json::json!({
+            "x402Version": 2,
+            "payload": {
+                "profile": PROFILE_PAYMENT_CHANNEL,
+                "from": "Payer1111111111111111111111111111111111111",
+                "maxAmount": "1000000",
+                "expiresAt": 4_102_444_800i64,
+                "validAfter": 0,
+                "nonce": "n-1",
+                "channelId": "Chan1111111111111111111111111111111111111",
+                "deposit": "1000000",
+                "authorizedSigner": "Op11111111111111111111111111111111111111111",
+                "openTransaction": "base64tx",
+            },
+            // canonical extras we must tolerate (ignored)
+            "resource": "https://example.com/x",
+            "extensions": {},
+            "accepted": serde_json::to_value(&req).unwrap(),
+        });
+
+        let env: UptoSignatureEnvelope = serde_json::from_value(canonical).unwrap();
+        // scheme + network live in `accepted`, per x402 v2 spec §5.2.
+        assert_eq!(
+            env.accepted.get("network").and_then(|n| n.as_str()),
+            Some(req.network.as_str()),
+            "network read from accepted"
+        );
+        assert_eq!(
+            env.accepted.get("scheme").and_then(|s| s.as_str()),
+            Some("upto")
+        );
+        assert_eq!(
+            env.payload.channel_id,
+            "Chan1111111111111111111111111111111111111"
+        );
+
+        // The emitted wire shape carries no envelope-level scheme/network.
+        let wire = serde_json::to_value(&env).unwrap();
+        assert!(
+            wire.get("scheme").is_none(),
+            "no envelope-level scheme on the wire"
+        );
+        assert!(
+            wire.get("network").is_none(),
+            "no envelope-level network on the wire"
+        );
+        assert!(
+            wire.get("accepted").is_some(),
+            "accepted present on the wire"
+        );
     }
 
     #[test]

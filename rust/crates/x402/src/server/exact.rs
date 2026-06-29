@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
+use solana_commitment_config::CommitmentConfig;
+use solana_keychain::SolanaSigner;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
+use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
 
@@ -74,6 +77,11 @@ pub struct ExactOptions<'a> {
     pub description: Option<&'a str>,
     pub resource: Option<&'a str>,
     pub max_age: Option<u64>,
+    /// On-chain memo (`extra.memo`) the client stamps on the transfer. When
+    /// unset the client falls back to a random 16-byte nonce; set it (e.g. to
+    /// the endpoint resource) for a stable, human-meaningful settlement memo.
+    /// The verifier requires the tx memo to equal this exactly.
+    pub memo: Option<&'a str>,
 }
 
 /// One payment option offered by a multi-currency route.
@@ -141,7 +149,13 @@ impl X402 {
             .unwrap_or_else(|| default_rpc_url(&config.network).to_string());
 
         Ok(Self {
-            rpc: Arc::new(RpcClient::new(rpc_url)),
+            // `confirmed`, not the default `finalized`: settlement (and blockhash/
+            // simulate) shouldn't block ~13s waiting for finalization — confirmed
+            // is the settled point. Mirrors the MPP charge path.
+            rpc: Arc::new(RpcClient::new_with_commitment(
+                rpc_url,
+                CommitmentConfig::confirmed(),
+            )),
             config,
         })
     }
@@ -178,7 +192,8 @@ impl X402 {
         amount: &str,
         options: ExactOptions<'_>,
     ) -> Result<PaymentRequiredEnvelope, Error> {
-        let requirements = self.exact_requirements(amount, options)?;
+        let mut requirements = self.exact_requirements(amount, options)?;
+        self.embed_recent_blockhash(&mut requirements);
         Ok(PaymentRequiredEnvelope {
             x402_version: X402_VERSION_V2,
             resource: requirements.resource_info(),
@@ -186,6 +201,42 @@ impl X402 {
             error: None,
             extensions: None,
         })
+    }
+
+    /// Embed a recent blockhash in the 402 *challenge* so the client can build
+    /// its transaction without its own RPC round-trip and against the same RPC
+    /// that will settle it (the client reads it in `client/exact`). Mirrors
+    /// x402-foundation/x402#2693.
+    ///
+    /// Challenge-only and best-effort: only when an RPC is configured, omitted
+    /// on RPC failure (the client fetches its own), and never applied to the
+    /// verify-time rebuild — `verify_envelope_payload` strips these fields from
+    /// the structural match since they are transient build hints, not pinned
+    /// binding fields.
+    ///
+    /// On the Surfpool sandbox this also lets a localnet client recognize the
+    /// surfnet fork: the embedded blockhash carries the `SURFNETxSAFEHASH`
+    /// sentinel the client keys on, regardless of the wire CAIP-2 network.
+    fn embed_recent_blockhash(&self, requirements: &mut PaymentRequirements) {
+        if self.config.rpc_url.is_none() {
+            return;
+        }
+        let Ok((blockhash, last_valid_block_height)) = self
+            .rpc
+            .get_latest_blockhash_with_commitment(self.rpc.commitment())
+        else {
+            return;
+        };
+        requirements.recent_blockhash = Some(blockhash.to_string());
+        let extra = requirements
+            .extra
+            .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                "lastValidBlockHeight".to_string(),
+                serde_json::Value::String(last_valid_block_height.to_string()),
+            );
+        }
     }
 
     pub fn exact_requirements(
@@ -259,6 +310,20 @@ impl X402 {
             requirements.fee_payer = Some(true);
             requirements.fee_payer_key = Some(key.clone());
         }
+        // Stable settlement memo (`extra.memo`): the client stamps it on the
+        // transfer and the verifier requires an exact match. Without it the
+        // client uses a random nonce.
+        if let Some(memo) = option.extra.memo {
+            let extra = requirements
+                .extra
+                .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = extra.as_object_mut() {
+                obj.insert(
+                    "memo".to_string(),
+                    serde_json::Value::String(memo.to_string()),
+                );
+            }
+        }
         Ok(requirements)
     }
 
@@ -278,7 +343,9 @@ impl X402 {
         }
         let mut accepts = Vec::with_capacity(options.len());
         for option in options {
-            accepts.push(self.exact_requirements_for_option(option)?);
+            let mut requirements = self.exact_requirements_for_option(option)?;
+            self.embed_recent_blockhash(&mut requirements);
+            accepts.push(requirements);
         }
         let resource = accepts[0].resource_info();
         Ok(PaymentRequiredEnvelope {
@@ -419,13 +486,23 @@ impl X402 {
                 let accepted_requirements: PaymentRequirements =
                     serde_json::from_value(accepted.clone())
                         .map_err(|e| Error::InvalidPaymentRequired(e.to_string()))?;
-                let accepted_json = serde_json::to_value(&accepted_requirements)
+                let mut accepted_json = serde_json::to_value(&accepted_requirements)
                     .map_err(|e| Error::Other(format!("Failed to serialize accepted: {e}")))?;
+                // `recentBlockhash` / `lastValidBlockHeight` are transient build
+                // hints the server embeds in the *challenge* (#2693) and the
+                // client echoes back in `accepted`, but the verify-time option
+                // rebuild omits them. Strip them from both sides so a
+                // hint-carrying credential still matches its offered option —
+                // mirrors the structural backstop in `verify_envelope_payload`.
+                strip_blockhash_hints(&mut accepted_json);
                 available
                     .iter()
                     .find(|requirement| {
                         serde_json::to_value(requirement)
-                            .map(|json| json == accepted_json)
+                            .map(|mut json| {
+                                strip_blockhash_hints(&mut json);
+                                json == accepted_json
+                            })
                             .unwrap_or(false)
                     })
                     .ok_or_else(|| {
@@ -471,6 +548,65 @@ impl X402 {
 
     pub fn payment_signature_header_name(&self) -> &'static str {
         PAYMENT_SIGNATURE_HEADER
+    }
+
+    /// Settle a verified `exact` payment on-chain and return the settlement
+    /// signature.
+    ///
+    /// `process_payment` only *verifies* the client's credential (structure,
+    /// network, recipient, amount) — it does not move funds. The caller MUST
+    /// settle before serving the resource:
+    /// - `Transaction` proof (pull): the sponsor (`fee_payer`) co-signs the
+    ///   still-empty fee-payer slot, then the transaction is simulated and
+    ///   broadcast + confirmed. The confirmed signature is returned.
+    /// - `Signature` proof (push): already on-chain — returned as-is.
+    pub async fn settle_exact(
+        &self,
+        verified: VerifiedExactPayment,
+        fee_payer: &dyn SolanaSigner,
+    ) -> Result<String, Error> {
+        let mut tx = match verified {
+            VerifiedExactPayment::Signature(signature) => return Ok(signature),
+            VerifiedExactPayment::Transaction(tx) => tx,
+        };
+
+        // Co-sign the fee-payer slot (the client left it empty for the sponsor).
+        // Solana's fee payer is always account index 0, so require the sponsor
+        // to occupy that slot — finding the key anywhere in the account list
+        // would let a crafted tx put another signer at index 0 and the sponsor
+        // later, signing the wrong slot and leaving the real fee payer unsigned.
+        let fee_payer_key = fee_payer.pubkey();
+        if tx.message.static_account_keys().first() != Some(&fee_payer_key) {
+            return Err(Error::Other(
+                "transaction fee payer must match the provided fee payer signer".into(),
+            ));
+        }
+        if tx.signatures.is_empty() {
+            return Err(Error::Other(
+                "fee payer is not a required transaction signer".into(),
+            ));
+        }
+        let signer_index = 0;
+        let signature = fee_payer
+            .sign_message(&tx.message.serialize())
+            .await
+            .map_err(|e| Error::Other(format!("fee payer signing failed: {e}")))?;
+        tx.signatures[signer_index] = Signature::from(<[u8; 64]>::from(signature));
+
+        // Simulate first for an actionable error, then broadcast + confirm.
+        let simulation = self
+            .rpc
+            .simulate_transaction(&tx)
+            .map_err(|e| Error::Rpc(format!("exact settlement simulation failed: {e}")))?;
+        if let Some(err) = simulation.value.err {
+            return Err(Error::Rpc(format!(
+                "exact settlement simulation failed: {err:?}"
+            )));
+        }
+        self.rpc
+            .send_and_confirm_transaction(&tx)
+            .map(|s| s.to_string())
+            .map_err(|e| Error::Rpc(format!("exact settlement broadcast failed: {e}")))
     }
 
     async fn verify_envelope_payload(
@@ -530,10 +666,18 @@ impl X402 {
             // resource, decimals, token_program, …) is a binding mismatch
             // by protocol. Compared via JSON values so unknown future
             // fields are covered automatically.
-            let accepted_json = serde_json::to_value(&accepted_requirements)
+            let mut accepted_json = serde_json::to_value(&accepted_requirements)
                 .map_err(|e| Error::Other(format!("Failed to serialize accepted: {e}")))?;
-            let route_json = serde_json::to_value(requirements)
+            let mut route_json = serde_json::to_value(requirements)
                 .map_err(|e| Error::Other(format!("Failed to serialize requirements: {e}")))?;
+            // `recentBlockhash` / `lastValidBlockHeight` are transient client
+            // build hints the server embeds in the *challenge* (#2693), not
+            // pinned binding fields: the challenge carries them but the
+            // verify-time rebuild (`exact_requirements`) does not, so exclude
+            // them from the structural match. The transaction's actual blockhash
+            // is validated separately (`check_network_blockhash` + on-chain).
+            strip_blockhash_hints(&mut accepted_json);
+            strip_blockhash_hints(&mut route_json);
             if accepted_json != route_json {
                 return Err(Error::Other(
                     "Credential's accepted requirements do not structurally match this route's expected requirements".into(),
@@ -685,6 +829,25 @@ fn is_loopback_rpc(rpc_url: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
 }
 
+/// Remove the server-provided build hints (`recentBlockhash` /
+/// `lastValidBlockHeight`, #2693) from a serialized requirements value so the
+/// verify-time match ignores them — they're present in the challenge the client
+/// echoes but absent from the verify-time rebuild.
+///
+/// `recentBlockhash` is stripped at both the top level and inside `extra`: the
+/// canonical `Serialize` routes it into `extra`, but a credential whose raw
+/// `accepted` is passed through verbatim (see `PaymentRequirements::accepted`)
+/// can carry it at the top level, so both must be cleared for matching to hold.
+fn strip_blockhash_hints(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("recentBlockhash");
+    }
+    if let Some(extra) = value.get_mut("extra").and_then(|e| e.as_object_mut()) {
+        extra.remove("recentBlockhash");
+        extra.remove("lastValidBlockHeight");
+    }
+}
+
 fn managed_signers_for_requirements(
     requirements: &PaymentRequirements,
 ) -> Result<Vec<Pubkey>, Error> {
@@ -785,6 +948,7 @@ mod tests {
                     description: Some("Override"),
                     resource: Some("/override"),
                     max_age: Some(120),
+                    memo: None,
                 },
             )
             .unwrap();
@@ -1070,6 +1234,63 @@ mod tests {
             err.to_string().contains("does not match any offered"),
             "got: {err:?}"
         );
+    }
+
+    /// A multi-option credential that echoes the challenge's blockhash build
+    /// hints (`recentBlockhash` / `lastValidBlockHeight`, #2693) in `accepted`
+    /// must still match its offered option. The hints are embedded into the
+    /// challenge but absent from the verify-time option rebuild, so matching
+    /// has to ignore them — otherwise a valid multi-option payment fails with
+    /// "does not match any offered" whenever `rpc_url` is configured.
+    #[test]
+    fn find_matching_requirement_ignores_blockhash_hints() {
+        let x402 = X402::new(config()).unwrap();
+
+        let options = [
+            PaymentOption::new("1.0"),
+            PaymentOption {
+                amount: "1.0",
+                currency: Some("PYUSD"),
+                decimals: Some(6),
+                token_program: None,
+                extra: ExactOptions::default(),
+            },
+        ];
+        let available: Vec<_> = options
+            .iter()
+            .map(|o| x402.exact_requirements_for_option(o).unwrap())
+            .collect();
+
+        // Echo option[0] back, but with the server's challenge build-hints
+        // injected — exactly what a real client returns after a 402 whose
+        // options were stamped by `embed_recent_blockhash`. Cover both shapes:
+        // the canonical `extra.*` form and a top-level `recentBlockhash` (which
+        // survives the verbatim `accepted` passthrough), so the normalization
+        // has to clear both.
+        let mut accepted = serde_json::to_value(&available[0]).unwrap();
+        accepted.as_object_mut().unwrap().insert(
+            "recentBlockhash".to_string(),
+            serde_json::Value::String("SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string()),
+        );
+        let extra = accepted
+            .get_mut("extra")
+            .and_then(|e| e.as_object_mut())
+            .expect("accepted has an extra object");
+        extra.insert(
+            "recentBlockhash".to_string(),
+            serde_json::Value::String("SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string()),
+        );
+        extra.insert(
+            "lastValidBlockHeight".to_string(),
+            serde_json::Value::String("123456789".to_string()),
+        );
+
+        let header = make_envelope_with_accepted(accepted);
+        let envelope = x402.parse_payment_signature(&header).unwrap();
+        let matched = x402
+            .find_matching_requirement(&available, &envelope)
+            .expect("hint-carrying credential should match its offered option");
+        assert_eq!(matched.currency, "USDC");
     }
 
     /// Tier-2 backstop for multi-currency: even if a route hand-builds

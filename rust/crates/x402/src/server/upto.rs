@@ -21,7 +21,6 @@ use solana_keychain::SolanaSigner;
 use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
-use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction::Transaction;
 
@@ -147,7 +146,12 @@ impl X402Upto {
             .unwrap_or_else(|| default_rpc_url(&config.cluster).to_string());
 
         Ok(Self {
-            rpc: Arc::new(RpcClient::new(rpc_url)),
+            // `confirmed`, not the default `finalized`: the channel open + voucher
+            // settlement shouldn't block ~13s on finalization.
+            rpc: Arc::new(RpcClient::new_with_commitment(
+                rpc_url,
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            )),
             config,
             operator,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -210,6 +214,7 @@ impl X402Upto {
                 fee_payer: self.operator(),
                 channel_program: Some(pc::pubkey_string(&self.program_id()?)),
                 recent_blockhash: None,
+                last_valid_block_height: None,
                 valid_after: None,
             },
         })
@@ -225,11 +230,12 @@ impl X402Upto {
         // the in-SDK client hard-requires `extra.recentBlockhash` to build the
         // channel open, so a silent `None` would surface as a non-retryable
         // payment failure on a transient RPC hiccup.
-        let blockhash = self
+        let (blockhash, last_valid_block_height) = self
             .rpc
-            .get_latest_blockhash()
+            .get_latest_blockhash_with_commitment(self.rpc.commitment())
             .map_err(|e| Error::Rpc(format!("failed to fetch recent blockhash: {e}")))?;
         requirement.extra.recent_blockhash = Some(blockhash.to_string());
+        requirement.extra.last_valid_block_height = Some(last_valid_block_height.to_string());
         let resource = (!self.config.resource.is_empty()).then(|| ResourceInfo {
             url: self.config.resource.clone(),
             description: self.config.description.clone(),
@@ -274,8 +280,15 @@ impl X402Upto {
             .map_err(|e| Error::InvalidPaymentRequired(e.to_string()))?;
         let envelope: UptoSignatureEnvelope = serde_json::from_slice(&decoded)
             .map_err(|e| Error::InvalidPaymentRequired(e.to_string()))?;
-        if envelope.scheme != UPTO_SCHEME {
-            return Err(Error::InvalidPayloadType(envelope.scheme));
+        // x402 v2 spec §5.2: scheme lives in `accepted` (the chosen
+        // PaymentRequirements), not at the envelope level.
+        let scheme = envelope
+            .accepted
+            .get("scheme")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        if scheme != UPTO_SCHEME {
+            return Err(Error::InvalidPayloadType(scheme.to_string()));
         }
         Ok(envelope)
     }
@@ -292,10 +305,13 @@ impl X402Upto {
         let payload = &envelope.payload;
 
         verify_upto_payload(payload, &requirements, &self.operator(), now_unix())?;
-        if envelope.network.as_deref() != Some(requirements.network.as_str()) {
+        // x402 v2 spec §5.2: network lives in `accepted` (the chosen
+        // PaymentRequirements), not at the envelope level.
+        let claimed_network = envelope.accepted.get("network").and_then(|n| n.as_str());
+        if claimed_network != Some(requirements.network.as_str()) {
             return Err(Error::Other(format!(
                 "network mismatch: payload {:?}, expected {}",
-                envelope.network, requirements.network
+                claimed_network, requirements.network
             )));
         }
 
@@ -557,45 +573,20 @@ impl X402Upto {
 }
 
 /// Co-sign the operator's (fee-payer) slot of a partially-signed transaction.
-/// Shared by the `upto` and `batch-settlement` servers.
+/// Shared by the `upto` and `batch-settlement` servers — the implementation
+/// lives in `solana-pay-core` so the MPP session opener reuses it too.
 pub(crate) async fn cosign_operator_fee_payer(
     signer: &dyn SolanaSigner,
     operator: &Pubkey,
     tx: &mut VersionedTransaction,
 ) -> Result<(), Error> {
-    let account_keys = tx.message.static_account_keys();
-    if account_keys.first() != Some(operator) {
-        return Err(Error::Other(
-            "open transaction fee payer must be the advertised operator".into(),
-        ));
-    }
-    let idx = account_keys
-        .iter()
-        .position(|k| k == operator)
-        .ok_or_else(|| Error::Other("operator (fee payer) not in transaction".into()))?;
-    if idx >= tx.signatures.len() {
-        return Err(Error::Other(
-            "operator is not a required signer in the transaction".into(),
-        ));
-    }
-    let msg_data = tx.message.serialize();
-    let sig_bytes: [u8; 64] = signer
-        .sign_message(&msg_data)
-        .await
-        .map_err(|e| Error::Other(format!("fee payer signing failed: {e}")))?
-        .into();
-    tx.signatures[idx] = Signature::from(sig_bytes);
-    Ok(())
+    Ok(pc::cosign_fee_payer(signer, operator, tx).await?)
 }
 
 /// Decode a base64 (standard) bincode transaction, accepting legacy and v0.
+/// Thin wrapper over the shared `solana-pay-core` decoder.
 pub(crate) fn decode_transaction(b64: &str) -> Result<VersionedTransaction, Error> {
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-        .map_err(|e| Error::Other(format!("invalid base64 transaction: {e}")))?;
-    bincode::deserialize::<Transaction>(&bytes)
-        .map(VersionedTransaction::from)
-        .or_else(|_| bincode::deserialize::<VersionedTransaction>(&bytes))
-        .map_err(|e| Error::Other(format!("invalid transaction: {e}")))
+    Ok(pc::decode_transaction(b64)?)
 }
 
 fn validate_empty_recipient_distribution_hash(distribution_hash: &[u8; 32]) -> Result<(), Error> {
@@ -724,6 +715,7 @@ mod tests {
     use solana_pay_core::payment_channels::{
         build_open_instruction, derive_channel_addresses, OpenChannelParams,
     };
+    use solana_signature::Signature;
 
     struct TestSigner(Pubkey);
 

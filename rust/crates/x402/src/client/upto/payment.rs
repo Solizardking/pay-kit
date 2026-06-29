@@ -107,11 +107,13 @@ pub fn encode_upto_header(
     requirements: &UptoRequirements,
     payload: UptoPayload,
 ) -> Result<String, Error> {
+    // Emit the canonical x402 v2 shape: `{ x402Version, accepted, payload }`.
+    // Per spec §5.2 the scheme/network live inside `accepted`, not at the
+    // envelope level.
     let envelope = UptoSignatureEnvelope {
         x402_version: X402_VERSION_V2,
-        scheme: UPTO_SCHEME.to_string(),
-        network: Some(requirements.network.clone()),
-        accepted: Some(requirements.to_accepted_value()?),
+        accepted: serde_json::to_value(requirements)
+            .map_err(|e| Error::Other(format!("upto accepted serialization failed: {e}")))?,
         payload,
     };
     let json = serde_json::to_string(&envelope)
@@ -177,6 +179,7 @@ mod tests {
                 fee_payer: OPERATOR.to_string(),
                 channel_program: None,
                 recent_blockhash: Some(Hash::default().to_string()),
+                last_valid_block_height: None,
                 valid_after: None,
             },
         }
@@ -204,10 +207,13 @@ mod tests {
         let bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &header).unwrap();
         let envelope: UptoSignatureEnvelope = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(envelope.scheme, UPTO_SCHEME);
+        assert_eq!(
+            envelope.accepted.get("scheme").and_then(|s| s.as_str()),
+            Some(UPTO_SCHEME)
+        );
         assert_eq!(envelope.payload.max_amount, "1000000");
         assert_eq!(envelope.x402_version, X402_VERSION_V2);
-        assert!(envelope.accepted.is_some());
+        assert!(envelope.accepted.is_object());
     }
 
     #[test]
