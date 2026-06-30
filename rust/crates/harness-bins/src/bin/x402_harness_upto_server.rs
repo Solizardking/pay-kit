@@ -7,10 +7,13 @@ use std::{
 };
 
 use serde_json::json;
-use solana_keychain::memory::MemorySigner;
+use solana_keychain::{memory::MemorySigner, SolanaSigner};
 use solana_pay_kit::x402::{
     protocol::schemes::upto::UptoSettlementResponse,
-    server::upto::{UptoConfig, X402Upto},
+    server::{
+        upto::{UptoConfig, UptoPayout, X402Upto},
+        CurrencyConfig,
+    },
     PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER,
 };
 
@@ -80,17 +83,21 @@ fn read_state(
     let settlement_header = env::var("X402_HARNESS_SETTLEMENT_HEADER")
         .unwrap_or_else(|_| DEFAULT_SETTLEMENT_HEADER.to_string());
     let program_id = env::var("PAYMENT_CHANNELS_PROGRAM_ID").ok();
+    let operator = operator_signer.pubkey().to_string();
+    let payout = harness_upto_payout(pay_to, &operator);
 
     let upto = X402Upto::new(UptoConfig {
-        recipient: pay_to,
-        currency: mint,
-        decimals: TOKEN_DECIMALS,
+        payout,
+        currencies: vec![CurrencyConfig {
+            currency: mint,
+            decimals: TOKEN_DECIMALS,
+            token_program: None,
+        }],
         cluster: network,
         rpc_url: Some(rpc_url),
         resource: resource_path.clone(),
         description: Some("Surfpool-backed usage endpoint".to_string()),
         max_timeout_seconds: 300,
-        token_program: None,
         program_id,
         operator_signer,
     })?;
@@ -103,6 +110,17 @@ fn read_state(
         actual_amount,
         runtime,
     })
+}
+
+fn harness_upto_payout(pay_to: String, operator: &str) -> UptoPayout {
+    if pay_to == operator {
+        UptoPayout::OperatorKeepsAll
+    } else {
+        UptoPayout::Beneficiary {
+            address: pay_to,
+            operator_fee_bps: 0,
+        }
+    }
 }
 
 fn handle_connection(
@@ -262,4 +280,32 @@ fn normalize_price(price: &str) -> Result<String, Box<dyn std::error::Error + Se
         return Err(format!("invalid price: {price}").into());
     }
     Ok(amount.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_upto_payout_keeps_all_when_pay_to_is_operator() {
+        let operator = "operator";
+        match harness_upto_payout(operator.to_string(), operator) {
+            UptoPayout::OperatorKeepsAll => {}
+            other => panic!("expected OperatorKeepsAll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn harness_upto_payout_uses_100_percent_beneficiary_for_distinct_pay_to() {
+        match harness_upto_payout("beneficiary".to_string(), "operator") {
+            UptoPayout::Beneficiary {
+                address,
+                operator_fee_bps,
+            } => {
+                assert_eq!(address, "beneficiary");
+                assert_eq!(operator_fee_bps, 0);
+            }
+            other => panic!("expected Beneficiary payout, got {other:?}"),
+        }
+    }
 }

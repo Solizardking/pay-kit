@@ -9,7 +9,6 @@
 //! - `server` / `client` — server-side verification / client-side building.
 //! - `axum` — unified dual-protocol payment gate (needs both protocols).
 //! - `confidential` — Token-2022 confidential transfers (mpp).
-//! - `settlement` — batched on-chain settlement worker.
 //! - `gcp_kms` — GCP KMS signer support.
 //! - `otel` — OpenTelemetry init.
 //! - `testkit` — settlement test/demo harness.
@@ -47,8 +46,8 @@ pub mod select;
 
 #[cfg(all(feature = "mpp", feature = "x402", feature = "client"))]
 pub use select::{
-    select_payment, select_payment_parsed, AcceptableToken, OfferedOption, OrderingStrategy,
-    SelectError, SelectedPayment,
+    select_payment, select_payment_parsed, select_payment_parsed_all, AcceptableToken,
+    OfferedOption, OrderingStrategy, SelectError, SelectedPayment,
 };
 
 /// Unified, dual-protocol payment gate for axum.

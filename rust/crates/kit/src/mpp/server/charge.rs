@@ -28,6 +28,10 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use solana_client::client_error::{ClientError, ClientErrorKind};
+use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_client::rpc_request::{RpcError, RpcResponseErrorData};
+use solana_client::rpc_response::RpcSimulateTransactionResult;
 use solana_message::compiled_instruction::CompiledInstruction;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
@@ -308,6 +312,10 @@ pub struct Mpp {
     pub(crate) html: bool,
     /// Audit #5: opt-in for push-mode credentials.
     pub(crate) accept_push_mode: bool,
+    /// Optional shared cache of a recent blockhash, refreshed out of band, so
+    /// challenge issuance avoids a per-challenge RPC round-trip. `None` ⇒ always
+    /// fetch directly (prior behaviour).
+    pub(crate) blockhash_cache: Option<crate::core::blockhash::BlockhashCache>,
 }
 
 impl Mpp {
@@ -372,7 +380,17 @@ impl Mpp {
             store,
             html: config.html,
             accept_push_mode: config.accept_push_mode,
+            blockhash_cache: None,
         })
+    }
+
+    /// Attach a shared blockhash cache (refreshed by a background task) so
+    /// `charge`/`charge_with_options` embed a recent blockhash without a
+    /// per-challenge RPC fetch. Falls back to a direct fetch when the cache is
+    /// empty or stale.
+    pub fn with_blockhash_cache(mut self, cache: crate::core::blockhash::BlockhashCache) -> Self {
+        self.blockhash_cache = Some(cache);
+        self
     }
 
     // ── Accessors ──
@@ -495,12 +513,22 @@ impl Mpp {
             );
         }
 
-        // Pre-fetch blockhash so the client doesn't need an extra RPC call.
-        if let Ok(blockhash) = self.rpc.get_latest_blockhash() {
-            details.insert(
-                "recentBlockhash".into(),
-                serde_json::json!(blockhash.to_string()),
-            );
+        // Pre-fetch a recent blockhash so the client doesn't need an extra RPC
+        // call. Prefer the shared cache (refreshed out of band) to avoid a
+        // blocking RPC round-trip per challenge; fall back to a direct fetch
+        // when the cache is empty or stale.
+        // Intentionally forward only the blockhash, not `last_valid_block_height`:
+        // the MPP charge wire shape has never carried `lastValidBlockHeight`
+        // (the direct-RPC fallback `get_latest_blockhash()` cannot produce one),
+        // and emitting it only on a cache hit would make the field flicker in
+        // and out of the challenge depending on cache warmth. The x402 paths,
+        // which already commit to the field, forward it; MPP does not.
+        let blockhash = match self.blockhash_cache.as_ref().and_then(|c| c.get()) {
+            Some(cached) => Some(cached.blockhash),
+            None => self.rpc.get_latest_blockhash().ok().map(|h| h.to_string()),
+        };
+        if let Some(blockhash) = blockhash {
+            details.insert("recentBlockhash".into(), serde_json::json!(blockhash));
         }
 
         request.method_details = Some(serde_json::Value::Object(details));
@@ -1019,7 +1047,13 @@ impl Mpp {
         // Reject up-front if the client signed against the wrong network
         // (e.g. mainnet keypair pointed at a sandbox-configured server, or
         // vice versa). Cheaper and clearer than letting the broadcast fail.
-        check_network_blockhash(&self.network, &tx.message.recent_blockhash().to_string())?;
+        let tx_recent_blockhash = tx.message.recent_blockhash().to_string();
+        let uses_challenge_blockhash = method_details
+            .recent_blockhash
+            .as_deref()
+            .map(|recent_blockhash| recent_blockhash == tx_recent_blockhash)
+            .unwrap_or(false);
+        check_network_blockhash(&self.network, &tx_recent_blockhash)?;
 
         // Verify the transaction instructions BEFORE co-signing or broadcasting.
         verify_versioned_transaction_pre_broadcast(&tx, request, method_details)?;
@@ -1057,23 +1091,123 @@ impl Mpp {
         }
         tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "cosign", "verify_pull");
 
-        // Simulate before broadcasting (prevent fee loss). Retry a few times:
-        // RPC backends can briefly lag after a just-confirmed transaction
-        // creates an account that this payment now depends on.
-        let mut simulated = false;
+        // Broadcast with the node's preflight simulation (skip_preflight stays
+        // off) rather than a separate simulate round-trip: on success the tx is
+        // already accepted into the mempool; on preflight failure the error
+        // carries the simulation error + program logs. Retry a few times
+        // because RPC backends can briefly lag after a just-confirmed
+        // transaction creates an account that this payment now depends on — the
+        // lag surfaces as a preflight failure (or a transport error), both of
+        // which clear on retry.
+        //
+        // Confirmation polling stays in await_pull_confirmation so the caller
+        // can reserve the signature in the replay store between broadcast
+        // acceptance and confirmation polling.
+        let mut broadcast_signature: Option<Signature> = None;
         for attempt in 1..=SIMULATION_MAX_ATTEMPTS {
-            let sim = match self.rpc.simulate_transaction(&tx) {
-                Ok(sim) => sim,
+            let retrying = attempt < SIMULATION_MAX_ATTEMPTS;
+            match self.rpc.send_transaction(&tx) {
+                Ok(signature) => {
+                    broadcast_signature = Some(signature);
+                    break;
+                }
                 Err(err) => {
-                    let message = format!("Simulation RPC error: {err}");
-                    let retrying = attempt < SIMULATION_MAX_ATTEMPTS;
+                    if let Some(sim) = preflight_simulation(&err) {
+                        // Preflight rejected the tx. Include program logs for
+                        // actionable diagnostics: Solana's TransactionError
+                        // alone is opaque (e.g. "custom program error: 0x1"),
+                        // but the logs reveal the actual cause.
+                        let logs = sim
+                            .logs
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(|l| {
+                                l.contains("Error") || l.contains("error") || l.contains("failed")
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let log_detail = if logs.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", logs.join("; "))
+                        };
+                        let sim_err = sim
+                            .err
+                            .as_ref()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        if !retrying
+                            && uses_challenge_blockhash
+                            && is_blockhash_not_found_simulation(sim)
+                        {
+                            tracing::warn!(
+                                elapsed_ms = %t0.elapsed().as_millis(),
+                                attempt,
+                                max_attempts = SIMULATION_MAX_ATTEMPTS,
+                                error = %sim_err,
+                                recent_blockhash = %tx_recent_blockhash,
+                                "broadcast_pull retrying without preflight after blockhash preflight failure"
+                            );
+                            match self
+                                .rpc
+                                .send_transaction_with_config(&tx, skip_preflight_send_config())
+                            {
+                                Ok(signature) => {
+                                    broadcast_signature = Some(signature);
+                                    break;
+                                }
+                                Err(skip_err) => {
+                                    let message = format!(
+                                        "Broadcast RPC error after blockhash preflight failure: {skip_err}"
+                                    );
+                                    tracing::warn!(
+                                        elapsed_ms = %t0.elapsed().as_millis(),
+                                        error = %skip_err,
+                                        "broadcast_pull skip_preflight rpc error"
+                                    );
+                                    return Err(VerificationError::network_error(message));
+                                }
+                            }
+                        }
+                        // Best-effort balance diagnostics add extra RPC calls,
+                        // so only run them when this failure is about to be
+                        // returned.
+                        let balance_detail = if retrying {
+                            String::new()
+                        } else {
+                            diagnose_balances(&self.rpc, &tx, request, method_details)
+                        };
+                        let message =
+                            format!("Simulation failed: {sim_err}{log_detail}{balance_detail}");
+                        tracing::warn!(
+                            elapsed_ms = %t0.elapsed().as_millis(),
+                            attempt,
+                            max_attempts = SIMULATION_MAX_ATTEMPTS,
+                            retrying,
+                            error = %sim_err,
+                            logs = ?logs,
+                            detail = %message,
+                            "broadcast_pull preflight failed"
+                        );
+                        if retrying {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                SIMULATION_RETRY_DELAY_MS,
+                            ));
+                            continue;
+                        }
+                        return Err(VerificationError::transaction_failed(message));
+                    }
+
+                    // Transport / RPC error (node unreachable, transient 5xx).
+                    let message = format!("Broadcast RPC error: {err}");
                     tracing::warn!(
                         elapsed_ms = %t0.elapsed().as_millis(),
                         attempt,
                         max_attempts = SIMULATION_MAX_ATTEMPTS,
                         retrying,
                         error = %err,
-                        "verify_pull simulation rpc error"
+                        "broadcast_pull rpc error"
                     );
                     if retrying {
                         std::thread::sleep(std::time::Duration::from_millis(
@@ -1083,70 +1217,11 @@ impl Mpp {
                     }
                     return Err(VerificationError::network_error(message));
                 }
-            };
-
-            if let Some(err) = sim.value.err {
-                // Include program logs for actionable diagnostics.
-                // Solana's TransactionError alone is opaque (e.g. "custom program
-                // error: 0x1"), but the logs reveal the actual cause.
-                let logs = sim
-                    .value
-                    .logs
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter(|l| l.contains("Error") || l.contains("error") || l.contains("failed"))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let log_detail = if logs.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {}", logs.join("; "))
-                };
-
-                let retrying = attempt < SIMULATION_MAX_ATTEMPTS;
-                // Best-effort balance diagnostics add extra RPC calls, so only
-                // run them when this failure is about to be returned.
-                let balance_detail = if retrying {
-                    String::new()
-                } else {
-                    diagnose_balances(&self.rpc, &tx, request, method_details)
-                };
-                let message = format!("Simulation failed: {err}{log_detail}{balance_detail}");
-                tracing::warn!(
-                    elapsed_ms = %t0.elapsed().as_millis(),
-                    attempt,
-                    max_attempts = SIMULATION_MAX_ATTEMPTS,
-                    retrying,
-                    error = %err,
-                    logs = ?logs,
-                    detail = %message,
-                    "verify_pull simulation failed"
-                );
-                if retrying {
-                    std::thread::sleep(std::time::Duration::from_millis(SIMULATION_RETRY_DELAY_MS));
-                    continue;
-                }
-                return Err(VerificationError::transaction_failed(message));
             }
-
-            simulated = true;
-            break;
         }
-        if !simulated {
-            return Err(VerificationError::network_error(
-                "Simulation did not complete".to_string(),
-            ));
-        }
-        tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "simulate", "verify_pull");
-
-        // Broadcast. Confirmation polling moved into await_pull_confirmation
-        // so the caller can reserve the signature in the replay store
-        // between broadcast acceptance and confirmation polling.
-        let signature = self
-            .rpc
-            .send_transaction(&tx)
-            .map_err(|e| VerificationError::network_error(format!("Broadcast failed: {e}")))?;
+        let signature = broadcast_signature.ok_or_else(|| {
+            VerificationError::network_error("Broadcast did not complete".to_string())
+        })?;
         tracing::info!(elapsed_ms = %t0.elapsed().as_millis(), step = "send", "broadcast_pull");
         Ok(signature.to_string())
     }
@@ -2766,6 +2841,36 @@ fn to_ui_amount(amount_base_units: u64, decimals: u8) -> Option<f64> {
     Some(amount_base_units as f64 / divisor as f64)
 }
 
+/// Extract the node's preflight simulation result from a failed
+/// `send_transaction`. Returns `Some` when the broadcast was rejected by
+/// preflight (carrying the simulation error + program logs we surface for
+/// diagnostics), and `None` for transport or other RPC-transport errors —
+/// letting the caller pick the right `VerificationError` variant.
+fn preflight_simulation(err: &ClientError) -> Option<&RpcSimulateTransactionResult> {
+    match err.kind() {
+        ClientErrorKind::RpcError(RpcError::RpcResponseError {
+            data: RpcResponseErrorData::SendTransactionPreflightFailure(result),
+            ..
+        }) => Some(result),
+        _ => None,
+    }
+}
+
+fn is_blockhash_not_found_simulation(sim: &RpcSimulateTransactionResult) -> bool {
+    sim.err
+        .as_ref()
+        .map(|err| err.to_string() == "Blockhash not found")
+        .unwrap_or(false)
+}
+
+fn skip_preflight_send_config() -> RpcSendTransactionConfig {
+    RpcSendTransactionConfig {
+        skip_preflight: true,
+        preflight_commitment: Some(solana_commitment_config::CommitmentLevel::Confirmed),
+        ..RpcSendTransactionConfig::default()
+    }
+}
+
 fn diagnose_balances(
     rpc: &RpcClient,
     tx: &VersionedTransaction,
@@ -3138,6 +3243,36 @@ mod tests {
         // The structured code is still available on the field for
         // callers that need to branch on it programmatically.
         assert_eq!(err.code, Some("wrong-network"));
+    }
+
+    #[test]
+    fn blockhash_not_found_simulation_is_detected() {
+        let sim: RpcSimulateTransactionResult =
+            serde_json::from_value(serde_json::json!({ "err": "BlockhashNotFound" })).unwrap();
+
+        assert!(is_blockhash_not_found_simulation(&sim));
+    }
+
+    #[test]
+    fn missing_simulation_error_is_not_blockhash_not_found() {
+        let sim: RpcSimulateTransactionResult =
+            serde_json::from_value(serde_json::json!({ "err": null })).unwrap();
+
+        assert!(!is_blockhash_not_found_simulation(&sim));
+    }
+
+    #[test]
+    fn skip_preflight_send_config_only_skips_preflight() {
+        let config = skip_preflight_send_config();
+
+        assert!(config.skip_preflight);
+        assert_eq!(
+            config.preflight_commitment,
+            Some(solana_commitment_config::CommitmentLevel::Confirmed)
+        );
+        assert_eq!(config.encoding, None);
+        assert_eq!(config.max_retries, None);
+        assert_eq!(config.min_context_slot, None);
     }
 
     // ── Audit #8: to_ui_amount ──

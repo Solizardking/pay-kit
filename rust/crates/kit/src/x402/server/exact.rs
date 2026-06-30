@@ -8,6 +8,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
 
+use crate::x402::server::CurrencyConfig;
 use crate::x402::{
     error::Error,
     protocol::schemes::exact::{
@@ -23,26 +24,17 @@ use crate::x402::{
 #[derive(Debug, Clone)]
 pub struct Config {
     pub recipient: String,
-    /// Default currency. Routes that don't specify a per-option override use
-    /// this value.
-    pub currency: String,
-    /// Default decimals for the configured currency.
-    pub decimals: u8,
+    /// Non-empty universe of currencies this server offers and accepts. `[0]`
+    /// is the primary/default currency used when a route option does not
+    /// specify a per-option currency override. Each entry yields one advertised
+    /// `accepts[]` option; the Tier-2 backstop in `verify_pinned_fields` checks
+    /// that the matched route requirement's currency is one of these.
+    pub currencies: Vec<CurrencyConfig>,
     pub network: String,
     pub rpc_url: Option<String>,
     pub resource: String,
     pub description: Option<String>,
     pub max_age: Option<u64>,
-    pub token_program: Option<String>,
-    /// Universe of currencies this server is willing to accept.
-    ///
-    /// `None` means single-currency mode and only `currency` is accepted —
-    /// the Tier-2 backstop in `verify_pinned_fields` checks for an exact
-    /// match against `currency`. To accept multiple currencies (e.g.
-    /// USDC plus PYUSD) set this to `Some(vec!["USDC".into(), "PYUSD".into()])`.
-    /// Tier-2 then checks that the matched route requirement's currency is
-    /// in this list.
-    pub accepted_currencies: Option<Vec<String>>,
     /// Address of the facilitator that will co-sign as fee payer. When
     /// `Some`, every requirement built by `exact_requirements*` is
     /// automatically enhanced with `fee_payer: true` and
@@ -57,15 +49,16 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             recipient: String::new(),
-            currency: "USDC".to_string(),
-            decimals: 6,
+            currencies: vec![CurrencyConfig {
+                currency: "USDC".to_string(),
+                decimals: 6,
+                token_program: None,
+            }],
             network: "mainnet-beta".to_string(),
             rpc_url: None,
             resource: String::new(),
             description: None,
             max_age: None,
-            token_program: None,
-            accepted_currencies: None,
             fee_payer_key: None,
         }
     }
@@ -133,12 +126,19 @@ pub enum VerifiedExactPayment {
 pub struct X402 {
     rpc: Arc<RpcClient>,
     config: Config,
+    /// Optional shared cache of a recent blockhash, refreshed out of band, so
+    /// challenge issuance avoids a per-challenge RPC round-trip. `None` ⇒ fetch
+    /// directly (prior behaviour).
+    blockhash_cache: Option<crate::core::blockhash::BlockhashCache>,
 }
 
 impl X402 {
     pub fn new(config: Config) -> Result<Self, Error> {
         if config.recipient.is_empty() {
             return Err(Error::Other("recipient is required".into()));
+        }
+        if config.currencies.is_empty() {
+            return Err(Error::Other("at least one currency is required".into()));
         }
         Pubkey::from_str(&config.recipient)
             .map_err(|e| Error::Other(format!("Invalid recipient pubkey: {e}")))?;
@@ -157,19 +157,34 @@ impl X402 {
                 CommitmentConfig::confirmed(),
             )),
             config,
+            blockhash_cache: None,
         })
+    }
+
+    /// Attach a shared blockhash cache (refreshed by a background task) so
+    /// challenge issuance embeds a recent blockhash without a per-challenge RPC
+    /// fetch. Falls back to a direct fetch when the cache is empty or stale.
+    pub fn with_blockhash_cache(mut self, cache: crate::core::blockhash::BlockhashCache) -> Self {
+        self.blockhash_cache = Some(cache);
+        self
     }
 
     pub fn recipient(&self) -> &str {
         &self.config.recipient
     }
 
+    /// The primary/default currency descriptor (`currencies[0]`). The
+    /// constructor rejects an empty list, so this never panics.
+    fn primary_currency(&self) -> &CurrencyConfig {
+        &self.config.currencies[0]
+    }
+
     pub fn currency(&self) -> &str {
-        &self.config.currency
+        &self.primary_currency().currency
     }
 
     pub fn decimals(&self) -> u8 {
-        self.config.decimals
+        self.primary_currency().decimals
     }
 
     pub fn network(&self) -> &str {
@@ -192,14 +207,48 @@ impl X402 {
         amount: &str,
         options: ExactOptions<'_>,
     ) -> Result<PaymentRequiredEnvelope, Error> {
-        let mut requirements = self.exact_requirements(amount, options)?;
-        self.embed_recent_blockhash(&mut requirements);
+        // Fan out one `accepts[]` entry per configured currency so the client
+        // can pick any of them. A single-element `currencies` yields exactly
+        // one accept (today's single-currency behaviour); a multi-element list
+        // advertises every accepted currency. Mirrors
+        // `exact_with_payment_options` but driven by `Config.currencies` rather
+        // than an explicit options list, so the gateway path
+        // (`payment_required_header` → here) advertises every accepted currency.
+        let currencies = &self.config.currencies;
+        let blockhash_hint = self.recent_blockhash_hint();
+        let mut accepts = Vec::with_capacity(currencies.len());
+        for cc in currencies {
+            let mut requirements = self.exact_requirements_for_currency(cc, amount, &options)?;
+            if let Some(hint) = blockhash_hint.as_ref() {
+                Self::embed_recent_blockhash(&mut requirements, hint);
+            }
+            accepts.push(requirements);
+        }
+        let resource = accepts[0].resource_info();
         Ok(PaymentRequiredEnvelope {
             x402_version: X402_VERSION_V2,
-            resource: requirements.resource_info(),
-            accepts: vec![requirements],
+            resource,
+            accepts,
             error: None,
             extensions: None,
+        })
+    }
+
+    /// Build requirements for a configured [`CurrencyConfig`] at the route's
+    /// amount, resolving mint, decimals, and token program independently from
+    /// the currency symbol (the descriptor's `token_program` override wins).
+    fn exact_requirements_for_currency(
+        &self,
+        cc: &CurrencyConfig,
+        amount: &str,
+        options: &ExactOptions<'_>,
+    ) -> Result<PaymentRequirements, Error> {
+        self.exact_requirements_for_option(&PaymentOption {
+            amount,
+            currency: Some(cc.currency.as_str()),
+            decimals: Some(cc.decimals),
+            token_program: cc.token_program.as_deref(),
+            extra: options.clone(),
         })
     }
 
@@ -217,24 +266,40 @@ impl X402 {
     /// On the Surfpool sandbox this also lets a localnet client recognize the
     /// surfnet fork: the embedded blockhash carries the `SURFNETxSAFEHASH`
     /// sentinel the client keys on, regardless of the wire CAIP-2 network.
-    fn embed_recent_blockhash(&self, requirements: &mut PaymentRequirements) {
+    fn recent_blockhash_hint(&self) -> Option<crate::core::blockhash::CachedBlockhash> {
+        // Prefer the shared cache (refreshed out of band) to avoid a blocking
+        // RPC round-trip per challenge; fall back to a direct fetch. Skip
+        // entirely when neither a cached entry nor an RPC URL is available.
+        if let Some(cached) = self.blockhash_cache.as_ref().and_then(|c| c.get()) {
+            return Some(cached);
+        }
         if self.config.rpc_url.is_none() {
-            return;
+            return None;
         }
         let Ok((blockhash, last_valid_block_height)) = self
             .rpc
             .get_latest_blockhash_with_commitment(self.rpc.commitment())
         else {
-            return;
+            return None;
         };
-        requirements.recent_blockhash = Some(blockhash.to_string());
+        Some(crate::core::blockhash::CachedBlockhash {
+            blockhash: blockhash.to_string(),
+            last_valid_block_height,
+        })
+    }
+
+    fn embed_recent_blockhash(
+        requirements: &mut PaymentRequirements,
+        hint: &crate::core::blockhash::CachedBlockhash,
+    ) {
+        requirements.recent_blockhash = Some(hint.blockhash.clone());
         let extra = requirements
             .extra
             .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "lastValidBlockHeight".to_string(),
-                serde_json::Value::String(last_valid_block_height.to_string()),
+                serde_json::Value::String(hint.last_valid_block_height.to_string()),
             );
         }
     }
@@ -260,17 +325,19 @@ impl X402 {
         &self,
         option: &PaymentOption<'_>,
     ) -> Result<PaymentRequirements, Error> {
-        let currency = option.currency.unwrap_or(self.config.currency.as_str());
-        let decimals = option.decimals.unwrap_or(self.config.decimals);
-        // `Config.token_program` is the override for `Config.currency`. When
-        // an option supplies a different currency, fall back to None and let
+        let primary = self.primary_currency();
+        let currency = option.currency.unwrap_or(primary.currency.as_str());
+        let decimals = option.decimals.unwrap_or(primary.decimals);
+        // The primary currency's `token_program` override only applies when the
+        // option doesn't supply its own currency. When an option supplies a
+        // different currency, fall back to None and let
         // `PaymentConfig::to_requirements` derive the correct token program
-        // (TOKEN vs TOKEN_2022) from the per-option currency.
+        // (TOKEN vs TOKEN_2022) from the per-option currency symbol.
         let token_program = option.token_program.map(str::to_string).or_else(|| {
             if option.currency.is_some() {
                 None
             } else {
-                self.config.token_program.clone()
+                primary.token_program.clone()
             }
         });
 
@@ -342,9 +409,12 @@ impl X402 {
             ));
         }
         let mut accepts = Vec::with_capacity(options.len());
+        let blockhash_hint = self.recent_blockhash_hint();
         for option in options {
             let mut requirements = self.exact_requirements_for_option(option)?;
-            self.embed_recent_blockhash(&mut requirements);
+            if let Some(hint) = blockhash_hint.as_ref() {
+                Self::embed_recent_blockhash(&mut requirements, hint);
+            }
             accepts.push(requirements);
         }
         let resource = accepts[0].resource_info();
@@ -433,9 +503,22 @@ impl X402 {
         amount: &str,
         options: ExactOptions<'_>,
     ) -> Result<VerifiedExactPayment, Error> {
-        let requirements = self.exact_requirements(amount, options)?;
-        self.verify_payment_signature_for_requirements(header, &requirements)
-            .await
+        // Build the requirement for each configured currency and verify the
+        // credential against whichever it matches, exactly like
+        // `process_payment_with_options`. Mirrors the fan-out in
+        // `exact_with_options` so the verify path accepts any advertised
+        // currency. A single-element `currencies` yields a single available
+        // requirement (today's single-currency behaviour).
+        let currencies = &self.config.currencies;
+        let mut available = Vec::with_capacity(currencies.len());
+        for cc in currencies {
+            available.push(self.exact_requirements_for_currency(cc, amount, &options)?);
+        }
+        let envelope = self.parse_payment_signature(header)?;
+        let matched = self.find_matching_requirement(&available, &envelope)?;
+        // Clone so the borrow on `available` ends before the async call.
+        let matched = matched.clone();
+        self.verify_envelope_payload(envelope, &matched).await
     }
 
     /// Verify a credential against a multi-option route.
@@ -445,10 +528,9 @@ impl X402 {
     /// `findMatchingRequirements` deepEqual semantics). On match, settles
     /// using the matched option's requirements.
     ///
-    /// `Config.accepted_currencies` should list every currency in `options`
-    /// — Tier-2 enforces it as a defense-in-depth backstop against
-    /// miswired routes that offer currencies the server isn't actually
-    /// configured for.
+    /// `Config.currencies` should list every currency in `options` — Tier-2
+    /// enforces it as a defense-in-depth backstop against miswired routes that
+    /// offer currencies the server isn't actually configured for.
     pub async fn process_payment_with_options(
         &self,
         header: &str,
@@ -593,16 +675,11 @@ impl X402 {
             .map_err(|e| Error::Other(format!("fee payer signing failed: {e}")))?;
         tx.signatures[signer_index] = Signature::from(<[u8; 64]>::from(signature));
 
-        // Simulate first for an actionable error, then broadcast + confirm.
-        let simulation = self
-            .rpc
-            .simulate_transaction(&tx)
-            .map_err(|e| Error::Rpc(format!("exact settlement simulation failed: {e}")))?;
-        if let Some(err) = simulation.value.err {
-            return Err(Error::Rpc(format!(
-                "exact settlement simulation failed: {err:?}"
-            )));
-        }
+        // Broadcast + confirm, relying on the node's preflight simulation
+        // (skip_preflight stays off) instead of a separate simulate round-trip.
+        // Preflight still rejects a bad tx before it lands, and on failure the
+        // returned error carries the simulation error and program logs, so the
+        // diagnostics that the explicit simulate used to surface survive.
         self.rpc
             .send_and_confirm_transaction(&tx)
             .map(|s| s.to_string())
@@ -747,14 +824,15 @@ impl X402 {
                 requirements.currency
             )));
         }
-        // Token program is only pinned when (a) the server config doesn't
-        // declare a per-currency override list AND (b) a token program is
-        // configured. Multi-currency setups vary token program per currency
-        // and rely on the per-option requirement to carry the correct one.
-        if self.config.accepted_currencies.is_none() {
-            if let (Some(server_token_program), Some(req_token_program)) =
-                (&self.config.token_program, &requirements.token_program)
-            {
+        // Token program is only pinned in single-currency mode, and only when
+        // that currency carries an explicit `token_program` override.
+        // Multi-currency setups vary token program per currency and rely on the
+        // per-option requirement to carry the correct one.
+        if self.config.currencies.len() == 1 {
+            if let (Some(server_token_program), Some(req_token_program)) = (
+                &self.primary_currency().token_program,
+                &requirements.token_program,
+            ) {
                 if req_token_program != server_token_program {
                     return Err(Error::Other(
                         "Requirements token program does not match server-configured token program"
@@ -766,16 +844,13 @@ impl X402 {
         Ok(())
     }
 
-    /// True if `currency` is one this X402 instance is configured to accept.
-    /// Single-currency mode (`accepted_currencies = None`) only accepts an
-    /// exact match against `Config.currency`. Multi-currency mode checks
-    /// the explicit list.
+    /// True if `currency` is one of the symbols this X402 instance is
+    /// configured to accept (`Config.currencies`).
     fn is_accepted_currency(&self, currency: &str) -> bool {
-        if let Some(list) = &self.config.accepted_currencies {
-            list.iter().any(|c| c == currency)
-        } else {
-            currency == self.config.currency
-        }
+        self.config
+            .currencies
+            .iter()
+            .any(|c| c.currency == currency)
     }
 }
 
@@ -890,16 +965,33 @@ mod tests {
     fn config() -> Config {
         Config {
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
-            currency: "USDC".to_string(),
-            decimals: 6,
+            currencies: vec![CurrencyConfig {
+                currency: "USDC".to_string(),
+                decimals: 6,
+                token_program: None,
+            }],
             network: "devnet".to_string(),
             rpc_url: Some("http://localhost:8899".to_string()),
             resource: "/fortune".to_string(),
             description: Some("Fortune".to_string()),
             max_age: Some(60),
-            token_program: None,
-            accepted_currencies: None,
             fee_payer_key: None,
+        }
+    }
+
+    /// Build a `Config` like `config()` but offering the given currency symbols
+    /// (each 6 decimals, program derived from the symbol).
+    fn multi_currency_config(symbols: &[&str]) -> Config {
+        Config {
+            currencies: symbols
+                .iter()
+                .map(|s| CurrencyConfig {
+                    currency: s.to_string(),
+                    decimals: 6,
+                    token_program: None,
+                })
+                .collect(),
+            ..config()
         }
     }
 
@@ -925,8 +1017,8 @@ mod tests {
         let cfg = config();
         let x402 = X402::new(cfg.clone()).unwrap();
         assert_eq!(x402.recipient(), cfg.recipient);
-        assert_eq!(x402.currency(), cfg.currency);
-        assert_eq!(x402.decimals(), cfg.decimals);
+        assert_eq!(x402.currency(), cfg.currencies[0].currency);
+        assert_eq!(x402.decimals(), cfg.currencies[0].decimals);
         assert_eq!(x402.network(), cfg.network);
         assert_eq!(x402.rpc_url(), cfg.rpc_url.unwrap());
     }
@@ -1179,8 +1271,7 @@ mod tests {
     /// A multi-option 402 envelope advertises every offered currency.
     #[test]
     fn exact_with_payment_options_advertises_each_option() {
-        let mut cfg = config();
-        cfg.accepted_currencies = Some(vec!["USDC".to_string(), "PYUSD".to_string()]);
+        let cfg = multi_currency_config(&["USDC", "PYUSD"]);
         let x402 = X402::new(cfg).unwrap();
 
         let envelope = x402
@@ -1206,8 +1297,7 @@ mod tests {
     /// one offer doesn't match".
     #[tokio::test]
     async fn process_payment_with_options_rejects_unmatched_credential() {
-        let mut cfg = config();
-        cfg.accepted_currencies = Some(vec!["USDC".to_string(), "PYUSD".to_string()]);
+        let cfg = multi_currency_config(&["USDC", "PYUSD"]);
         let x402 = X402::new(cfg).unwrap();
 
         let options = [
@@ -1293,13 +1383,74 @@ mod tests {
         assert_eq!(matched.currency, "USDC");
     }
 
+    /// The SINGLE-method gateway path (`exact_with_options`, called by
+    /// `payment_required_header`) must fan out one `accepts[]` entry per
+    /// configured currency when `accepted_currencies` is set — this is the
+    /// bug fix: previously it ignored the list and emitted a single accept.
+    #[test]
+    fn exact_with_options_fans_out_accepted_currencies() {
+        let cfg = multi_currency_config(&["USDC", "PYUSD"]);
+        let x402 = X402::new(cfg).unwrap();
+
+        let envelope = x402
+            .exact_with_options("1.0", ExactOptions::default())
+            .unwrap();
+        assert_eq!(envelope.accepts.len(), 2);
+        assert_eq!(envelope.accepts[0].currency, "USDC");
+        assert_eq!(envelope.accepts[1].currency, "PYUSD");
+        // Distinct token programs per currency (legacy SPL for USDC,
+        // Token-2022 for PYUSD).
+        assert_ne!(
+            envelope.accepts[0].token_program,
+            envelope.accepts[1].token_program
+        );
+    }
+
+    #[test]
+    fn exact_with_options_stamps_same_cached_blockhash_on_all_currencies() {
+        let cache = crate::core::blockhash::BlockhashCache::new();
+        let blockhash = Hash::new_from_array([7u8; 32]).to_string();
+        cache.set(blockhash.clone(), 123_456);
+        let x402 = X402::new(multi_currency_config(&["USDC", "PYUSD"]))
+            .unwrap()
+            .with_blockhash_cache(cache);
+
+        let envelope = x402
+            .exact_with_options("1.0", ExactOptions::default())
+            .unwrap();
+
+        assert_eq!(envelope.accepts.len(), 2);
+        for accept in &envelope.accepts {
+            assert_eq!(accept.recent_blockhash.as_deref(), Some(blockhash.as_str()));
+            assert_eq!(
+                accept
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.get("lastValidBlockHeight"))
+                    .and_then(|height| height.as_str()),
+                Some("123456")
+            );
+        }
+    }
+
+    /// With `accepted_currencies = None`, the single method behaves exactly as
+    /// before: a single-entry `accepts`.
+    #[test]
+    fn exact_with_options_single_currency_unchanged() {
+        let x402 = X402::new(config()).unwrap();
+        let envelope = x402
+            .exact_with_options("1.0", ExactOptions::default())
+            .unwrap();
+        assert_eq!(envelope.accepts.len(), 1);
+        assert_eq!(envelope.accepts[0].currency, "USDC");
+    }
+
     /// Tier-2 backstop for multi-currency: even if a route hand-builds
     /// requirements with a currency the X402 instance isn't configured to
     /// accept, the verifier rejects.
     #[tokio::test]
     async fn tier2_rejects_currency_not_in_accepted_list() {
-        let mut cfg = config();
-        cfg.accepted_currencies = Some(vec!["USDC".to_string(), "PYUSD".to_string()]);
+        let cfg = multi_currency_config(&["USDC", "PYUSD"]);
         let x402 = X402::new(cfg).unwrap();
 
         // Forge requirements for USDG (not in the accepted list).
@@ -1362,8 +1513,15 @@ mod tests {
             .process_payment(&header, "1.0", ExactOptions::default())
             .await
             .unwrap_err();
+        // `process_payment` now uniformly routes through `find_matching_requirement`
+        // (the same path as the multi-option API). A credential whose `accepted`
+        // lies about the amount fails to match the single offered option, so the
+        // rejection surfaces as a no-match error rather than a targeted "amount
+        // mismatch" — either way the cross-route replay is rejected before
+        // settlement.
+        let msg = err.to_string().to_lowercase();
         assert!(
-            err.to_string().to_lowercase().contains("amount"),
+            msg.contains("amount") || msg.contains("does not match any offered"),
             "got: {err:?}"
         );
     }

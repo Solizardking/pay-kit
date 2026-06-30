@@ -16,7 +16,7 @@ use crate::core::payment_channels as pc;
 use crate::x402::error::Error;
 use crate::x402::protocol::schemes::upto::{
     UptoPayload, UptoRequiredEnvelope, UptoRequirements, UptoSignatureEnvelope,
-    PROFILE_PAYMENT_CHANNEL, UPTO_SCHEME,
+    UPTO_ASSET_TRANSFER_METHOD, UPTO_SCHEME,
 };
 use crate::x402::{PAYMENT_REQUIRED_HEADER, X402_VERSION_V2};
 
@@ -31,24 +31,35 @@ pub async fn build_upto_payload(
     expires_at: i64,
     nonce: impl Into<String>,
 ) -> Result<UptoPayload, Error> {
-    if !requirements
-        .extra
-        .profiles
-        .iter()
-        .any(|p| p == PROFILE_PAYMENT_CHANNEL)
-    {
+    if requirements.extra.asset_transfer_method != UPTO_ASSET_TRANSFER_METHOD {
         return Err(Error::Other(
-            "requirement does not advertise the payment-channel profile".to_string(),
+            "requirement does not use the payment-channel asset transfer method".to_string(),
         ));
     }
 
     let max = requirements.max_amount()?;
-    let payee = Pubkey::from_str(&requirements.pay_to)
-        .map_err(|e| Error::Other(format!("invalid payTo: {e}")))?;
     let mint = Pubkey::from_str(&requirements.asset)
         .map_err(|e| Error::Other(format!("invalid asset mint: {e}")))?;
-    let operator = Pubkey::from_str(&requirements.extra.fee_payer)
-        .map_err(|e| Error::Other(format!("invalid feePayer: {e}")))?;
+    // EVM-aligned: `facilitatorAddress` is the settler/operator. The Solana
+    // channel program requires the channel payee == the settle signer, so the
+    // channel is opened with payee = facilitator and the beneficiary (`payTo`)
+    // is paid via a derived distribution split of `10000 - facilitatorFee`.
+    let operator = Pubkey::from_str(&requirements.extra.facilitator_address)
+        .map_err(|e| Error::Other(format!("invalid facilitatorAddress: {e}")))?;
+    let beneficiary = Pubkey::from_str(&requirements.pay_to)
+        .map_err(|e| Error::Other(format!("invalid payTo: {e}")))?;
+    let recipients = if beneficiary == operator {
+        // Facilitator is the beneficiary — it keeps 100%, no split needed.
+        Vec::new()
+    } else {
+        let bps = 10_000u16
+            .checked_sub(requirements.extra.facilitator_fee)
+            .ok_or_else(|| Error::Other("facilitatorFee exceeds 100%".to_string()))?;
+        vec![pc::Distribution {
+            recipient: beneficiary,
+            bps,
+        }]
+    };
     let program_id = match &requirements.extra.channel_program {
         Some(value) => {
             Pubkey::from_str(value).map_err(|e| Error::Other(format!("invalid programId: {e}")))?
@@ -73,13 +84,13 @@ pub async fn build_upto_payload(
     // operator is both the voucher signer (authorized_signer) and the fee payer.
     let open = pc::build_open_payment_channel_tx(
         payer_signer,
-        &payee,
+        &operator, // channel payee/merchant == authorized_signer == fee_payer
         &mint,
         &operator,
         salt,
         max,
         pc::DEFAULT_GRACE_PERIOD_SECONDS,
-        vec![],
+        recipients,
         &token_program,
         &program_id,
         &operator,
@@ -88,7 +99,6 @@ pub async fn build_upto_payload(
     .await?;
 
     Ok(UptoPayload {
-        profile: PROFILE_PAYMENT_CHANNEL.to_string(),
         from: pc::pubkey_string(&payer_signer.pubkey()),
         max_amount: max.to_string(),
         expires_at,
@@ -98,7 +108,6 @@ pub async fn build_upto_payload(
         deposit: max.to_string(),
         authorized_signer: pc::pubkey_string(&operator),
         open_transaction: Some(open.transaction),
-        signature: None,
     })
 }
 
@@ -135,11 +144,23 @@ pub async fn build_upto_header(
     encode_upto_header(requirements, payload)
 }
 
-/// Parse a 402 `upto` challenge from a `PAYMENT-REQUIRED` header value or body.
+/// Parse a 402 `upto` challenge from a `PAYMENT-REQUIRED` header value or body,
+/// returning the first advertised `upto` requirement. Use [`parse_upto_accepts`]
+/// to consider every advertised currency.
 pub fn parse_upto_challenge(
     headers: &[(String, String)],
     body: Option<&str>,
 ) -> Option<UptoRequirements> {
+    parse_upto_accepts(headers, body).into_iter().next()
+}
+
+/// Parse *all* `upto` requirements advertised on a 402 (every `scheme == "upto"`
+/// `accepts` entry), so a balance- and cost-aware selector can choose among the
+/// offered currencies — not just the first. Empty when none are present.
+pub fn parse_upto_accepts(
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Vec<UptoRequirements> {
     let from_header = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(PAYMENT_REQUIRED_HEADER))
@@ -148,13 +169,17 @@ pub fn parse_upto_challenge(
         })
         .and_then(|bytes| serde_json::from_slice::<UptoRequiredEnvelope>(&bytes).ok());
 
-    let envelope = from_header
-        .or_else(|| body.and_then(|b| serde_json::from_str::<UptoRequiredEnvelope>(b).ok()))?;
+    let Some(envelope) = from_header
+        .or_else(|| body.and_then(|b| serde_json::from_str::<UptoRequiredEnvelope>(b).ok()))
+    else {
+        return Vec::new();
+    };
 
     envelope
         .accepts
         .into_iter()
-        .find(|req| req.scheme == UPTO_SCHEME)
+        .filter(|req| req.scheme == UPTO_SCHEME)
+        .collect()
 }
 
 #[cfg(test)]
@@ -173,10 +198,10 @@ mod tests {
             pay_to: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             max_timeout_seconds: 300,
             extra: UptoExtra {
-                profiles: vec![PROFILE_PAYMENT_CHANNEL.to_string()],
-                decimals: Some(6),
+                asset_transfer_method: UPTO_ASSET_TRANSFER_METHOD.to_string(),
                 token_program: None,
-                fee_payer: OPERATOR.to_string(),
+                facilitator_address: OPERATOR.to_string(),
+                facilitator_fee: 0,
                 channel_program: None,
                 recent_blockhash: Some(Hash::default().to_string()),
                 last_valid_block_height: None,
@@ -187,7 +212,6 @@ mod tests {
 
     fn sample_payload() -> UptoPayload {
         UptoPayload {
-            profile: PROFILE_PAYMENT_CHANNEL.to_string(),
             from: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             max_amount: "1000000".to_string(),
             expires_at: 4_102_444_800,
@@ -197,7 +221,6 @@ mod tests {
             deposit: "1000000".to_string(),
             authorized_signer: OPERATOR.to_string(),
             open_transaction: Some("tx".to_string()),
-            signature: None,
         }
     }
 
@@ -231,7 +254,7 @@ mod tests {
 
         let parsed = parse_upto_challenge(&headers, None).unwrap();
         assert_eq!(parsed.amount, "1000000");
-        assert_eq!(parsed.extra.fee_payer, OPERATOR);
+        assert_eq!(parsed.extra.facilitator_address, OPERATOR);
     }
 
     #[test]
