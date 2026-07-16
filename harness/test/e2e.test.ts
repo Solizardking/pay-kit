@@ -1073,30 +1073,35 @@ function expectPaymentChannelSettlement(
   scenarioEnv: Record<string, string>,
 ): void {
   const actual = primaryDelta(scenario);
+  // The split tail is always the explicit single payTo entry now, so every
+  // settlement carries an idempotent recipient-ATA create before distribute.
   if (actual === 0n) {
     expect(
       message.instructions,
       "x402-upto zero-actual settlement instruction count",
-    ).toHaveLength(4);
+    ).toHaveLength(5);
   } else {
     expect(
       message.instructions,
       "x402-upto settlement instruction count",
-    ).toHaveLength(5);
+    ).toHaveLength(6);
   }
 
   let settle: (typeof message.instructions)[number];
   let createPayee: (typeof message.instructions)[number];
   let createTreasury: (typeof message.instructions)[number];
+  let createRecipient: (typeof message.instructions)[number];
   let distribute: (typeof message.instructions)[number];
   if (actual === 0n) {
-    [settle, createPayee, createTreasury, distribute] = message.instructions;
+    [settle, createPayee, createTreasury, createRecipient, distribute] =
+      message.instructions;
   } else {
     const [
       verify,
       nonZeroSettle,
       nonZeroCreatePayee,
       nonZeroCreateTreasury,
+      nonZeroCreateRecipient,
       nonZeroDistribute,
     ] = message.instructions;
     expect(accountAt(message, verify.programAddressIndex)).toBe(
@@ -1114,6 +1119,7 @@ function expectPaymentChannelSettlement(
     settle = nonZeroSettle;
     createPayee = nonZeroCreatePayee;
     createTreasury = nonZeroCreateTreasury;
+    createRecipient = nonZeroCreateRecipient;
     distribute = nonZeroDistribute;
   }
 
@@ -1130,11 +1136,16 @@ function expectPaymentChannelSettlement(
     throw new Error(`x402-upto scenario ${scenario.id} has no SPL mint`);
   }
   const tokenProgram = tokenProgramAddress(scenario.tokenProgram);
+  // The channel payee seat is held by the fee payer (zero-share); 100% of
+  // the settled amount flows to payTo through the explicit distribution
+  // recipient. The harness fixture runs feePayer, receiverAuthorizer, and
+  // payTo on one keypair, so the payee ATA and the recipient ATA coincide.
   const payeeAta = surfnet.getAta(
     primaryRecipientForScenario(scenario, scenarioEnv),
     mint,
     tokenProgram,
   );
+  const recipientAta = payeeAta;
   const treasuryAta = surfnet.getAta(
     PAYMENT_CHANNEL_TREASURY_OWNER,
     mint,
@@ -1142,7 +1153,7 @@ function expectPaymentChannelSettlement(
   );
 
   expectIdempotentAtaCreationInstruction(message, createPayee, {
-    ata: payeeAta,
+    ata: recipientAta,
     owner: primaryRecipientForScenario(scenario, scenarioEnv),
     mint,
     tokenProgram,
@@ -1153,13 +1164,22 @@ function expectPaymentChannelSettlement(
     mint,
     tokenProgram,
   });
+  expectIdempotentAtaCreationInstruction(message, createRecipient, {
+    ata: recipientAta,
+    owner: primaryRecipientForScenario(scenario, scenarioEnv),
+    mint,
+    tokenProgram,
+  });
 
   expect(accountAt(message, distribute.programAddressIndex)).toBe(
     PAYMENT_CHANNEL_PROGRAM,
   );
   expect(distribute.data[0], "distribute discriminator").toBe(7);
+  // 11 fixed accounts plus the always-explicit single payTo recipient ATA:
+  // the zero-share payee never takes an implicit remainder, so the split
+  // tail is never empty.
   expect(distribute.accountIndices, "distribute account count").toHaveLength(
-    11,
+    12,
   );
   expect(accountAt(message, settle.accountIndices[1]), "settled channel").toBe(
     accountAt(message, distribute.accountIndices[0]),
@@ -1179,6 +1199,10 @@ function expectPaymentChannelSettlement(
     accountAt(message, distribute.accountIndices[10]),
     "self program",
   ).toBe(PAYMENT_CHANNEL_PROGRAM);
+  expect(
+    accountAt(message, distribute.accountIndices[11]),
+    "payTo recipient ATA",
+  ).toBe(recipientAta);
 }
 
 async function fetchTransactionBase64(
