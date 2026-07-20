@@ -58,17 +58,7 @@ pub struct Split {
 /// The simpler successor to the removed `multi_delegator` path. Both settle
 /// through the same batched worker; the difference is only who holds the
 /// channel's `authorized_signer`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum SettlementAuthority {
-    /// Client's ephemeral key signs each voucher (classic MPP push). Default —
-    /// preserves existing behavior.
-    #[default]
-    ClientVoucher,
-    /// Operator is the channel `authorized_signer` and signs settlement (the
-    /// x402 `upto` model). Usage metered server-side; one settlement at close.
-    Delegated,
-}
+pub use crate::mpp::protocol::intents::session::SessionSettlementAuthority as SettlementAuthority;
 
 impl SettlementAuthority {
     /// The channel `authorized_signer` to open with under this mode: the
@@ -112,6 +102,9 @@ pub struct SessionConfig {
     /// Minimum voucher increment (base units). 0 = no minimum.
     pub min_voucher_delta: u64,
 
+    /// Voucher signing authority, independent of transaction submission mode.
+    pub settlement_authority: SettlementAuthority,
+
     /// Forced-close grace period (seconds) used as the voucher settlement
     /// window: a non-zero voucher expiry MUST outlast this window so the
     /// operator can still redeem the voucher on-chain after the asynchronous
@@ -149,6 +142,7 @@ impl Default for SessionConfig {
             network: "mainnet".to_string(),
             program_id: None,
             min_voucher_delta: 0,
+            settlement_authority: SettlementAuthority::ClientVoucher,
             grace_period_seconds: payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
             modes: vec![SessionMode::Push],
             pull_voucher_strategy: None,
@@ -334,6 +328,7 @@ impl<S: ChannelStore> SessionServer<S> {
             } else {
                 None
             },
+            settlement_authority: self.config.settlement_authority,
             // Omit if only Push — clients assume Push when modes is absent.
             modes: if self.config.modes == [SessionMode::Push] {
                 vec![]
@@ -415,6 +410,14 @@ impl<S: ChannelStore> SessionServer<S> {
         // rentPayer pin. rentPayer is pinned to it below (slot-1 == operator).
         let operator = parse_required_operator(&self.config.operator)?;
 
+        if self.config.settlement_authority == SettlementAuthority::Delegated
+            && authorized_signer != operator
+        {
+            return Err(Error::Other(
+                "delegated settlement requires authorizedSigner to match the operator".to_string(),
+            ));
+        }
+
         if payee != expected_payee {
             return Err(Error::Other(
                 "payment-channel open payee does not match challenge recipient".to_string(),
@@ -486,6 +489,25 @@ impl<S: ChannelStore> SessionServer<S> {
     /// existing channel are rejected when the channel is sealed or when the
     /// payload's authorized signer differs from the stored one.
     pub async fn process_open(&self, payload: &OpenPayload) -> Result<ChannelState> {
+        self.process_open_inner(payload, true).await
+    }
+
+    /// Process an `open` action whose transaction the host already verified.
+    ///
+    /// This performs every payload, challenge, replay, and store validation in
+    /// [`Self::process_open`], but skips the RPC signature lookup. It is only
+    /// safe for host integrations that have independently validated the exact
+    /// open transaction, submitted it, and observed a successful on-chain
+    /// status before calling this method.
+    pub async fn process_preverified_open(&self, payload: &OpenPayload) -> Result<ChannelState> {
+        self.process_open_inner(payload, false).await
+    }
+
+    async fn process_open_inner(
+        &self,
+        payload: &OpenPayload,
+        verify_on_chain: bool,
+    ) -> Result<ChannelState> {
         let supports_mode = if self.config.modes.is_empty() {
             payload.mode == SessionMode::Push
         } else {
@@ -514,6 +536,18 @@ impl<S: ChannelStore> SessionServer<S> {
             )));
         }
 
+        if self.config.settlement_authority == SettlementAuthority::Delegated {
+            let operator = parse_required_operator(&self.config.operator)?;
+            let authorized_signer =
+                parse_pubkey_field(&payload.authorized_signer, "authorizedSigner")?;
+            if authorized_signer != operator {
+                return Err(Error::Other(
+                    "delegated settlement requires authorizedSigner to match the operator"
+                        .to_string(),
+                ));
+            }
+        }
+
         // On-chain verification: confirm the open transaction was accepted.
         //
         // Pull mode: host integrations submit server-broadcast transactions or
@@ -521,12 +555,14 @@ impl<S: ChannelStore> SessionServer<S> {
         // method. Skip tx-sig verification here.
         //
         // Push mode: verify the payment-channel open tx is confirmed before persisting.
-        if payload.mode == SessionMode::Push {
+        if verify_on_chain && payload.mode == SessionMode::Push {
             if let Some(ref rpc_url) = self.config.rpc_url {
-                verify_transaction_signature(&payload.signature, rpc_url, VerifiedTx::Open).map_err(|e| {
-                    tracing::warn!(signature = %payload.signature, %e, "open tx verification failed");
-                    e
-                })?;
+                verify_transaction_signature(&payload.signature, rpc_url, VerifiedTx::Open)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(signature = %payload.signature, %e, "open tx verification failed");
+                        e
+                    })?;
                 tracing::debug!(signature = %payload.signature, "open tx confirmed on-chain");
             }
         }
@@ -647,10 +683,12 @@ impl<S: ChannelStore> SessionServer<S> {
         // On-chain verification: confirm the top-up transaction was accepted
         // (same RPC path as process_open).
         if let Some(ref rpc_url) = self.config.rpc_url {
-            verify_transaction_signature(&payload.signature, rpc_url, VerifiedTx::TopUp).map_err(|e| {
-                tracing::warn!(signature = %payload.signature, %e, "top-up tx verification failed");
-                e
-            })?;
+            verify_transaction_signature(&payload.signature, rpc_url, VerifiedTx::TopUp)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(signature = %payload.signature, %e, "top-up tx verification failed");
+                    e
+                })?;
             tracing::debug!(signature = %payload.signature, "top-up tx confirmed on-chain");
         }
 
@@ -1141,6 +1179,11 @@ enum VerifiedTx {
 }
 
 #[cfg(feature = "server")]
+const TRANSACTION_STATUS_MAX_ATTEMPTS: usize = 60;
+#[cfg(feature = "server")]
+const TRANSACTION_STATUS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(feature = "server")]
 impl std::fmt::Display for VerifiedTx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -1150,15 +1193,34 @@ impl std::fmt::Display for VerifiedTx {
     }
 }
 
-/// Confirm that `sig_str` is a finalized, successful transaction on-chain.
+/// Confirm that `sig_str` is a successful transaction on-chain.
 ///
 /// `tx` names the transaction in error messages (see [`VerifiedTx`]).
-/// Uses the blocking `RpcClient` — consistent with the rest of this module.
-/// Returns an error if the signature is malformed, the tx was rejected, or
-/// the tx is not found (not yet processed or doesn't exist).
+/// Retries temporarily missing statuses because RPC providers may route
+/// consecutive requests to replicas with different visibility. Returns an
+/// error if the signature is malformed, the tx was rejected, or it remains
+/// unavailable after the bounded retry window.
 #[cfg(feature = "server")]
-fn verify_transaction_signature(sig_str: &str, rpc_url: &str, tx: VerifiedTx) -> Result<()> {
-    use solana_rpc_client::rpc_client::RpcClient;
+async fn verify_transaction_signature(sig_str: &str, rpc_url: &str, tx: VerifiedTx) -> Result<()> {
+    verify_transaction_signature_with_policy(
+        sig_str,
+        rpc_url,
+        tx,
+        TRANSACTION_STATUS_MAX_ATTEMPTS,
+        TRANSACTION_STATUS_RETRY_DELAY,
+    )
+    .await
+}
+
+#[cfg(feature = "server")]
+async fn verify_transaction_signature_with_policy(
+    sig_str: &str,
+    rpc_url: &str,
+    tx: VerifiedTx,
+    max_attempts: usize,
+    retry_delay: std::time::Duration,
+) -> Result<()> {
+    use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     use solana_signature::Signature;
     use std::str::FromStr;
 
@@ -1166,17 +1228,31 @@ fn verify_transaction_signature(sig_str: &str, rpc_url: &str, tx: VerifiedTx) ->
         .map_err(|e| Error::Other(format!("invalid {tx} tx signature '{sig_str}': {e}")))?;
 
     let rpc = RpcClient::new(rpc_url.to_string());
+    let max_attempts = max_attempts.max(1);
 
-    match rpc
-        .get_signature_status(&sig)
-        .map_err(|e| Error::Other(format!("RPC error verifying {tx} tx: {e}")))?
-    {
-        Some(Ok(())) => Ok(()),
-        Some(Err(e)) => Err(Error::Other(format!("{tx} tx was rejected on-chain: {e}"))),
-        None => Err(Error::Other(format!(
-            "{tx} tx '{sig_str}' not found — not yet confirmed or does not exist"
-        ))),
+    for attempt in 1..=max_attempts {
+        match rpc.get_signature_status(&sig).await {
+            Ok(Some(Ok(()))) => return Ok(()),
+            Ok(Some(Err(e))) => {
+                return Err(Error::Other(format!("{tx} tx was rejected on-chain: {e}")));
+            }
+            Ok(None) if attempt < max_attempts => tokio::time::sleep(retry_delay).await,
+            Ok(None) => break,
+            Err(error) if attempt < max_attempts => {
+                tracing::debug!(%error, attempt, "RPC error verifying {tx} tx, retrying");
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => {
+                return Err(Error::Other(format!(
+                    "RPC error verifying {tx} tx: {error}"
+                )));
+            }
+        }
     }
+
+    Err(Error::Other(format!(
+        "{tx} tx '{sig_str}' not found — not yet confirmed or does not exist"
+    )))
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey> {
@@ -1296,6 +1372,7 @@ mod tests {
                 network: "localnet".to_string(),
                 program_id: None,
                 min_voucher_delta: 0,
+                settlement_authority: SettlementAuthority::ClientVoucher,
                 grace_period_seconds: payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                 modes: vec![SessionMode::Push],
                 pull_voucher_strategy: None,
@@ -1317,6 +1394,7 @@ mod tests {
                 network: "localnet".to_string(),
                 program_id: None,
                 min_voucher_delta: min_delta,
+                settlement_authority: SettlementAuthority::ClientVoucher,
                 grace_period_seconds: payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                 modes: vec![SessionMode::Push],
                 pull_voucher_strategy: None,
@@ -1374,6 +1452,42 @@ mod tests {
         assert_eq!(state.cumulative, 0);
         assert!(!state.sealed);
         assert_eq!(state.authorized_signer, "signer1");
+    }
+
+    #[tokio::test]
+    async fn process_preverified_open_skips_rpc_lookup() {
+        let server = SessionServer::new(
+            SessionConfig {
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                ..make_server().config
+            },
+            MemoryChannelStore::new(),
+        );
+
+        let state = server
+            .process_preverified_open(&open_payload("chan1", 1_000_000, "signer1"))
+            .await
+            .unwrap();
+
+        assert_eq!(state.channel_id, "chan1");
+        assert_eq!(state.deposit, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn delegated_open_rejects_non_operator_authorized_signer() {
+        let server = SessionServer::new(
+            SessionConfig {
+                settlement_authority: SettlementAuthority::Delegated,
+                ..make_server().config
+            },
+            MemoryChannelStore::new(),
+        );
+        let payload = open_payload("chan1", 1_000_000, &Pubkey::new_unique().to_string());
+
+        let err = server.process_preverified_open(&payload).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("delegated settlement requires authorizedSigner to match the operator"));
     }
 
     #[tokio::test]
@@ -1513,6 +1627,20 @@ mod tests {
                 .program_id,
             payment_channels::to_address(&expected.program_id)
         );
+
+        let delegated_server = SessionServer::new(
+            SessionConfig {
+                settlement_authority: SettlementAuthority::Delegated,
+                ..server.config.clone()
+            },
+            MemoryChannelStore::new(),
+        );
+        let err = delegated_server
+            .payment_channel_open_params(&payload)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("authorizedSigner to match the operator"));
 
         let mut wrong_payee = payload.clone();
         wrong_payee.payee = Some(payment_channels::pubkey_string(&Pubkey::new_unique()));
@@ -1917,6 +2045,7 @@ mod tests {
             network: "mainnet".to_string(),
             program_id: None,
             min_voucher_delta: 0,
+            settlement_authority: SettlementAuthority::ClientVoucher,
             grace_period_seconds: payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
             modes: vec![SessionMode::Push],
             pull_voucher_strategy: None,
@@ -1940,6 +2069,7 @@ mod tests {
             network: "localnet".to_string(),
             program_id: None,
             min_voucher_delta: 500,
+            settlement_authority: SettlementAuthority::ClientVoucher,
             grace_period_seconds: payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
             modes: vec![SessionMode::Push],
             pull_voucher_strategy: None,
@@ -1969,6 +2099,7 @@ mod tests {
             network: "localnet".to_string(),
             program_id: None,
             min_voucher_delta: 0,
+            settlement_authority: SettlementAuthority::ClientVoucher,
             grace_period_seconds: payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
             modes: vec![SessionMode::Push, SessionMode::Pull],
             pull_voucher_strategy: Some(SessionPullVoucherStrategy::ClientVoucher),
@@ -2709,5 +2840,127 @@ mod tests {
                 || err.to_string().contains("close"),
             "Expected double-close error, got: {err}"
         );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn transaction_verification_retries_until_status_is_visible() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        async fn signature_status(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            let status = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Value::Null
+            } else {
+                json!({
+                    "slot": 1,
+                    "confirmations": null,
+                    "err": null,
+                    "confirmationStatus": "finalized",
+                    "status": { "Ok": null }
+                })
+            };
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {
+                    "context": { "slot": 1 },
+                    "value": [status]
+                }
+            }))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/", post(signature_status))
+            .with_state(Arc::clone(&calls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let signature = solana_signature::Signature::from([7_u8; 64]).to_string();
+
+        verify_transaction_signature_with_policy(
+            &signature,
+            &rpc_url,
+            VerifiedTx::Open,
+            2,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn transaction_verification_retries_after_rpc_error() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        async fn signature_status(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"].clone(),
+                    "error": {
+                        "code": -32005,
+                        "message": "Node is unhealthy"
+                    }
+                }));
+            }
+
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {
+                    "context": { "slot": 1 },
+                    "value": [{
+                        "slot": 1,
+                        "confirmations": null,
+                        "err": null,
+                        "confirmationStatus": "finalized",
+                        "status": { "Ok": null }
+                    }]
+                }
+            }))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/", post(signature_status))
+            .with_state(Arc::clone(&calls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let signature = solana_signature::Signature::from([7_u8; 64]).to_string();
+
+        verify_transaction_signature_with_policy(
+            &signature,
+            &rpc_url,
+            VerifiedTx::Open,
+            2,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }
