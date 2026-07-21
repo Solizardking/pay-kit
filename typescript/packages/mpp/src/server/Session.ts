@@ -17,6 +17,7 @@ import type {
     SessionMode,
     SessionPullVoucherStrategy,
     SessionRequest,
+    SessionSettlementAuthority,
     SessionSplit,
     SignedVoucher,
 } from '../shared/session-types.js';
@@ -102,6 +103,7 @@ export function session(parameters: session.Parameters) {
         programId,
         modes,
         pullVoucherStrategy,
+        settlementAuthority = 'clientVoucher',
         splits,
         pricing,
         rpc,
@@ -241,6 +243,7 @@ export function session(parameters: session.Parameters) {
                 ...(recentBlockhash ? { recentBlockhash } : {}),
                 ...(recentSlot ? { recentSlot } : {}),
                 recipient,
+                settlementAuthority,
                 ...(splits?.length ? { splits: [...splits] } : {}),
             };
 
@@ -272,6 +275,7 @@ export function session(parameters: session.Parameters) {
                         pullVoucherStrategy,
                         recipient,
                         rpc,
+                        settlementAuthority,
                         store,
                     });
                 case 'voucher':
@@ -422,6 +426,7 @@ interface HandleOpenArgs {
     readonly pullVoucherStrategy: SessionPullVoucherStrategy | undefined;
     readonly recipient: string;
     readonly rpc: RpcLike | undefined;
+    readonly settlementAuthority: SessionSettlementAuthority;
     readonly store: SessionStore;
 }
 
@@ -433,6 +438,9 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
     }
     if (mode === 'pull' && !args.pullVoucherStrategy) {
         throw new Error('pull-mode open requires a pullVoucherStrategy on the server config');
+    }
+    if (args.settlementAuthority === 'delegated' && payload.authorizedSigner !== args.operator) {
+        throw new Error('delegated settlement requires authorizedSigner to match the operator');
     }
 
     let channelId: string;
@@ -1282,6 +1290,8 @@ export declare namespace session {
         readonly rpc?: RpcLike;
         /** RPC URL for blockhash prefetch. Defaults from `network`. */
         readonly rpcUrl?: string;
+        /** Voucher signing authority advertised by this session. */
+        readonly settlementAuthority?: SessionSettlementAuthority;
         /**
          * Settlement window in seconds — the forced-close grace period a
          * non-zero voucher `expiresAt` must outlast. When set, a voucher

@@ -30,6 +30,9 @@ export type SessionMode = 'pull' | 'push';
  */
 export type SessionPullVoucherStrategy = 'clientVoucher' | 'operatedVoucher';
 
+/** Voucher signing authority advertised by a session challenge. */
+export type SessionSettlementAuthority = 'clientVoucher' | 'delegated';
+
 /**
  * Signer capable of Ed25519-signing exact voucher message bytes.
  */
@@ -77,6 +80,8 @@ export interface SessionRequest extends Record<string, unknown> {
     readonly recentSlot?: number | string | undefined;
     /** Primary recipient of the settled amount (base58). */
     readonly recipient: string;
+    /** Voucher signing authority; absent challenges default to client vouchers. */
+    readonly settlementAuthority?: SessionSettlementAuthority | undefined;
     /** Basis-point splits distributed at close. */
     readonly splits?: SessionSplit[] | undefined;
 }
@@ -530,7 +535,7 @@ export class ActiveSession {
     ): OpenPayload & { readonly action: 'open' } {
         return {
             action: 'open',
-            authorizedSigner: this.authorizedSigner,
+            authorizedSigner: options.authorizedSigner ?? this.authorizedSigner,
             channelId: this.#channelId,
             deposit: formatAmount(deposit, 'deposit'),
             mode: options.mode ?? 'push',
@@ -547,7 +552,7 @@ export class ActiveSession {
     ): OpenPayload & { readonly action: 'open' } {
         return {
             action: 'open',
-            authorizedSigner: this.authorizedSigner,
+            authorizedSigner: parameters.authorizedSigner ?? this.authorizedSigner,
             channelId: this.#channelId,
             deposit: formatAmount(parameters.deposit, 'deposit'),
             gracePeriod: parameters.gracePeriod,
@@ -569,7 +574,7 @@ export class ActiveSession {
         return {
             action: 'open',
             approvedAmount: formatAmount(parameters.approvedAmount, 'approvedAmount'),
-            authorizedSigner: this.authorizedSigner,
+            authorizedSigner: parameters.authorizedSigner ?? this.authorizedSigner,
             ...(parameters.initMultiDelegateTx ? { initMultiDelegateTx: parameters.initMultiDelegateTx } : {}),
             mode: 'pull',
             owner: parameters.owner,
@@ -625,6 +630,8 @@ export declare namespace ActiveSession {
     }
 
     interface OpenOptions {
+        /** Authorized voucher signer; delegated sessions use the advertised operator. */
+        readonly authorizedSigner?: string | undefined;
         /** Funding mode. Defaults to `push`. */
         readonly mode?: SessionMode | undefined;
         /** Base64 signed open transaction for server-side submission. */
@@ -653,6 +660,8 @@ export declare namespace ActiveSession {
     interface PullOpenParameters {
         /** Delegated amount approved by the wallet, in base units. */
         readonly approvedAmount: AmountLike;
+        /** Authorized voucher signer; delegated sessions use the advertised operator. */
+        readonly authorizedSigner?: string | undefined;
         /** Pre-signed multi-delegate init transaction (base64), when the PDA may not exist yet. */
         readonly initMultiDelegateTx?: string | undefined;
         /** Wallet that owns the delegated token account (base58). */
@@ -769,6 +778,7 @@ function createOpenAction(
     if (mode === 'pull' && shouldUseDelegatedPull(context, challenge)) {
         return session_.openPullAction({
             approvedAmount: context.approvedAmount ?? context.deposit ?? challenge.request.cap,
+            authorizedSigner: delegatedAuthorizedSigner(challenge),
             initMultiDelegateTx: context.initMultiDelegateTx,
             owner: requireString(context.owner, 'owner'),
             signature,
@@ -786,6 +796,7 @@ function createOpenAction(
         context.gracePeriod !== undefined
     ) {
         return session_.openPaymentChannelAction({
+            authorizedSigner: delegatedAuthorizedSigner(challenge),
             deposit: context.deposit ?? challenge.request.cap,
             gracePeriod: requireValue(context.gracePeriod, 'gracePeriod'),
             mint: requireString(context.mint, 'mint'),
@@ -800,9 +811,14 @@ function createOpenAction(
     }
 
     return session_.openAction(context.deposit ?? challenge.request.cap, signature, {
+        authorizedSigner: delegatedAuthorizedSigner(challenge),
         mode,
         transaction: context.transaction,
     });
+}
+
+function delegatedAuthorizedSigner(challenge: SessionChallenge): string | undefined {
+    return challenge.request.settlementAuthority === 'delegated' ? challenge.request.operator : undefined;
 }
 
 function shouldUseDelegatedPull(context: SessionContext, challenge: SessionChallenge): boolean {
