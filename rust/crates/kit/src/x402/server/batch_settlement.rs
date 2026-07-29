@@ -25,9 +25,12 @@ use solana_transaction::Transaction;
 use crate::core::payment_channels as pc;
 use crate::core::payment_channels::generated::accounts::Channel;
 use crate::core::session::{accept_voucher, VoucherAcceptance};
-use crate::core::settlement::packing::{pack, ChannelInstructions, DEFAULT_MAX_CHANNELS_PER_TX};
 use crate::core::store::{ChannelState, ChannelStore, MemoryChannelStore, StoreError};
 use crate::core::voucher::verify_voucher_signature;
+use crate::core::{
+    payment_channels::MAX_VOUCHER_SETTLEMENTS_PER_TX,
+    settlement::packing::{pack, ChannelInstructionGroup},
+};
 
 use crate::x402::error::Error;
 use crate::x402::protocol::schemes::batch_settlement::{
@@ -492,6 +495,7 @@ impl X402BatchSettlement {
                     next_delivery_sequence: 0,
                     pending_deliveries: vec![],
                     committed_deliveries: vec![],
+                    lifecycle: None,
                 },
             )
             .await
@@ -751,7 +755,7 @@ impl X402BatchSettlement {
                 expires_at,
                 &program_id,
             )?;
-            pending.push(ChannelInstructions {
+            pending.push(ChannelInstructionGroup {
                 channel_id: state.channel_id.clone(),
                 instructions: ixs,
             });
@@ -760,7 +764,7 @@ impl X402BatchSettlement {
         // Shared, byte-bounded packing (same as the mpp settlement worker) —
         // groups channels into <=1232-byte legacy transactions.
         let mut signatures = Vec::new();
-        for group in pack(pending, &self.operator, DEFAULT_MAX_CHANNELS_PER_TX) {
+        for group in pack(pending, &self.operator, MAX_VOUCHER_SETTLEMENTS_PER_TX) {
             let instructions: Vec<_> = group.into_iter().flat_map(|c| c.instructions).collect();
             let blockhash = self
                 .rpc
@@ -963,6 +967,7 @@ mod tests {
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
             committed_deliveries: vec![],
+            lifecycle: None,
         }
     }
 

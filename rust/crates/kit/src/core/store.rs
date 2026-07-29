@@ -9,6 +9,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(feature = "redis-store")]
+use std::time::Duration;
+
+/// Default time to retain a finalized channel record for reconciliation,
+/// debugging, and idempotent retries before Redis removes it.
+#[cfg(feature = "redis-store")]
+pub const DEFAULT_FINALIZED_CHANNEL_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Async key-value store interface.
 pub trait Store: Send + Sync {
@@ -152,7 +159,31 @@ pub struct CommittedDelivery {
     pub voucher_signature: String,
 }
 
+/// Durable lifecycle scheduling metadata for a payment channel.
+///
+/// Request-serving processes only advance this deadline. A lifecycle worker
+/// reads it through [`ChannelStore::list_channels`] and owns the clock and
+/// close decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelLifecycle {
+    /// Ephemeral worker namespace used by an embedded lifecycle worker.
+    ///
+    /// Durable reconciliation workers may process every due channel regardless
+    /// of owner.
+    pub owner: String,
+
+    /// Unix timestamp in milliseconds after which the channel is idle.
+    #[serde(rename = "closeAfter")]
+    pub close_after: u64,
+}
+
 /// Persisted state of a payment channel, managed by the server.
+///
+/// # Breaking change
+///
+/// Lifecycle scheduling is part of the channel state contract. Consumers
+/// upgrading to this API must initialize [`ChannelState::lifecycle`] in struct
+/// literals, typically to `None` before the first store-backed touch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChannelState {
     /// On-chain channel address (base58).
@@ -218,12 +249,23 @@ pub struct ChannelState {
     /// Recently committed deliveries, kept for idempotent commit replay.
     #[serde(default)]
     pub committed_deliveries: Vec<CommittedDelivery>,
+
+    /// Store-backed idle-close deadline.
+    ///
+    /// The Serde default keeps existing persisted channel records readable.
+    /// Adding this public field is an intentional pre-1.0 Rust API change.
+    #[serde(default)]
+    pub lifecycle: Option<ChannelLifecycle>,
 }
 
 /// Async store for channel state with compare-and-swap watermark advancement.
 ///
 /// Implementations MUST guarantee that `advance_cumulative` is atomic to
 /// prevent double-spend under concurrent requests.
+///
+/// This trait deliberately requires the complete lifecycle contract. Custom
+/// stores must implement enumeration, touch, deletion, and finalization rather
+/// than inheriting defaults that fail only when a lifecycle worker runs.
 pub trait ChannelStore: Send + Sync {
     /// Return a weakly-consistent snapshot of every channel in this store's
     /// namespace.
@@ -251,6 +293,16 @@ pub trait ChannelStore: Send + Sync {
         state: ChannelState,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
 
+    /// Delete a terminal channel record.
+    ///
+    /// This operation is idempotent. Callers must first establish from the
+    /// authoritative chain state that the channel account no longer exists;
+    /// deleting a live record could discard an accepted voucher watermark.
+    fn delete_channel(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
+
     /// Atomically read-modify-write channel state.
     ///
     /// The `updater` closure receives the current state (None if absent) and
@@ -260,6 +312,15 @@ pub trait ChannelStore: Send + Sync {
         &self,
         channel_id: &str,
         updater: Box<dyn FnOnce(Option<ChannelState>) -> Result<ChannelState, StoreError> + Send>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>>;
+
+    /// Persist an idle-close deadline without allowing an older touch to move
+    /// an existing deadline backwards. Once close is claimed or the channel is
+    /// sealed, return the current state without changing its lifecycle.
+    fn touch_channel_lifecycle(
+        &self,
+        channel_id: &str,
+        lifecycle: ChannelLifecycle,
     ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>>;
 
     /// Atomically advance the settled watermark from `expected` to `new`.
@@ -282,6 +343,16 @@ pub trait ChannelStore: Send + Sync {
 
     /// Mark a channel as sealed (phase 1 close complete).
     fn mark_sealed(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
+
+    /// Mark a channel's lifecycle as fully finalized.
+    ///
+    /// Callers must not invoke this after only the phase-1 seal; all required
+    /// distribution work must be complete or the channel must already be
+    /// absent on-chain.
+    fn mark_finalized(
         &self,
         channel_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
@@ -312,12 +383,27 @@ where
         (**self).put_channel(channel_id, state)
     }
 
+    fn delete_channel(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        (**self).delete_channel(channel_id)
+    }
+
     fn update_channel(
         &self,
         channel_id: &str,
         updater: Box<dyn FnOnce(Option<ChannelState>) -> Result<ChannelState, StoreError> + Send>,
     ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
         (**self).update_channel(channel_id, updater)
+    }
+
+    fn touch_channel_lifecycle(
+        &self,
+        channel_id: &str,
+        lifecycle: ChannelLifecycle,
+    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
+        (**self).touch_channel_lifecycle(channel_id, lifecycle)
     }
 
     fn advance_cumulative(
@@ -342,6 +428,13 @@ where
         channel_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         (**self).mark_sealed(channel_id)
+    }
+
+    fn mark_finalized(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        (**self).mark_finalized(channel_id)
     }
 }
 
@@ -397,6 +490,14 @@ impl ChannelStore for MemoryChannelStore {
         Box::pin(async move { result })
     }
 
+    fn delete_channel(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        self.data.lock().unwrap().remove(channel_id);
+        Box::pin(async { Ok(()) })
+    }
+
     fn update_channel(
         &self,
         channel_id: &str,
@@ -413,6 +514,32 @@ impl ChannelStore for MemoryChannelStore {
                 }
                 Err(e) => Err(e),
             }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn touch_channel_lifecycle(
+        &self,
+        channel_id: &str,
+        lifecycle: ChannelLifecycle,
+    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
+        let result = {
+            let mut data = self.data.lock().unwrap();
+            let state = data
+                .get_mut(channel_id)
+                .ok_or_else(|| StoreError::Internal("Channel not found".to_string()));
+            state.map(|state| {
+                let replace = !state.sealed
+                    && state.close_requested_at.is_none()
+                    && state
+                        .lifecycle
+                        .as_ref()
+                        .is_none_or(|current| lifecycle.close_after >= current.close_after);
+                if replace {
+                    state.lifecycle = Some(lifecycle);
+                }
+                state.clone()
+            })
         };
         Box::pin(async move { result })
     }
@@ -462,23 +589,30 @@ impl ChannelStore for MemoryChannelStore {
             None => Box::pin(async { Err(StoreError::Internal("Channel not found".to_string())) }),
         }
     }
+
+    fn mark_finalized(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        self.mark_sealed(channel_id)
+    }
 }
 
 // ── Redis channel store ──
 
 /// Durable Redis-backed payment-channel state.
 ///
-/// Enabled by the `redis-store` feature. Every read/modify/write operation is
-/// guarded by a Lua compare-and-set, so multiple gateway instances cannot
-/// silently overwrite one another. A conflicting generic `update_channel`
-/// returns an error and is safe for the caller to retry; the dedicated
-/// `advance_cumulative` operation reports the conflict as `Ok(false)`, matching
-/// the [`ChannelStore`] contract.
+/// Enabled by the `redis-store` feature. Read/modify/write operations use Lua
+/// scripts so multiple gateway instances cannot silently overwrite one
+/// another. A conflicting generic `update_channel` returns an error and is
+/// safe for the caller to retry; dedicated operations use the atomic semantics
+/// required by their [`ChannelStore`] contracts.
 #[cfg(feature = "redis-store")]
 #[derive(Clone)]
 pub struct RedisChannelStore {
     connection: redis::aio::ConnectionManager,
     key_prefix: String,
+    finalized_retention_seconds: u64,
 }
 
 #[cfg(feature = "redis-store")]
@@ -492,6 +626,29 @@ impl RedisChannelStore {
         redis_url: &str,
         key_prefix: impl Into<String>,
     ) -> Result<Self, StoreError> {
+        Self::connect_with_finalized_retention(
+            redis_url,
+            key_prefix,
+            DEFAULT_FINALIZED_CHANNEL_RETENTION,
+        )
+        .await
+    }
+
+    /// Connect with a caller-selected finalized-record retention window.
+    ///
+    /// Durations shorter than one second are rejected instead of truncating
+    /// them to an immediate delete.
+    pub async fn connect_with_finalized_retention(
+        redis_url: &str,
+        key_prefix: impl Into<String>,
+        finalized_retention: Duration,
+    ) -> Result<Self, StoreError> {
+        let finalized_retention_seconds = finalized_retention.as_secs();
+        if finalized_retention_seconds == 0 {
+            return Err(StoreError::Internal(
+                "Finalized channel retention must be at least one second".to_string(),
+            ));
+        }
         let client = redis::Client::open(redis_url)
             .map_err(|e| StoreError::Internal(format!("Redis client: {e}")))?;
         let connection = client
@@ -501,6 +658,7 @@ impl RedisChannelStore {
         Ok(Self {
             connection,
             key_prefix: Self::namespace_key_prefix(key_prefix.into()),
+            finalized_retention_seconds,
         })
     }
 
@@ -553,7 +711,11 @@ if ARGV[1] == '0' then
 elseif (not current) or current ~= ARGV[2] then
   return 0
 end
-redis.call('SET', KEYS[1], ARGV[3])
+if ARGV[1] == '0' then
+  redis.call('SET', KEYS[1], ARGV[3])
+else
+  redis.call('SET', KEYS[1], ARGV[3], 'KEEPTTL')
+end
 return 1
 "#;
         let mut connection = self.connection.clone();
@@ -566,6 +728,84 @@ return 1
             .await
             .map_err(|e| StoreError::Internal(format!("Redis CAS: {e}")))?;
         Ok(updated == 1)
+    }
+
+    async fn mark_sealed_atomic(&self, channel_id: &str) -> Result<(), StoreError> {
+        // Mutate only the boolean field in one Redis script. Decoding and
+        // re-encoding through Lua cjson would coerce large u64 values through
+        // an imprecise floating-point representation.
+        const SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+
+local sealed_false = '"sealed":false'
+local sealed_true = '"sealed":true'
+if string.find(current, sealed_true, 1, true) then return 1 end
+
+local first, last = string.find(current, sealed_false, 1, true)
+if not first then return -1 end
+
+local updated = string.sub(current, 1, first - 1)
+  .. sealed_true
+  .. string.sub(current, last + 1)
+redis.call('SET', KEYS[1], updated, 'KEEPTTL')
+return 1
+"#;
+        let mut connection = self.connection.clone();
+        let result: i32 = redis::Script::new(SCRIPT)
+            .key(self.key(channel_id))
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|e| StoreError::Internal(format!("Redis mark sealed: {e}")))?;
+        match result {
+            1 => Ok(()),
+            0 => Err(StoreError::Internal("Channel not found".to_string())),
+            _ => Err(StoreError::Serialization(
+                "Channel record is missing its sealed field".to_string(),
+            )),
+        }
+    }
+
+    async fn mark_finalized_atomic(&self, channel_id: &str) -> Result<(), StoreError> {
+        // Apply the retention in the same script that flips the lifecycle bit.
+        // Repeated reconciliation of an already-finalized record only backfills
+        // a missing TTL; it never refreshes an existing expiry indefinitely.
+        const SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+
+local sealed_false = '"sealed":false'
+local sealed_true = '"sealed":true'
+if string.find(current, sealed_true, 1, true) then
+  if redis.call('TTL', KEYS[1]) == -1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+  end
+  return 1
+end
+
+local first, last = string.find(current, sealed_false, 1, true)
+if not first then return -1 end
+
+local updated = string.sub(current, 1, first - 1)
+  .. sealed_true
+  .. string.sub(current, last + 1)
+redis.call('SET', KEYS[1], updated, 'EX', ARGV[1])
+return 1
+"#;
+        let mut connection = self.connection.clone();
+        let result: i32 = redis::Script::new(SCRIPT)
+            .key(self.key(channel_id))
+            .arg(self.finalized_retention_seconds)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|e| StoreError::Internal(format!("Redis mark finalized: {e}")))?;
+        match result {
+            1 => Ok(()),
+            0 => Err(StoreError::Internal("Channel not found".to_string())),
+            _ => Err(StoreError::Serialization(
+                "Channel record is missing its sealed field".to_string(),
+            )),
+        }
     }
 
     fn decode(raw: &str) -> Result<ChannelState, StoreError> {
@@ -663,6 +903,22 @@ impl ChannelStore for RedisChannelStore {
         })
     }
 
+    fn delete_channel(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        let channel_id = channel_id.to_string();
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            redis::cmd("DEL")
+                .arg(self.key(&channel_id))
+                .query_async::<u64>(&mut connection)
+                .await
+                .map_err(|error| StoreError::Internal(format!("Redis DEL: {error}")))?;
+            Ok(())
+        })
+    }
+
     fn update_channel(
         &self,
         channel_id: &str,
@@ -683,6 +939,43 @@ impl ChannelStore for RedisChannelStore {
                 ));
             }
             Ok(new_state)
+        })
+    }
+
+    fn touch_channel_lifecycle(
+        &self,
+        channel_id: &str,
+        lifecycle: ChannelLifecycle,
+    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
+        let channel_id = channel_id.to_string();
+        Box::pin(async move {
+            const MAX_ATTEMPTS: usize = 8;
+            for _ in 0..MAX_ATTEMPTS {
+                let Some(current_raw) = self.get_raw(&channel_id).await? else {
+                    return Err(StoreError::Internal("Channel not found".to_string()));
+                };
+                let mut state = Self::decode(&current_raw)?;
+                let replace = !state.sealed
+                    && state.close_requested_at.is_none()
+                    && state
+                        .lifecycle
+                        .as_ref()
+                        .is_none_or(|current| lifecycle.close_after >= current.close_after);
+                if !replace {
+                    return Ok(state);
+                }
+                state.lifecycle = Some(lifecycle.clone());
+                let new_raw = Self::encode(&state)?;
+                if self
+                    .compare_and_set(&channel_id, Some(&current_raw), &new_raw)
+                    .await?
+                {
+                    return Ok(state);
+                }
+            }
+            Err(StoreError::Internal(
+                "Concurrent channel lifecycle updates; retry the request".to_string(),
+            ))
         })
     }
 
@@ -734,19 +1027,15 @@ impl ChannelStore for RedisChannelStore {
         channel_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         let channel_id = channel_id.to_string();
-        Box::pin(async move {
-            self.update_channel(
-                &channel_id,
-                Box::new(|state| {
-                    let mut state = state
-                        .ok_or_else(|| StoreError::Internal("Channel not found".to_string()))?;
-                    state.sealed = true;
-                    Ok(state)
-                }),
-            )
-            .await
-            .map(|_| ())
-        })
+        Box::pin(async move { self.mark_sealed_atomic(&channel_id).await })
+    }
+
+    fn mark_finalized(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        let channel_id = channel_id.to_string();
+        Box::pin(async move { self.mark_finalized_atomic(&channel_id).await })
     }
 }
 
@@ -794,6 +1083,7 @@ mod tests {
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
             committed_deliveries: vec![],
+            lifecycle: None,
         }
     }
 
@@ -810,6 +1100,125 @@ mod tests {
         assert_eq!(state.cumulative, 0);
         assert!(!state.sealed);
         assert_eq!(store.list_channels().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_store_delete_is_idempotent() {
+        let store = MemoryChannelStore::new();
+        store
+            .put_channel("c1", make_state("c1", 1_000_000))
+            .await
+            .unwrap();
+
+        store.delete_channel("c1").await.unwrap();
+        assert!(store.get_channel("c1").await.unwrap().is_none());
+        store.delete_channel("c1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_lifecycle_touch_is_store_backed_and_monotonic() {
+        let store = MemoryChannelStore::new();
+        store
+            .put_channel("c1", make_state("c1", 1_000_000))
+            .await
+            .unwrap();
+
+        let latest = ChannelLifecycle {
+            owner: "worker-b".to_string(),
+            close_after: 2_000,
+        };
+        store
+            .touch_channel_lifecycle("c1", latest.clone())
+            .await
+            .unwrap();
+        store
+            .touch_channel_lifecycle(
+                "c1",
+                ChannelLifecycle {
+                    owner: "worker-a".to_string(),
+                    close_after: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_channel("c1").await.unwrap().unwrap().lifecycle,
+            Some(latest.clone())
+        );
+
+        store
+            .update_channel(
+                "c1",
+                Box::new(|state| {
+                    let mut state = state.unwrap();
+                    state.close_requested_at = Some(2);
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        let claimed = store
+            .touch_channel_lifecycle(
+                "c1",
+                ChannelLifecycle {
+                    owner: "worker-c".to_string(),
+                    close_after: 3_000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.lifecycle, Some(latest));
+    }
+
+    #[tokio::test]
+    async fn channel_lifecycle_touch_does_not_update_sealed_memory_channel() {
+        let store = MemoryChannelStore::new();
+        store
+            .put_channel("c1", make_state("c1", 1_000_000))
+            .await
+            .unwrap();
+        let original = ChannelLifecycle {
+            owner: "worker-a".to_string(),
+            close_after: 1_000,
+        };
+        store
+            .touch_channel_lifecycle("c1", original.clone())
+            .await
+            .unwrap();
+        store.mark_sealed("c1").await.unwrap();
+
+        let touched = store
+            .touch_channel_lifecycle(
+                "c1",
+                ChannelLifecycle {
+                    owner: "worker-b".to_string(),
+                    close_after: 2_000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(touched.sealed);
+        assert_eq!(touched.lifecycle, Some(original));
+    }
+
+    #[test]
+    fn channel_state_without_lifecycle_remains_decodable() {
+        let persisted = serde_json::json!({
+            "channel_id": "c1",
+            "authorized_signer": "signer1",
+            "deposit": 1_000_000,
+            "cumulative": 42,
+            "sealed": false,
+            "highest_voucher_signature": null,
+            "highest_voucher_expires_at": null,
+            "close_requested_at": null,
+            "operator": null
+        });
+
+        let decoded: ChannelState = serde_json::from_value(persisted).unwrap();
+        assert!(decoded.lifecycle.is_none());
     }
 
     #[tokio::test]
@@ -859,6 +1268,20 @@ mod tests {
 
     #[cfg(feature = "redis-store")]
     #[tokio::test]
+    async fn redis_channel_store_rejects_subsecond_finalized_retention() {
+        for retention in [Duration::ZERO, Duration::from_millis(500)] {
+            let result = RedisChannelStore::connect_with_finalized_retention(
+                "redis://127.0.0.1/",
+                "test",
+                retention,
+            )
+            .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(feature = "redis-store")]
+    #[tokio::test]
     async fn redis_channel_store_roundtrip_and_atomic_watermark() {
         let redis_url = std::env::var("PAY_KIT_TEST_REDIS_URL")
             .expect("PAY_KIT_TEST_REDIS_URL is required for the Redis integration test");
@@ -891,14 +1314,152 @@ mod tests {
             100 | 200
         ));
 
+        let lifecycle = ChannelLifecycle {
+            owner: "redis-worker".to_string(),
+            close_after: 120_000,
+        };
+        store
+            .touch_channel_lifecycle("c1", lifecycle.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_channel("c1").await.unwrap().unwrap().lifecycle,
+            Some(lifecycle)
+        );
+
+        store
+            .put_channel("seal-race", make_state("seal-race", 1_000_000))
+            .await
+            .unwrap();
+        let sealing_store = store.clone();
+        let touching_store = store.clone();
+        let (sealed, touched) = tokio::join!(sealing_store.mark_sealed("seal-race"), async move {
+            for close_after in 1..=32 {
+                touching_store
+                    .touch_channel_lifecycle(
+                        "seal-race",
+                        ChannelLifecycle {
+                            owner: "concurrent-worker".to_string(),
+                            close_after,
+                        },
+                    )
+                    .await?;
+            }
+            Ok::<_, StoreError>(())
+        });
+        sealed.unwrap();
+        touched.unwrap();
+        assert!(
+            store
+                .get_channel("seal-race")
+                .await
+                .unwrap()
+                .unwrap()
+                .sealed
+        );
+
+        store
+            .put_channel("sealed-touch", make_state("sealed-touch", 1_000_000))
+            .await
+            .unwrap();
+        let original = ChannelLifecycle {
+            owner: "redis-worker-a".to_string(),
+            close_after: 1_000,
+        };
+        store
+            .touch_channel_lifecycle("sealed-touch", original.clone())
+            .await
+            .unwrap();
+        store.mark_sealed("sealed-touch").await.unwrap();
+        let touched = store
+            .touch_channel_lifecycle(
+                "sealed-touch",
+                ChannelLifecycle {
+                    owner: "redis-worker-b".to_string(),
+                    close_after: 2_000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(touched.sealed);
+        assert_eq!(touched.lifecycle, Some(original));
+        store.delete_channel("sealed-touch").await.unwrap();
+
         store.update_deposit("c1", 2_000_000).await.unwrap();
         store.mark_sealed("c1").await.unwrap();
         let state = store.get_channel("c1").await.unwrap().unwrap();
         assert_eq!(state.deposit, 2_000_000);
         assert!(state.sealed);
+
+        store
+            .put_channel("finalized", make_state("finalized", 1_000_000))
+            .await
+            .unwrap();
+        store.mark_sealed("finalized").await.unwrap();
+        let mut connection = store.connection.clone();
+        let ttl_before: i64 = redis::cmd("TTL")
+            .arg(store.key("finalized"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(ttl_before, -1, "phase-1 seal must not start retention");
+
+        store.mark_finalized("finalized").await.unwrap();
+        let ttl_after: i64 = redis::cmd("TTL")
+            .arg(store.key("finalized"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            ttl_after > 0 && ttl_after <= DEFAULT_FINALIZED_CHANNEL_RETENTION.as_secs() as i64,
+            "finalization must attach the bounded retention TTL"
+        );
+        store.mark_sealed("finalized").await.unwrap();
+        let ttl_after_reseal: i64 = redis::cmd("TTL")
+            .arg(store.key("finalized"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            ttl_after_reseal > 0 && ttl_after_reseal <= ttl_after,
+            "repeated sealing must preserve, not refresh, finalized retention"
+        );
+
+        store
+            .put_channel("sealed-with-ttl", make_state("sealed-with-ttl", 1_000_000))
+            .await
+            .unwrap();
+        redis::cmd("EXPIRE")
+            .arg(store.key("sealed-with-ttl"))
+            .arg(120)
+            .query_async::<bool>(&mut connection)
+            .await
+            .unwrap();
+        store.mark_sealed("sealed-with-ttl").await.unwrap();
+        let sealed_ttl: i64 = redis::cmd("TTL")
+            .arg(store.key("sealed-with-ttl"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            sealed_ttl > 0 && sealed_ttl <= 120,
+            "sealing an expiring record must preserve its existing TTL"
+        );
+        store.delete_channel("sealed-with-ttl").await.unwrap();
+
+        store
+            .put_channel("deleted", make_state("deleted", 1_000_000))
+            .await
+            .unwrap();
+        store.delete_channel("deleted").await.unwrap();
+        assert!(store.get_channel("deleted").await.unwrap().is_none());
+        store.delete_channel("deleted").await.unwrap();
+
         let channels = store.list_channels().await.unwrap();
-        assert_eq!(channels.len(), 1);
-        assert_eq!(channels[0].channel_id, "c1");
+        assert_eq!(channels.len(), 3);
+        assert!(channels
+            .iter()
+            .any(|channel| channel.channel_id.as_str() == "c1"));
 
         let create_one = make_state("created-once", 1_000_000);
         let create_two = make_state("created-once", 2_000_000);
@@ -1009,6 +1570,8 @@ mod tests {
             5_000_000
         );
         store.mark_sealed("c1").await.unwrap();
+        assert!(store.get_channel("c1").await.unwrap().unwrap().sealed);
+        store.mark_finalized("c1").await.unwrap();
         assert!(store.get_channel("c1").await.unwrap().unwrap().sealed);
         assert!(store.update_deposit("ghost", 1).await.is_err());
         assert!(store.mark_sealed("ghost").await.is_err());
