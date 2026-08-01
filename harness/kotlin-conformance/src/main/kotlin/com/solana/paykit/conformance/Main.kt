@@ -25,7 +25,7 @@ import java.util.Base64
  */
 
 @Serializable
-private data class VoucherPreimage(val channelId: String, val cumulativeAmount: String, val expiresAt: Long)
+private data class VoucherPreimage(val channelId: String, val cumulativeAmount: String, val expiresAt: Long = 0)
 
 @Serializable
 private data class VectorInput(val voucherPreimage: VoucherPreimage? = null)
@@ -71,7 +71,7 @@ private fun runVector(vector: Vector): RunnerResult {
     val preimage = vector.input.voucherPreimage
         ?: return RunnerResult(
             vector.id, "reject",
-            error = "kotlin conformance runner only supports the session voucherPreimage canonical-bytes vector",
+            error = "unsupported-mode: kotlin conformance runner only supports the session voucherPreimage canonical-bytes vector",
         )
     val cumulative = preimage.cumulativeAmount.toULongOrNull()
         ?: return RunnerResult(vector.id, "reject", error = "invalid cumulativeAmount ${preimage.cumulativeAmount}")

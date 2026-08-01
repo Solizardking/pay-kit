@@ -19,7 +19,7 @@ class RecordingTransport implements CommitTransport {
         this.commits.push(payload);
         return {
             amount: directive.amount,
-            cumulative: payload.voucher.data.cumulativeAmount,
+            cumulative: payload.voucher.voucher.cumulativeAmount,
             deliveryId: directive.deliveryId,
             sessionId: directive.sessionId,
             status: 'committed',
@@ -80,7 +80,7 @@ describe('SessionConsumer', () => {
         expect(transport.commits).toHaveLength(1);
         expect(transport.commits[0]).toMatchObject({
             deliveryId: 'delivery-1',
-            voucher: { data: { cumulativeAmount: '250', nonce: 1 } },
+            voucher: { voucher: { cumulativeAmount: '250' } },
         });
     });
 
@@ -91,7 +91,7 @@ describe('SessionConsumer', () => {
         await expect(
             consumer.accept({ metering: directive(session.channelId, '50'), payload: { ok: true } }).commit(),
         ).resolves.toMatchObject({ cumulative: '50' });
-        expect(transport.commits[0]?.voucher.data.expiresAt).toBe(1234);
+        expect(transport.commits[0]?.voucher.voucher.expiresAt).toBe(1234);
 
         await expect(consumer.commitDirective(directive(session.channelId, '75'))).resolves.toMatchObject({
             cumulative: '125',
@@ -161,12 +161,14 @@ describe('HttpCommitTransport', () => {
             payload: {
                 deliveryId: 'delivery-1',
                 voucher: {
-                    data: {
+                    voucher: {
                         channelId: 'session-1',
                         cumulativeAmount: '5',
                         expiresAt: DEFAULT_SESSION_EXPIRES_AT,
                     },
                     signature: 'sig',
+                    signatureType: 'ed25519',
+                    signer: 'session-signer',
                 },
             },
         });
@@ -197,12 +199,14 @@ describe('HttpCommitTransport', () => {
                 payload: {
                     deliveryId: 'delivery-1',
                     voucher: {
-                        data: {
+                        voucher: {
                             channelId: 'session-1',
                             cumulativeAmount: '1',
                             expiresAt: DEFAULT_SESSION_EXPIRES_AT,
                         },
                         signature: 'sig',
+                        signatureType: 'ed25519',
+                        signer: 'session-signer',
                     },
                 },
             }),
@@ -214,12 +218,14 @@ describe('HttpCommitTransport', () => {
                 payload: {
                     deliveryId: 'delivery-1',
                     voucher: {
-                        data: {
+                        voucher: {
                             channelId: 'session-1',
                             cumulativeAmount: '1',
                             expiresAt: DEFAULT_SESSION_EXPIRES_AT,
                         },
                         signature: 'sig',
+                        signatureType: 'ed25519',
+                        signer: 'session-signer',
                     },
                 },
             }),
@@ -235,12 +241,14 @@ describe('HttpCommitTransport', () => {
                 payload: {
                     deliveryId: 'delivery-1',
                     voucher: {
-                        data: {
+                        voucher: {
                             channelId: 'session-1',
                             cumulativeAmount: '1',
                             expiresAt: DEFAULT_SESSION_EXPIRES_AT,
                         },
                         signature: 'sig',
+                        signatureType: 'ed25519',
+                        signer: 'session-signer',
                     },
                 },
             }),

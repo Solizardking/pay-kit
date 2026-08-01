@@ -78,14 +78,16 @@ pub use protocol::core::{
 
 // Intent types
 pub use protocol::intents::{
-    parse_units, ActivatePayload, AuthenticateMethodDetails, AuthenticatePayload,
-    AuthenticateRequest, ChargeRequest, ClosePayload, CommitPayload, CommitReceipt, CommitStatus,
-    MeteredEnvelope, MeteringDirective, MeteringUsage, OpenPayload, SessionAction, SessionMode,
-    SessionPullVoucherStrategy, SessionRequest, SessionSettlementAuthority, SessionSplit,
-    SignedVoucher, SubscriptionAction, SubscriptionPeriodUnit, SubscriptionReceiptExtensions,
-    SubscriptionRequest, TopUpPayload, VoucherData, VoucherPayload, DEFAULT_SESSION_EXPIRES_AT,
-    RESOURCE_SCHEME_HTTP, RESOURCE_SCHEME_SOLANA_SESSION, RESOURCE_SCHEME_SOLANA_SUBSCRIPTION,
-    SIGNATURE_SCHEME_SIWMPP, SIGNATURE_TYPE_ED25519, SIWMPP_VERSION,
+    parse_units, resolve_idle_timeout_seconds, validate_idle_timeout_options, ActivatePayload,
+    AuthenticateMethodDetails, AuthenticatePayload, AuthenticateRequest, ChargeRequest,
+    ClosePayload, CommitPayload, CommitReceipt, CommitStatus, MeteredEnvelope, MeteringDirective,
+    MeteringUsage, OpenPayload, SessionAction, SessionAuthentication, SessionAuthenticationType,
+    SessionMethodDetails, SessionRequest, SessionSplit, SessionVoucherSigner, SignedVoucher,
+    SubscriptionAction, SubscriptionPeriodUnit, SubscriptionReceiptExtensions, SubscriptionRequest,
+    TopUpPayload, UsePayload, VoucherData, VoucherPayload, VoucherSignatureType,
+    DEFAULT_SESSION_EXPIRES_AT, MAX_IDLE_TIMEOUT_SECONDS, RESOURCE_SCHEME_HTTP,
+    RESOURCE_SCHEME_SOLANA_SESSION, RESOURCE_SCHEME_SOLANA_SUBSCRIPTION,
+    SESSION_AUTHENTICATION_DOMAIN, SIGNATURE_SCHEME_SIWMPP, SIGNATURE_TYPE_ED25519, SIWMPP_VERSION,
 };
 
 pub use protocol::solana::{
@@ -95,7 +97,7 @@ pub use protocol::solana::{
 // Store types
 pub use store::{
     ChannelState, ChannelStore, CommittedDelivery, MemoryChannelStore, MemoryStore,
-    PendingDelivery, Store, StoreError,
+    PendingDelivery, Store, StoreError, CHANNEL_STATE_SCHEMA_VERSION,
 };
 
 // Re-export crates callers need to use with the charge builder.

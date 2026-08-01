@@ -37,11 +37,11 @@ class _TestVoucherSigner:
     def sign_voucher(self, channel_id: str, cumulative: int, expires_at: int) -> SignedVoucher:
         data = VoucherData(
             channel_id=channel_id,
-            cumulative=str(cumulative),
+            cumulative_amount=str(cumulative),
             expires_at=expires_at,
         )
         signature = self._kp.sign_message(data.message_bytes())
-        return SignedVoucher(data=data, signature=str(signature))
+        return SignedVoucher(data=data, signer=self.address(), signature=str(signature))
 
 
 def _far_future() -> int:
@@ -67,6 +67,30 @@ def test_verify_voucher_for_channel_happy_path() -> None:
     assert result.new_cumulative == 100
     assert result.new_signature == voucher.signature
     assert result.new_expires_at == expires_at
+
+
+def test_verify_voucher_for_channel_accepts_no_expiry_voucher_signed_over_zero() -> None:
+    """The cross-SDK no-expiry case: the counterparty (Rust ``unwrap_or(0)``,
+    TS ``?? 0``) signs the 50-byte preimage with ``expires_at = 0`` and omits
+    ``expiresAt`` on the wire. Verification must reconstruct the same bytes
+    (0 verbatim, never a sentinel) and record the watermark as 0 so the
+    on-chain settle replays exactly what the signature covers."""
+    signer = _TestVoucherSigner(1)
+    state = _voucher_test_state(signer.address())
+    signed_over_zero = signer.sign_voucher(state.channel_id, 100, 0)
+    # As received off the wire: expiresAt omitted entirely.
+    received = SignedVoucher(
+        data=VoucherData(channel_id=state.channel_id, cumulative_amount="100", expires_at=None),
+        signer=signed_over_zero.signer,
+        signature=signed_over_zero.signature,
+    )
+
+    result = verify_voucher_for_channel(
+        VerifyVoucherArgs(state=state, signed=received, deposit=state.deposit, settlement_window=300)
+    )
+    assert result.status == VoucherVerifyStatus.ACCEPTED
+    assert result.new_cumulative == 100
+    assert result.new_expires_at == 0
 
 
 def test_verify_voucher_for_channel_idempotent_replay() -> None:
@@ -222,9 +246,10 @@ def test_verify_voucher_for_channel_invalid_cumulative_rejected() -> None:
     tampered = SignedVoucher(
         data=VoucherData(
             channel_id=real.data.channel_id,
-            cumulative="not-a-number",
+            cumulative_amount="not-a-number",
             expires_at=real.data.expires_at,
         ),
+        signer=real.signer,
         signature=real.signature,
     )
     state = _voucher_test_state(signer.address())
@@ -245,9 +270,10 @@ def test_verify_voucher_for_channel_ordering_parse_beats_sealed() -> None:
     voucher = SignedVoucher(
         data=VoucherData(
             channel_id=state.channel_id,
-            cumulative="bogus",
+            cumulative_amount="bogus",
             expires_at=_far_future(),
         ),
+        signer=signer.address(),
         signature="sig",
     )
 

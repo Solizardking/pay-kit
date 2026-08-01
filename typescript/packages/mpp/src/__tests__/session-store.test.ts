@@ -11,12 +11,17 @@ function makeState(overrides: Partial<ChannelState> = {}): ChannelState {
     return {
         channelId: '11111111111111111111111111111111',
         authorizedSigner: '11111111111111111111111111111111',
+        committedDeliveries: [],
         deposit: 1_000_000n,
         cumulative: 0n,
-        sealed: false,
         nextDeliverySequence: 0n,
         pendingDeliveries: [],
-        committedDeliveries: [],
+        payer: '11111111111111111111111111111111',
+        processedUses: [],
+        rentPayer: '11111111111111111111111111111111',
+        sealed: false,
+        settledOnChain: 0n,
+        spentAmount: 0n,
         ...overrides,
     };
 }
@@ -36,7 +41,12 @@ async function signVoucher(
     const [signatures] = await signer.signMessages([{ content: message, signatures: {} }]);
     const sigBytes = signatures?.[signer.address];
     if (!sigBytes) throw new Error('signer did not produce a signature');
-    return { data, signature: getBase58Decoder().decode(new Uint8Array(sigBytes)) };
+    return {
+        signature: getBase58Decoder().decode(new Uint8Array(sigBytes)),
+        signatureType: 'ed25519',
+        signer: signer.address,
+        voucher: data,
+    };
 }
 
 const FAR_FUTURE = BigInt(Math.floor(Date.now() / 1000) + 3600);
@@ -297,8 +307,10 @@ describe('verifyVoucherForChannel', () => {
         const real = await signVoucher(signer, '11111111111111111111111111111111', 100n, FAR_FUTURE);
         // Tamper the data field after signing — verifier should reject on parse before sig.
         const badData: SignedVoucher = {
-            data: { ...real.data, cumulativeAmount: 'not-a-number' },
             signature: real.signature,
+            signatureType: real.signatureType,
+            signer: real.signer,
+            voucher: { ...real.voucher, cumulativeAmount: 'not-a-number' },
         };
         const state = makeState({ authorizedSigner: signer.address });
 

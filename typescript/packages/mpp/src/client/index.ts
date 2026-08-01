@@ -15,24 +15,9 @@ export type {
 } from './ChallengeSelection.js';
 export { buildChargeTransaction, charge } from './Charge.js';
 export {
-    buildCreateFixedDelegationInstruction,
-    buildInitMultiDelegateInstruction,
-    buildInitMultiDelegateTx,
-    buildUpdateDelegationTx,
-    DELEGATION_SEED,
-    deriveDelegatedTokenAccount,
-    findFixedDelegationPda,
-    findMultiDelegatePda,
-    MULTI_DELEGATE_SEED,
-    MULTI_DELEGATOR_PROGRAM,
-} from './MultiDelegate.js';
-export type { MultiDelegateInstruction, MultiDelegateTxParameters } from './MultiDelegate.js';
-export {
     buildOpenPaymentChannelTransaction,
     createPaymentChannelSessionOpener,
-    createServerOpenedPaymentChannelSessionOpener,
     derivePaymentChannelOpen,
-    PENDING_SERVER_SIGNATURE,
 } from './PaymentChannels.js';
 export type { PaymentChannelOpen, PaymentChannelOpenTransaction } from './PaymentChannels.js';
 export {
@@ -47,10 +32,18 @@ export { solana } from './Methods.js';
 export {
     ActiveSession,
     DEFAULT_SESSION_EXPIRES_AT,
+    MAX_IDLE_TIMEOUT_SECONDS,
+    resolveIdleTimeoutSeconds,
+    resolveOpenBlockhash,
+    resolveOpenSlot,
     serializeSessionCredential,
     session,
+    SESSION_AUTHENTICATION_DOMAIN,
+    sessionAuthenticationMessage,
     sessionContextSchema,
-    sessionRequestModes,
+    signSessionAuthentication,
+    validateIdleTimeoutOptions,
+    verifySessionAuthentication,
     voucherMessageBytes,
 } from './Session.js';
 export type {
@@ -65,9 +58,9 @@ export type {
     SessionAction,
     SessionChallenge,
     SessionContext,
-    SessionMode,
-    SessionPullVoucherStrategy,
-    SessionSettlementAuthority,
+    SessionMethodDetails,
+    SessionAuthentication,
+    SessionVoucherSigner,
     SessionRequest,
     SessionSigner,
     SessionSplit,
@@ -77,13 +70,7 @@ export type {
 } from './Session.js';
 export { HttpCommitTransport, MeteredDelivery, SessionConsumer } from './SessionConsumer.js';
 export type { CommitTransport } from './SessionConsumer.js';
-export {
-    createEphemeralSessionOpener,
-    createSessionFetch,
-    SessionFetchClient,
-    stripRequestHeaders,
-    withPatchedGlobalFetch,
-} from './SessionFetch.js';
+export { createSessionFetch, SessionFetchClient, stripRequestHeaders, withPatchedGlobalFetch } from './SessionFetch.js';
 export type {
     CommitSessionDeliveryParameters,
     PreparedFetchRequest,

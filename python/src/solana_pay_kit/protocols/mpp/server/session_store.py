@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 __all__ = [
     "PendingDelivery",
     "CommittedDelivery",
+    "ProcessedUse",
     "ChannelState",
     "ListChannelsFilter",
     "ChannelMutator",
@@ -105,6 +107,42 @@ class CommittedDelivery:
 
 
 @dataclass
+class ProcessedUse:
+    """Cached result for one operator-signed use request."""
+
+    challenge_id: str
+    idempotency_key: str
+    cumulative: int
+    voucher_signature: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "challengeId": self.challenge_id,
+            "idempotencyKey": self.idempotency_key,
+            "cumulative": self.cumulative,
+            "voucherSignature": self.voucher_signature,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ProcessedUse:
+        return cls(
+            challenge_id=str(data.get("challengeId", "")),
+            idempotency_key=str(data.get("idempotencyKey", "")),
+            cumulative=int(data.get("cumulative", 0)),
+            voucher_signature=str(data.get("voucherSignature", "")),
+        )
+
+
+# Schema version stamped on every channel record this SDK writes.
+#
+# A writer must refuse records stamped with a *newer* version than its own:
+# decoding one would drop the fields it does not know, and a subsequent
+# re-encode would destroy them for every reader. Unknown fields at the same
+# or an older version round-trip verbatim through ``ChannelState.extra``.
+CHANNEL_STATE_SCHEMA_VERSION = 1
+
+
+@dataclass
 class ChannelState:
     """Persisted state of a single payment channel from the server's point of
     view.
@@ -115,8 +153,6 @@ class ChannelState:
 
     # ChannelID is the on-chain channel address (base58).
     #
-    # Push sessions: the payment-channel address.
-    # Pull sessions: the FixedDelegation PDA address.
     channel_id: str
 
     # AuthorizedSigner is the public key authorized to sign vouchers for this
@@ -134,11 +170,32 @@ class ChannelState:
     # Sealed is true once the channel has been sealed on-chain.
     sealed: bool = False
 
-    # OpenSlot is the slot the channel was opened at (push sessions). A channel
+    # OpenSlot is the slot the channel was opened at. A channel
     # PDA seed since the epoch-addressed program update, so it is persisted to
     # re-derive the channel address and to reclaim the channel rent after
-    # distribution. Zero when unknown (e.g. pull sessions or trusted opens).
+    # distribution.
     open_slot: int = 0
+
+    # Original payer/refund destination and account that funded rent.
+    payer: str = ""
+    rent_payer: str = ""
+
+    # Opening challenge and reusable proof bound for operator-signed sessions.
+    opening_challenge_id: str = ""
+    authentication: dict[str, Any] | None = None
+    voucher_signer: str = "client"
+
+    # Negotiated lifecycle and accounting state.
+    idle_timeout_seconds: int | None = None
+    last_activity_at: int = 0
+    spent_amount: int = 0
+    settled_on_chain: int = 0
+    processed_uses: list[ProcessedUse] = field(default_factory=list)
+
+    # Transaction signatures of top-ups already credited to ``deposit``
+    # (base58). Checked inside the atomic top-up mutator so a resubmitted or
+    # concurrently duplicated top-up transaction credits exactly once.
+    processed_topup_signatures: list[str] = field(default_factory=list)
 
     # HighestVoucherSignature is the signature of the highest accepted voucher
     # (base58). Stored for idempotent replay detection.
@@ -169,10 +226,6 @@ class ChannelState:
     # Not serialized: it is transient server state and round-trips as absent.
     settling: bool = False
 
-    # Operator is the client wallet pubkey (base58) for pull-mode sessions;
-    # None for push sessions.
-    operator: str | None = None
-
     # NextDeliverySequence is the next server-side metered delivery sequence.
     next_delivery_sequence: int = 0
 
@@ -182,6 +235,15 @@ class ChannelState:
     # CommittedDeliveries are recently committed deliveries, kept for idempotent
     # commit replay.
     committed_deliveries: list[CommittedDelivery] = field(default_factory=list)
+
+    # Schema version stamped by the last writer. 0 for records persisted
+    # before versioning. See CHANNEL_STATE_SCHEMA_VERSION.
+    schema_version: int = 0
+
+    # Fields this SDK version does not know, preserved verbatim so a
+    # read-modify-write by an older writer can never strip a newer schema's
+    # fields off a shared record.
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def clone(self) -> ChannelState:
         """Return a deep copy so callers can never alias store-internal state.
@@ -194,6 +256,9 @@ class ChannelState:
             self,
             pending_deliveries=[replace(d) for d in self.pending_deliveries],
             committed_deliveries=[replace(d) for d in self.committed_deliveries],
+            processed_uses=[replace(use) for use in self.processed_uses],
+            processed_topup_signatures=list(self.processed_topup_signatures),
+            extra=deepcopy(self.extra),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,10 +275,20 @@ class ChannelState:
             "cumulative": self.cumulative,
             "sealed": self.sealed,
             "open_slot": self.open_slot,
+            "payer": self.payer,
+            "rent_payer": self.rent_payer,
+            "opening_challenge_id": self.opening_challenge_id,
+            "authentication": self.authentication,
+            "voucher_signer": self.voucher_signer,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "last_activity_at": self.last_activity_at,
+            "spent_amount": self.spent_amount,
+            "settled_on_chain": self.settled_on_chain,
+            "processed_uses": [use.to_dict() for use in self.processed_uses],
+            "processed_topup_signatures": list(self.processed_topup_signatures),
             "highest_voucher_signature": self.highest_voucher_signature,
             "highest_voucher_expires_at": self.highest_voucher_expires_at,
             "close_requested_at": self.close_requested_at,
-            "operator": self.operator,
             "next_delivery_sequence": self.next_delivery_sequence,
             "pending_deliveries": ([p.to_dict() for p in self.pending_deliveries] if self.pending_deliveries else None),
             "committed_deliveries": (
@@ -223,6 +298,10 @@ class ChannelState:
         # settled_signature is omitted from the wire form when unset.
         if self.settled_signature is not None:
             d["settled_signature"] = self.settled_signature
+        # Serialization is the write path: stamp this writer's version, and
+        # re-emit fields decoded from newer same-version writers verbatim.
+        d["schema_version"] = CHANNEL_STATE_SCHEMA_VERSION
+        d.update(self.extra)
         return d
 
     @classmethod
@@ -237,6 +316,12 @@ class ChannelState:
                 "legacy pre-seal channel record (field 'finalized') is not supported; "
                 "migrate or reset the durable channel store"
             )
+        schema_version = int(data.get("schema_version", 0))
+        if schema_version > CHANNEL_STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"channel record schema_version {schema_version} is newer than this "
+                f"writer's {CHANNEL_STATE_SCHEMA_VERSION}; refusing lossy decode"
+            )
         return cls(
             channel_id=data.get("channel_id", ""),
             authorized_signer=data.get("authorized_signer", ""),
@@ -244,20 +329,67 @@ class ChannelState:
             cumulative=int(data.get("cumulative", 0)),
             sealed=bool(data.get("sealed", False)),
             open_slot=int(data.get("open_slot", 0)),
+            payer=str(data.get("payer", "")),
+            rent_payer=str(data.get("rent_payer", "")),
+            opening_challenge_id=str(data.get("opening_challenge_id", "")),
+            authentication=data.get("authentication"),
+            voucher_signer=str(data.get("voucher_signer", "client")),
+            idle_timeout_seconds=(
+                None if data.get("idle_timeout_seconds") is None else int(data["idle_timeout_seconds"])
+            ),
+            last_activity_at=int(data.get("last_activity_at", 0)),
+            spent_amount=int(data.get("spent_amount", 0)),
+            settled_on_chain=int(data.get("settled_on_chain", 0)),
+            processed_uses=[ProcessedUse.from_dict(use) for use in (data.get("processed_uses") or [])],
+            processed_topup_signatures=[str(s) for s in (data.get("processed_topup_signatures") or [])],
             highest_voucher_signature=data.get("highest_voucher_signature"),
             highest_voucher_expires_at=(
                 None if data.get("highest_voucher_expires_at") is None else int(data["highest_voucher_expires_at"])
             ),
             close_requested_at=(None if data.get("close_requested_at") is None else int(data["close_requested_at"])),
             settled_signature=data.get("settled_signature"),
-            operator=data.get("operator"),
             next_delivery_sequence=int(data.get("next_delivery_sequence", 0)),
             # A missing key, explicit JSON ``null``, and an empty array all
             # decode to an empty list. ``data.get(key) or []`` folds ``None``
             # and ``[]`` together; ``from_dict`` never iterates ``None``.
             pending_deliveries=[PendingDelivery.from_dict(p) for p in (data.get("pending_deliveries") or [])],
             committed_deliveries=[CommittedDelivery.from_dict(c) for c in (data.get("committed_deliveries") or [])],
+            schema_version=schema_version,
+            extra={k: v for k, v in data.items() if k not in _CHANNEL_STATE_KNOWN_KEYS},
         )
+
+
+# Keys ``ChannelState`` decodes into named fields; everything else lands in
+# ``extra``. ``finalized`` is rejected before this set matters.
+_CHANNEL_STATE_KNOWN_KEYS = frozenset(
+    {
+        "channel_id",
+        "authorized_signer",
+        "deposit",
+        "cumulative",
+        "sealed",
+        "open_slot",
+        "payer",
+        "rent_payer",
+        "opening_challenge_id",
+        "authentication",
+        "voucher_signer",
+        "idle_timeout_seconds",
+        "last_activity_at",
+        "spent_amount",
+        "settled_on_chain",
+        "processed_uses",
+        "processed_topup_signatures",
+        "highest_voucher_signature",
+        "highest_voucher_expires_at",
+        "close_requested_at",
+        "settled_signature",
+        "next_delivery_sequence",
+        "pending_deliveries",
+        "committed_deliveries",
+        "schema_version",
+    }
+)
 
 
 @dataclass

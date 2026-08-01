@@ -1,38 +1,49 @@
 import {
     type Address,
+    createSignableMessage,
     createSolanaRpc,
+    getBase58Decoder,
     isTransactionPartialSigner,
+    type MessagePartialSigner,
     type Signature,
     type TransactionPartialSigner,
     type TransactionSigner,
 } from '@solana/kit';
 import { Method, Receipt } from 'mppx';
 
-import { DEFAULT_RPC_URLS, defaultTokenProgramForCurrency, resolveStablecoinMint } from '../constants.js';
+import {
+    DEFAULT_SESSION_EXPIRES_AT,
+    resolveIdleTimeoutSeconds,
+    validateIdleTimeoutOptions,
+    verifySessionAuthentication,
+} from '../client/Session.js';
+import { defaultTokenProgramForCurrency, resolveStablecoinMint } from '../constants.js';
 import * as Methods from '../Methods.js';
 import type {
     CommitReceipt,
     MeteringDirective,
     OpenPayload,
-    SessionMode,
-    SessionPullVoucherStrategy,
+    SessionAction,
+    SessionAuthentication,
     SessionRequest,
-    SessionSettlementAuthority,
     SessionSplit,
+    SessionVoucherSigner,
     SignedVoucher,
 } from '../shared/session-types.js';
-import { normalizeSignedVoucher, verifyVoucherSignature } from '../shared/voucher.js';
+import { encodeVoucherMessageLoose, normalizeSignedVoucher, verifyVoucherSignature } from '../shared/voucher.js';
 import { createLifecycle, type Lifecycle } from './session/lifecycle.js';
 import {
-    type MultiDelegateSubmitRpc,
+    OPEN_SLOT_WINDOW,
     PAYMENT_CHANNELS_PROGRAM_ID,
-    submitInitMultiDelegateTxIfMissing,
     submitOpenTx,
     submitSettleAndDistribute,
     type SubmitSettleAndDistributeResult,
+    submitTopUpTx,
+    transactionSignatureFromWire,
     verifyOpenTx,
 } from './session/on-chain.js';
 import {
+    CHANNEL_STATE_SCHEMA_VERSION,
     type ChannelState,
     type CommittedDelivery,
     createMemorySessionStore,
@@ -64,7 +75,7 @@ function resolveSessionStore(parameters: session.Parameters): SessionStore {
 /**
  * Creates a Solana `session` MPP method for the server.
  *
- * A session opens a payment channel (or delegated-token pull) once, then
+ * A session opens a payment channel once, then
  * accepts off-chain cumulative vouchers for subsequent paid deliveries.
  * On close, the server settles the highest accepted voucher on-chain and
  * distributes proceeds to the configured splits.
@@ -76,15 +87,13 @@ function resolveSessionStore(parameters: session.Parameters): SessionStore {
  * import { Mppx, session } from '@solana/mpp/server'
  *
  * const sess = session({
- *   operator: OPERATOR,
  *   recipient: RECIPIENT,
- *   signer,              // optional: server-side fee payer / merchant signer
- *   cap: 10_000_000n,    // 10 USDC default cap
+ *   signer,
+ *   amount: 100n,
+ *   suggestedDeposit: 10_000_000n,
  *   currency: 'USDC',
  *   decimals: 6,
  *   network: 'devnet',
- *   modes: ['push'],
- *   pricing: { perDelivery: 100n },
  *   rpc: createSolanaRpc('https://api.devnet.solana.com'),
  * })
  *
@@ -93,53 +102,50 @@ function resolveSessionStore(parameters: session.Parameters): SessionStore {
  */
 export function session(parameters: session.Parameters) {
     const {
-        operator,
         recipient,
         signer,
-        cap,
+        amount,
+        suggestedDeposit,
+        minimumDeposit,
         currency,
         decimals,
         network = 'mainnet',
-        programId,
-        modes,
-        pullVoucherStrategy,
-        settlementAuthority = 'clientVoucher',
-        splits,
-        pricing,
+        channelProgram,
+        voucherSigner = 'client',
+        distributionSplits,
         rpc,
-        closeDelayMs = 0,
+        idleTimeoutOptionsSeconds,
+        idleTimeoutSeconds = 300,
         minVoucherDelta,
-        openTxSubmitter = 'client',
-        paymentChannelPayerSigner,
+        feePayer = false,
+        feePayerSigner,
+        gracePeriodSeconds,
         settlementWindowSeconds,
+        operatorVoucherSigner,
     } = parameters;
 
-    if (cap <= 0n) {
-        throw new Error('cap must be positive');
+    if (amount <= 0n) {
+        throw new Error('amount must be positive');
     }
-    if (signer && !isTransactionPartialSigner(signer)) {
+    if (!rpc) throw new Error('rpc is required for session funding verification');
+    if (!isTransactionPartialSigner(signer)) {
         throw new Error('signer must implement signTransactions()');
     }
-    if (paymentChannelPayerSigner && !isTransactionPartialSigner(paymentChannelPayerSigner)) {
-        throw new Error('paymentChannelPayerSigner must implement signTransactions()');
+    if (feePayerSigner && !isTransactionPartialSigner(feePayerSigner)) {
+        throw new Error('feePayerSigner must implement signTransactions()');
     }
-    if (splits && splits.length > 8) {
-        throw new Error('splits cannot exceed 8 entries');
+    if (feePayer && !feePayerSigner) throw new Error('feePayerSigner is required when feePayer is true');
+    if (distributionSplits && distributionSplits.length > 32) {
+        throw new Error('distributionSplits cannot exceed 32 entries');
     }
-    const effectiveModes: SessionMode[] = modes && modes.length > 0 ? modes.slice() : ['push'];
-    if (effectiveModes.includes('pull') && !pullVoucherStrategy) {
-        throw new Error('pullVoucherStrategy is required when modes includes "pull"');
+    if (idleTimeoutOptionsSeconds) validateIdleTimeoutOptions(idleTimeoutOptionsSeconds);
+    resolveIdleTimeoutSeconds({ defaultSeconds: idleTimeoutSeconds, options: idleTimeoutOptionsSeconds });
+    if (voucherSigner === 'operator' && !operatorVoucherSigner) {
+        throw new Error('operatorVoucherSigner is required when voucherSigner is operator');
     }
-    if (openTxSubmitter !== 'client' && openTxSubmitter !== 'server') {
-        throw new Error(`openTxSubmitter must be 'client' or 'server', got ${String(openTxSubmitter)}`);
-    }
-    if (pricing.perDelivery !== undefined && pricing.perDelivery <= 0n) {
-        throw new Error('pricing.perDelivery must be positive when set');
-    }
-
-    const rpcUrl = parameters.rpcUrl ?? DEFAULT_RPC_URLS[network] ?? DEFAULT_RPC_URLS['mainnet'];
+    const operator = operatorVoucherSigner?.address;
     const store = resolveSessionStore(parameters);
-    const resolvedProgramId = (programId ?? PAYMENT_CHANNELS_PROGRAM_ID) as Address;
+    const resolvedProgramId = (channelProgram ?? PAYMENT_CHANNELS_PROGRAM_ID) as Address;
     const resolvedMint = resolveStablecoinMint(currency, network) ?? currency;
     const tokenProgram = parameters.tokenProgram ?? defaultTokenProgramForCurrency(currency, network);
     const lifecycleRef: { value: Lifecycle | undefined } = { value: undefined };
@@ -147,11 +153,10 @@ export function session(parameters: session.Parameters) {
     // Note: lifecycle's closeOnIdle would normally drive an on-chain settle.
     // Because that requires a configured merchant signer + rpc, we only
     // create the lifecycle when both are present.
-    if (closeDelayMs > 0) {
+    if (idleTimeoutSeconds > 0) {
         lifecycleRef.value = createLifecycle(
             store,
             async channelId => {
-                if (!signer || !rpc) return;
                 try {
                     await closeAndSettleChannel({
                         channelId,
@@ -160,11 +165,11 @@ export function session(parameters: session.Parameters) {
                         merchantSigner: signer,
                         mint: resolvedMint,
                         network,
-                        operator,
                         programId: resolvedProgramId,
                         recipient,
+                        rentPayer: feePayerSigner?.address,
                         rpc,
-                        splits,
+                        splits: distributionSplits?.map(split => ({ bps: split.shareBps, recipient: split.recipient })),
                         store,
                         tokenProgram,
                     });
@@ -175,107 +180,118 @@ export function session(parameters: session.Parameters) {
                     console.warn(`[solana-mpp] idle-close settle failed for ${channelId}:`, error);
                 }
             },
-            closeDelayMs,
+            idleTimeoutSeconds * 1_000,
         );
     }
 
     const method = Method.toServer(Methods.session, {
         defaults: {
-            cap: cap.toString(),
+            amount: amount.toString(),
             currency,
-            operator,
+            methodDetails: {
+                channelProgram: resolvedProgramId.toString(),
+                network,
+            },
             recipient,
         },
 
         async request({ credential, request }) {
-            // Don't fetch a blockhash on the verify path — the client
-            // already built whatever tx it needed against its own
-            // blockhash. We only prefetch when issuing a fresh 402.
-            // The current slot rides along from the same response's context:
-            // it becomes the channel `openSlot` PDA seed, which the client
-            // must take from the challenge rather than its own RPC.
-            let recentBlockhash: string | undefined;
-            let recentSlot: string | undefined;
-            if (!credential) {
-                try {
-                    const res = await fetch(rpcUrl, {
-                        body: JSON.stringify({
-                            id: 1,
-                            jsonrpc: '2.0',
-                            method: 'getLatestBlockhash',
-                            params: [{ commitment: 'confirmed' }],
-                        }),
-                        headers: { 'Content-Type': 'application/json' },
-                        method: 'POST',
-                    });
-                    const data = (await res.json()) as {
-                        result?: { context?: { slot?: number }; value?: { blockhash?: string } };
-                    };
-                    recentBlockhash = data.result?.value?.blockhash;
-                    const slot = data.result?.context?.slot;
-                    if (typeof slot === 'number') recentSlot = String(slot);
-                } catch {
-                    // Non-fatal — client will fetch its own blockhash, and
-                    // push opens fail with a clear recentSlot error client-side.
-                }
-            }
-
-            // Clamp cap to the server max (mirrors Rust
-            // `build_challenge_request` clamp behavior).
-            const requestedCap = parseU64String(request.cap ?? cap.toString(), 'cap');
-            const effectiveCap = requestedCap > cap ? cap : requestedCap;
+            // A route-supplied channelId marks a resume challenge for an
+            // already-open channel: recentBlockhash/recentSlot MUST be absent
+            // (there is no open transaction to build). A fresh new-channel 402
+            // REQUIRES both, from ONE getLatestBlockhash observation.
+            const resumeChannelId = (request as { methodDetails?: { channelId?: string } }).methodDetails?.channelId;
+            // Skip the fetch on the verify path (credential present): the
+            // client builds its open against the challenge it was actually
+            // issued — echoed back and HMAC-verified — so re-fetching here
+            // would only burn an RPC call. The pinned challenge binding does
+            // not pin the transient blockhash fields.
+            const openContext =
+                resumeChannelId || credential
+                    ? undefined
+                    : await challengeOpenTransactionContext(parameters.blockhashCache, rpc);
 
             const challengeRequest: SessionRequest = {
-                cap: effectiveCap.toString(),
+                amount: request.amount ?? amount.toString(),
                 currency,
-                ...(decimals !== undefined ? { decimals } : {}),
                 ...(request.description ? { description: request.description } : {}),
                 ...(request.externalId ? { externalId: request.externalId } : {}),
-                ...(minVoucherDelta !== undefined && minVoucherDelta > 0n
-                    ? { minVoucherDelta: minVoucherDelta.toString() }
-                    : {}),
-                // Omit modes when only push (Rust mirror).
-                ...(effectiveModes.length === 1 && effectiveModes[0] === 'push' ? {} : { modes: effectiveModes }),
-                network,
-                operator,
-                ...(programId ? { programId: programId.toString() } : {}),
-                ...(effectiveModes.includes('pull') && pullVoucherStrategy ? { pullVoucherStrategy } : {}),
-                ...(recentBlockhash ? { recentBlockhash } : {}),
-                ...(recentSlot ? { recentSlot } : {}),
+                ...(minimumDeposit !== undefined ? { minimumDeposit: minimumDeposit.toString() } : {}),
                 recipient,
-                settlementAuthority,
-                ...(splits?.length ? { splits: [...splits] } : {}),
+                ...(suggestedDeposit !== undefined ? { suggestedDeposit: suggestedDeposit.toString() } : {}),
+                ...(parameters.unitType ? { unitType: parameters.unitType } : {}),
+                methodDetails: {
+                    ...(resumeChannelId ? { channelId: resumeChannelId } : {}),
+                    channelProgram: resolvedProgramId.toString(),
+                    ...(decimals !== undefined ? { decimals } : {}),
+                    ...(distributionSplits?.length ? { distributionSplits: [...distributionSplits] } : {}),
+                    ...(feePayer ? { feePayer: true, feePayerKey: feePayerSigner?.address } : {}),
+                    ...(gracePeriodSeconds !== undefined ? { gracePeriodSeconds } : {}),
+                    ...(idleTimeoutOptionsSeconds ? { idleTimeoutOptionsSeconds: [...idleTimeoutOptionsSeconds] } : {}),
+                    idleTimeoutSeconds,
+                    ...(minVoucherDelta !== undefined && minVoucherDelta > 0n
+                        ? { minVoucherDelta: minVoucherDelta.toString() }
+                        : {}),
+                    network,
+                    ...(operator ? { operator } : {}),
+                    ...(openContext
+                        ? { recentBlockhash: openContext.blockhash, recentSlot: openContext.slot.toString() }
+                        : {}),
+                    tokenProgram,
+                    voucherSigner,
+                },
             };
 
             return challengeRequest as Record<string, unknown> & SessionRequest;
         },
 
-        async verify({ credential }) {
+        async verify({ credential, envelope }) {
             const cred = credential as unknown as CredentialPayload;
             const action = cred.payload.action;
 
             switch (action) {
                 case 'open':
+                    assertChallengeOpenNotExpired(cred.challenge.expires);
                     return await handleOpen({
-                        cap,
                         challengeId: cred.challenge.id,
-                        challengeOpenSlot: parseOptionalU64(cred.challenge.request.recentSlot, 'recentSlot'),
                         currency,
+                        distributionSplits,
                         externalId: cred.challenge.request.externalId,
+                        feePayer,
+                        feePayerSigner,
+                        gracePeriodSeconds,
+                        idleTimeoutOptionsSeconds,
+                        idleTimeoutSeconds,
                         lifecycle: lifecycleRef.value,
-                        merchantSigner: signer,
+                        minimumDeposit,
                         mint: resolvedMint,
-                        modes: effectiveModes,
                         network,
-                        openTxSubmitter,
+                        // Verified outer challenge facts the open is bound to
+                        // (mirrors the Rust SessionOpenContext): the challenged
+                        // blockhash + slot flow from the (HMAC-verified) echoed
+                        // challenge into open verification.
+                        openContext: challengedOpenContext(cred.challenge.request),
                         operator,
-                        payerSigner: paymentChannelPayerSigner,
                         payload: cred.payload,
                         programId: resolvedProgramId,
-                        pullVoucherStrategy,
                         recipient,
                         rpc,
-                        settlementAuthority,
+                        store,
+                        tokenProgram,
+                        voucherSigner,
+                    });
+                case 'use':
+                    if (!operatorVoucherSigner) {
+                        throw new Error('use is only valid when voucherSigner is operator');
+                    }
+                    return await handleUse({
+                        challengeId: cred.challenge.id,
+                        externalId: cred.challenge.request.externalId,
+                        idempotencyKey: envelope?.capturedRequest.headers.get('Idempotency-Key') ?? '',
+                        lifecycle: lifecycleRef.value,
+                        operatorVoucherSigner,
+                        payload: cred.payload,
+                        price: parseU64String(cred.challenge.request.amount, 'amount'),
                         store,
                     });
                 case 'voucher':
@@ -288,19 +304,10 @@ export function session(parameters: session.Parameters) {
                         settlementWindow: settlementWindowSeconds,
                         store,
                     });
-                case 'commit':
-                    return await handleCommit({
-                        challengeId: cred.challenge.id,
-                        externalId: cred.challenge.request.externalId,
-                        lifecycle: lifecycleRef.value,
-                        payload: cred.payload,
-                        settlementWindow: settlementWindowSeconds,
-                        store,
-                    });
                 case 'topUp':
                     return await handleTopUp({
-                        cap,
                         challengeId: cred.challenge.id,
+                        channelProgram: resolvedProgramId.toString(),
                         externalId: cred.challenge.request.externalId,
                         lifecycle: lifecycleRef.value,
                         payload: cred.payload,
@@ -317,13 +324,13 @@ export function session(parameters: session.Parameters) {
                         merchantSigner: signer,
                         mint: resolvedMint,
                         network,
-                        operator,
                         payload: cred.payload,
                         programId: resolvedProgramId,
                         recipient,
+                        rentPayer: feePayerSigner?.address,
                         rpc,
                         settlementWindow: settlementWindowSeconds,
-                        splits,
+                        splits: distributionSplits?.map(split => ({ bps: split.shareBps, recipient: split.recipient })),
                         store,
                         tokenProgram,
                     });
@@ -335,6 +342,91 @@ export function session(parameters: session.Parameters) {
 
     return method;
 }
+
+function assertChallengeOpenNotExpired(expires: string | undefined): void {
+    if (expires === undefined) return;
+    const expiresAt = Date.parse(expires);
+    if (Number.isNaN(expiresAt)) throw new Error('challenge expires must be an RFC3339 timestamp');
+    if (expiresAt <= Date.now()) throw new Error(`challenge expired at ${expires}`);
+}
+
+/**
+ * Verified outer challenge facts required while opening a session — the
+ * challenged `recentBlockhash` the compiled open message must use, and the
+ * challenged `recentSlot` the payload's `openSlot` must sit at-or-before
+ * within {@link OPEN_SLOT_WINDOW}. Mirrors `SessionOpenContext` in
+ * `rust/crates/kit/src/mpp/server/session.rs`.
+ */
+export interface SessionOpenContext {
+    readonly recentBlockhash: string;
+    readonly recentSlot: bigint;
+}
+
+/**
+ * Extracts the open-transaction context from the (HMAC-verified) echoed
+ * challenge. Both fields are REQUIRED on the new-channel challenge an `open`
+ * answers — a challenge without them (e.g. a resume challenge) never
+ * authorized an open.
+ */
+function challengedOpenContext(request: SessionRequest): SessionOpenContext {
+    const details = request.methodDetails;
+    if (!details.recentBlockhash || details.recentSlot === undefined) {
+        throw new Error(
+            'open requires a challenge carrying recentBlockhash/recentSlot; only a new-channel challenge provides them',
+        );
+    }
+    return {
+        recentBlockhash: details.recentBlockhash,
+        recentSlot: parseU64String(details.recentSlot, 'methodDetails.recentSlot'),
+    };
+}
+
+/**
+ * Fetch the open-transaction context (`recentBlockhash` + `recentSlot`) for a
+ * new-channel challenge.
+ *
+ * Prefers the shared cache (refreshed out of band) to avoid a blocking RPC
+ * round-trip per 402; falls back to ONE direct `getLatestBlockhash` call,
+ * whose response carries both the blockhash (`result.value.blockhash`) and
+ * the context slot (`result.context.slot`).
+ *
+ * Fails loudly (retryable) rather than issuing a degraded challenge without
+ * the fields: both are REQUIRED for a new-channel challenge — the client
+ * derives the channel PDA from `recentSlot` and MUST use the challenged
+ * blockhash — so a silent omission would surface as a non-retryable payment
+ * failure at open time. Mirrors `challenge_open_transaction_context` in the
+ * Rust SessionServer.
+ */
+async function challengeOpenTransactionContext(
+    cache: session.BlockhashCache | undefined,
+    rpc: RpcLike,
+): Promise<{ blockhash: string; slot: bigint }> {
+    const cached = cache?.get();
+    if (cached) return { blockhash: cached.blockhash, slot: BigInt(cached.slot) };
+    const candidate = rpc as Partial<LatestBlockhashRpc>;
+    if (typeof candidate.getLatestBlockhash !== 'function') {
+        throw new Error(
+            'session challenge requires recentBlockhash/recentSlot; configure a blockhashCache or an rpc that supports getLatestBlockhash',
+        );
+    }
+    let response;
+    try {
+        response = await candidate.getLatestBlockhash({ commitment: 'confirmed' }).send();
+    } catch (error) {
+        throw new Error(`failed to fetch recentBlockhash/recentSlot for session challenge: ${errorMessage(error)}`);
+    }
+    return { blockhash: response.value.blockhash, slot: BigInt(response.context.slot) };
+}
+
+/** RPC subset used to fetch the challenge open-transaction context. */
+type LatestBlockhashRpc = {
+    getLatestBlockhash(config?: { commitment?: 'confirmed' | 'finalized' | 'processed' }): {
+        send(): Promise<{
+            context: { slot: bigint | number };
+            value: { blockhash: string };
+        }>;
+    };
+};
 
 // ─────────────────────────────────────────────────────────────────────
 // Routes — side-channel HTTP endpoints for deliveries / commit.
@@ -353,8 +445,6 @@ export function session(parameters: session.Parameters) {
  * touch these — they're a separate HTTP surface for metered streaming.
  */
 session.routes = function routes(parameters: session.Parameters): session.RoutesHandlers {
-    const cap = parameters.cap;
-    if (cap === undefined) throw new Error('cap is required');
     const store = resolveSessionStore(parameters);
     const currency = parameters.currency;
 
@@ -406,203 +496,166 @@ session.routes = function routes(parameters: session.Parameters): session.Routes
 // ─────────────────────────────────────────────────────────────────────
 
 interface HandleOpenArgs {
-    readonly cap: bigint;
     readonly challengeId: string | undefined;
-    /** Slot issued in the 402 challenge; the open tx must echo it. */
-    readonly challengeOpenSlot: bigint | undefined;
     readonly currency: string;
+    /** Server-configured splits the challenge advertised; the open must encode exactly these. */
+    readonly distributionSplits: readonly SessionSplit[] | undefined;
     readonly externalId: string | undefined;
+    readonly feePayer: boolean;
+    readonly feePayerSigner: TransactionPartialSigner | undefined;
+    readonly gracePeriodSeconds: number | undefined;
+    readonly idleTimeoutOptionsSeconds: readonly number[] | undefined;
+    readonly idleTimeoutSeconds: number;
     readonly lifecycle: Lifecycle | undefined;
-    readonly merchantSigner: TransactionPartialSigner | undefined;
+    readonly minimumDeposit: bigint | undefined;
     readonly mint: string;
-    readonly modes: SessionMode[];
     readonly network: string;
-    readonly openTxSubmitter: 'client' | 'server';
-    /** Operator / fee-payer pubkey (base58); pins the open `rentPayer`. */
-    readonly operator: string;
-    readonly payerSigner: TransactionPartialSigner | undefined;
+    readonly openContext: SessionOpenContext;
+    readonly operator: string | undefined;
     readonly payload: OpenPayload & { readonly action: 'open' };
     readonly programId: Address;
-    readonly pullVoucherStrategy: SessionPullVoucherStrategy | undefined;
     readonly recipient: string;
-    readonly rpc: RpcLike | undefined;
-    readonly settlementAuthority: SessionSettlementAuthority;
+    readonly rpc: RpcLike;
     readonly store: SessionStore;
+    readonly tokenProgram: string;
+    readonly voucherSigner: SessionVoucherSigner;
 }
 
 async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
     const { payload } = args;
-    const mode = payload.mode;
-    if (!args.modes.includes(mode)) {
-        throw new Error(`Session mode ${mode} is not supported by this challenge`);
+    if (args.voucherSigner === 'operator' && (!args.operator || payload.authorizedSigner !== args.operator)) {
+        throw new Error('operator voucher signing requires authorizedSigner to match the operator');
     }
-    if (mode === 'pull' && !args.pullVoucherStrategy) {
-        throw new Error('pull-mode open requires a pullVoucherStrategy on the server config');
-    }
-    if (args.settlementAuthority === 'delegated' && payload.authorizedSigner !== args.operator) {
-        throw new Error('delegated settlement requires authorizedSigner to match the operator');
+    if (args.voucherSigner === 'client' && payload.authentication) {
+        throw new Error('authentication is only valid when voucherSigner is operator');
     }
 
-    let channelId: string;
-    let deposit: bigint;
-    let signature: string | undefined;
-    // Channel payer (the deposit funder / distribute refund destination),
-    // captured from the verified open when a transaction is present.
-    let channelPayer: string | undefined;
-    // Slot the channel was opened at — a channel PDA seed, persisted so the
-    // PDA can be re-derived and reclaim gated later. Read from the verified
-    // open transaction when present; otherwise from the client payload's
-    // `recentSlot` echo.
-    let openSlot: bigint | undefined = parseOptionalU64(payload.recentSlot, 'recentSlot');
-
-    if (mode === 'push' && !payload.transaction && !payload.channelId) {
-        throw new Error('open payload missing transaction or channelId');
+    if (args.gracePeriodSeconds === undefined || args.gracePeriodSeconds <= 0) {
+        throw new Error('challenge must specify a positive gracePeriodSeconds');
     }
-
-    if (payload.transaction) {
-        // Payment-channel-backed open. This covers push sessions and
-        // clientVoucher pull sessions whose deposit lives in an on-chain
-        // payment channel (the `createPaymentChannelSessionOpener` flow):
-        // both attach the pre-signed open transaction for verification —
-        // and, with `openTxSubmitter: 'server'`, server-side broadcast.
-        const expected = {
-            authorizedSigner: payload.authorizedSigner,
-            currency: args.currency,
-            maxCap: args.cap,
-            mint: args.mint,
-            network: args.network,
-            openSlot: args.challengeOpenSlot,
-            operator: args.operator,
-            programId: args.programId.toString(),
-            recipient: args.recipient,
-        };
-
-        if (args.openTxSubmitter === 'server') {
-            if (!args.rpc) throw new Error('openTxSubmitter=server requires an rpc client');
-            // Decode (no RPC) first so an idempotent replay of an
-            // already-persisted open does not rebroadcast the tx.
-            const preVerified = await verifyOpenTx({ expected, openPayload: payload });
-            const existing = await args.store.getChannel(preVerified.channelId);
-            if (existing) {
-                channelId = preVerified.channelId;
-                deposit = preVerified.deposit;
-                channelPayer = preVerified.payer;
-                openSlot = preVerified.openSlot;
-                signature = payload.signature;
-            } else {
-                const submitted = await submitOpenTx({
-                    expected,
-                    openPayload: payload,
-                    payerSigner: args.payerSigner,
-                    rpc: args.rpc as SubmitOpenRpc,
-                });
-                channelId = submitted.channelId;
-                deposit = submitted.deposit;
-                channelPayer = submitted.payer;
-                openSlot = submitted.openSlot;
-                signature = submitted.signature as unknown as string;
-            }
-        } else {
-            const verified = await verifyOpenTx({
-                expected,
-                openPayload: payload,
-                rpc: args.rpc as VerifyOpenRpc | undefined,
-            });
-            channelId = verified.channelId;
-            deposit = verified.deposit;
-            channelPayer = verified.payer;
-            openSlot = verified.openSlot;
-            signature = payload.signature;
-        }
-    } else if (mode === 'push') {
-        // No transaction in payload: the client asserts a previously
-        // broadcast open. When an RPC client is configured the open
-        // signature is confirmed on-chain before persisting (mirrors
-        // Rust `process_open`); without one the channelId/deposit
-        // fields are trusted as-is, matching Rust with `rpc_url`
-        // unset. The generated payment-channels client has no Channel
-        // account decoder yet, so the on-chain channel fields
-        // (payee/mint/authorizedSigner/deposit) are not re-checked.
-        channelId = expectString(payload.channelId, 'channelId');
-        deposit = parseU64String(expectString(payload.deposit, 'deposit'), 'deposit');
-        signature = payload.signature;
-        if (args.rpc) {
-            await assertSignatureSucceeded(args.rpc as VerifyOpenRpc, expectString(signature, 'signature'), 'open');
-        }
-    } else {
-        // pull mode: trust the channelId/tokenAccount + approvedAmount.
-        // Keying order matches Rust `OpenPayload::session_id()`: prefer
-        // channelId, then tokenAccount.
-        channelId = payload.channelId ?? expectString(payload.tokenAccount, 'channelId/tokenAccount');
-        const approved = expectString(payload.approvedAmount ?? payload.deposit, 'approvedAmount/deposit');
-        deposit = parseU64String(approved, 'approvedAmount');
-        signature = payload.signature;
-
-        // Operated-voucher pulls may attach a pre-signed InitMultiDelegate
-        // transaction; submit it idempotently when the PDA is missing.
-        if (
-            args.pullVoucherStrategy === 'operatedVoucher' &&
-            payload.initMultiDelegateTx &&
-            payload.owner &&
-            args.merchantSigner &&
-            isMultiDelegateSubmitRpc(args.rpc)
-        ) {
-            await submitInitMultiDelegateTxIfMissing({
-                initMultiDelegateTx: payload.initMultiDelegateTx,
-                mint: payload.mint ?? args.mint,
-                owner: payload.owner,
-                rpc: args.rpc,
-            });
-        }
+    if (payload.gracePeriodSeconds !== args.gracePeriodSeconds) {
+        throw new Error('open gracePeriodSeconds does not match the challenge');
     }
-
-    if (deposit === 0n) throw new Error('deposit must be greater than zero');
-    if (deposit > args.cap) throw new Error(`deposit ${deposit} exceeds cap ${args.cap}`);
-
-    const newState: ChannelState = {
+    const openSlot = parseU64String(payload.openSlot, 'openSlot');
+    // Bind the open to the specific challenge that authorized it: the client
+    // takes `openSlot` from the challenged `recentSlot` (an earlier slot is
+    // allowed, a later one never is), so a payload outside this window was
+    // not built against this challenge. Mirrors `process_open` in the Rust
+    // SessionServer.
+    const { recentBlockhash, recentSlot } = args.openContext;
+    if (openSlot > recentSlot) {
+        throw new Error(
+            `open openSlot ${openSlot.toString()} is ahead of the challenged recentSlot ${recentSlot.toString()}`,
+        );
+    }
+    if (recentSlot - openSlot > OPEN_SLOT_WINDOW) {
+        throw new Error(
+            `open openSlot ${openSlot.toString()} is outside the ${OPEN_SLOT_WINDOW.toString()}-slot freshness window of the challenged recentSlot ${recentSlot.toString()}`,
+        );
+    }
+    const rentPayer = args.feePayer ? args.feePayerSigner?.address : payload.payer;
+    if (!rentPayer) throw new Error('unable to determine channel rent payer');
+    const expected = {
         authorizedSigner: payload.authorizedSigner,
-        channelId,
+        channelProgram: args.programId.toString(),
+        currency: args.currency,
+        feePayer: rentPayer,
+        minimumDeposit: args.minimumDeposit,
+        mint: args.mint,
+        network: args.network,
+        openSlot,
+        recentBlockhash,
+        recipient: args.recipient,
+        rentPayer,
+        splits: args.distributionSplits ?? [],
+        tokenProgram: args.tokenProgram,
+    };
+    const verified = await verifyOpenTx({ expected, openPayload: payload });
+
+    const effectiveIdleTimeoutSeconds = resolveIdleTimeoutSeconds({
+        defaultSeconds: args.idleTimeoutSeconds,
+        options: args.idleTimeoutOptionsSeconds,
+        selected: payload.idleTimeoutSeconds,
+    });
+    if (args.voucherSigner === 'operator') {
+        const authentication = payload.authentication;
+        if (!authentication) throw new Error('operator voucher signing requires authentication');
+        if (authentication.challengeId !== args.challengeId) {
+            throw new Error('session authentication challengeId does not match the open challenge');
+        }
+        if (authentication.payer !== verified.payer) {
+            throw new Error('session authentication payer does not match the channel payer');
+        }
+        if (!(await verifySessionAuthentication(authentication, verified.channelId))) {
+            throw new Error('invalid session authentication signature');
+        }
+    }
+
+    let signature: string | undefined;
+    const newState: ChannelState = {
+        authentication: payload.authentication,
+        authorizedSigner: payload.authorizedSigner,
+        channelId: verified.channelId,
         closeRequestedAt: undefined,
         committedDeliveries: [],
         cumulative: 0n,
-        deposit,
+        deposit: verified.deposit,
         highestVoucherExpiresAt: undefined,
         highestVoucherSignature: undefined,
+        idleTimeoutSeconds: effectiveIdleTimeoutSeconds,
+        lastActivityAt: Date.now(),
         nextDeliverySequence: 0n,
-        openSlot,
-        // Prefer the payer read from the verified open transaction (account 0,
-        // what the channel actually records) over the client-supplied payload
-        // fields, which could be stale/wrong. Fall back to the payload only for
-        // opens with no transaction to verify (bare push assertion / pull).
-        operator: channelPayer ?? payload.owner ?? payload.payer,
+        openSlot: verified.openSlot,
+        openingChallengeId: args.challengeId,
+        payer: verified.payer,
         pendingDeliveries: [],
+        processedUses: [],
+        rentPayer,
+        schemaVersion: CHANNEL_STATE_SCHEMA_VERSION,
         sealed: false,
+        settledOnChain: 0n,
+        spentAmount: 0n,
+        voucherSigner: args.voucherSigner,
     };
 
     // The existence check lives inside the atomic mutator so a concurrent
     // open replay cannot race a fresh create.
-    await args.store.updateChannel(channelId, current => {
+    const persisted = await args.store.updateChannel(verified.channelId, async current => {
         if (current) {
             if (current.sealed) {
-                throw new Error(`Channel ${channelId} is already sealed`);
+                throw new Error(`Channel ${verified.channelId} is already sealed`);
             }
-            if (payload.authorizedSigner !== current.authorizedSigner) {
-                throw new Error(
-                    `open replay: authorizedSigner ${payload.authorizedSigner} does not match existing channel ${channelId}`,
-                );
+            if (
+                payload.authorizedSigner !== current.authorizedSigner ||
+                verified.payer !== current.payer ||
+                verified.deposit !== current.deposit ||
+                verified.openSlot !== current.openSlot ||
+                rentPayer !== current.rentPayer ||
+                args.challengeId !== current.openingChallengeId ||
+                args.voucherSigner !== current.voucherSigner ||
+                !optionalSessionAuthenticationMatches(payload.authentication, current.authentication)
+            ) {
+                throw new Error(`open replay does not match existing channel ${verified.channelId}`);
             }
             // Idempotent replay: never reset the voucher watermark.
-            return current;
+            return { ...current, lastActivityAt: Date.now() };
         }
+        const submitted = await submitOpenTx({
+            expected,
+            openPayload: payload,
+            payerSigner: args.feePayer ? args.feePayerSigner : undefined,
+            rpc: args.rpc as SubmitOpenRpc,
+        });
+        signature = submitted.signature as unknown as string;
         return newState;
     });
-    args.lifecycle?.touch(channelId);
+    args.lifecycle?.touch(verified.channelId, persisted.idleTimeoutSeconds);
 
     return Receipt.from({
         method: 'solana',
         ...(args.challengeId ? { challengeId: args.challengeId } : {}),
         ...(args.externalId ? { externalId: args.externalId } : {}),
-        reference: signature ?? channelId,
+        reference: signature ?? verified.channelId,
         status: 'success',
         timestamp: new Date().toISOString(),
     });
@@ -613,15 +666,119 @@ interface HandleVoucherArgs {
     readonly externalId: string | undefined;
     readonly lifecycle: Lifecycle | undefined;
     readonly minVoucherDelta: bigint | undefined;
-    readonly payload: { readonly action: 'voucher'; readonly voucher: SignedVoucher };
+    readonly payload: { readonly action: 'voucher'; readonly channelId: string; readonly voucher: SignedVoucher };
     /** Forced-close grace period a non-zero voucher expiry must outlast. */
     readonly settlementWindow: bigint | undefined;
     readonly store: SessionStore;
 }
 
+interface HandleUseArgs {
+    readonly challengeId: string | undefined;
+    readonly externalId: string | undefined;
+    readonly idempotencyKey: string;
+    readonly lifecycle: Lifecycle | undefined;
+    readonly operatorVoucherSigner: MessagePartialSigner;
+    readonly payload: {
+        readonly action: 'use';
+        readonly authentication: SessionAuthentication;
+        readonly channelId: string;
+    };
+    readonly price: bigint;
+    readonly store: SessionStore;
+}
+
+async function handleUse(args: HandleUseArgs): Promise<Receipt.Receipt> {
+    const price = args.price;
+    if (price === 0n) throw new Error('session amount must be positive');
+    if (!args.idempotencyKey) throw new Error('operator-signed use requires an Idempotency-Key header');
+    const existing = await args.store.getChannel(args.payload.channelId);
+    if (!existing) throw new Error(`Channel ${args.payload.channelId} not found`);
+    // A record with no binding at all is not a mismatch: it either predates
+    // proof binding or was rewritten by a pre-binding writer. Name it so the
+    // client knows re-opening — not retrying the proof — is the fix.
+    if (!existing.openingChallengeId && !existing.authentication) {
+        throw new Error('session channel predates proof binding; open a new session');
+    }
+    if (existing.voucherSigner !== 'operator' || !existing.authentication) {
+        throw new Error('use is only valid for an operator-signed channel');
+    }
+    if (!sessionAuthenticationMatches(args.payload.authentication, existing.authentication)) {
+        throw new Error('session authentication does not match the proof bound at open');
+    }
+    if (!(await verifySessionAuthentication(args.payload.authentication, args.payload.channelId))) {
+        throw new Error('invalid session authentication signature');
+    }
+
+    let voucherSignature = '';
+    let cumulative = 0n;
+    let idleTimeoutSeconds: number | undefined;
+    await args.store.updateChannel(args.payload.channelId, async current => {
+        if (!current) throw new Error(`Channel ${args.payload.channelId} not found`);
+        if (current.sealed || current.closeRequestedAt !== undefined) {
+            throw new Error('Channel is closed or close is pending');
+        }
+        const replay = current.processedUses.find(use => use.idempotencyKey === args.idempotencyKey);
+        if (replay) {
+            cumulative = replay.cumulative;
+            voucherSignature = replay.voucherSignature;
+            idleTimeoutSeconds = current.idleTimeoutSeconds;
+            return current;
+        }
+        cumulative = current.cumulative + price;
+        idleTimeoutSeconds = current.idleTimeoutSeconds;
+        if (cumulative > current.deposit) throw new Error('insufficient channel availability');
+        const data = {
+            channelId: current.channelId,
+            cumulativeAmount: cumulative.toString(),
+            expiresAt: DEFAULT_SESSION_EXPIRES_AT,
+        };
+        const [signatures] = await args.operatorVoucherSigner.signMessages([
+            createSignableMessage(encodeVoucherMessageLoose(data)),
+        ]);
+        const signature = signatures?.[args.operatorVoucherSigner.address];
+        if (!signature) throw new Error('operator voucher signer did not return a signature');
+        voucherSignature = getBase58Decoder().decode(new Uint8Array(signature));
+        return {
+            ...current,
+            cumulative,
+            highestVoucherExpiresAt: BigInt(DEFAULT_SESSION_EXPIRES_AT),
+            highestVoucherSignature: voucherSignature,
+            lastActivityAt: Date.now(),
+            processedUses: [
+                ...current.processedUses,
+                {
+                    challengeId: args.challengeId ?? '',
+                    cumulative,
+                    idempotencyKey: args.idempotencyKey,
+                    voucherSignature,
+                },
+            ],
+            spentAmount: current.spentAmount + price,
+        };
+    });
+    args.lifecycle?.touch(args.payload.channelId, idleTimeoutSeconds);
+
+    return Receipt.from({
+        method: 'solana',
+        ...(args.challengeId ? { challengeId: args.challengeId } : {}),
+        ...(args.externalId ? { externalId: args.externalId } : {}),
+        reference: `${args.payload.channelId}:${cumulative.toString()}:${voucherSignature}`,
+        status: 'success',
+        timestamp: new Date().toISOString(),
+    });
+}
+
 async function handleVoucher(args: HandleVoucherArgs): Promise<Receipt.Receipt> {
     const signed = normalizeSignedVoucher(args.payload.voucher);
-    const channelId = signed.data.channelId;
+    // The top-level channelId is the routing key; it must never diverge from
+    // the signed voucher's inner channelId (spec: servers MUST reject the
+    // action when the two differ).
+    if (args.payload.channelId !== signed.voucher.channelId) {
+        throw new Error(
+            `invalid-voucher: voucher action channelId ${args.payload.channelId} does not match the signed voucher's channelId ${signed.voucher.channelId}`,
+        );
+    }
+    const channelId = signed.voucher.channelId;
     const existing = await args.store.getChannel(channelId);
     if (!existing) throw new Error(`Channel ${channelId} not found`);
 
@@ -657,9 +814,12 @@ async function handleVoucher(args: HandleVoucherArgs): Promise<Receipt.Receipt> 
             cumulative: result.newCumulative,
             highestVoucherExpiresAt: result.newExpiresAt,
             highestVoucherSignature: result.newSignature,
+            lastActivityAt: Date.now(),
         };
     });
-    args.lifecycle?.touch(channelId);
+    if (finalResult.status === 'accepted') {
+        args.lifecycle?.touch(channelId, existing.idleTimeoutSeconds);
+    }
 
     const cumulative =
         finalResult.status === 'accepted' || finalResult.status === 'replayed' ? finalResult.newCumulative : 0n;
@@ -674,86 +834,82 @@ async function handleVoucher(args: HandleVoucherArgs): Promise<Receipt.Receipt> 
     });
 }
 
-interface HandleCommitArgs {
-    readonly challengeId: string | undefined;
-    readonly externalId: string | undefined;
-    readonly lifecycle: Lifecycle | undefined;
-    readonly payload: { readonly action: 'commit'; readonly deliveryId: string; readonly voucher: SignedVoucher };
-    readonly settlementWindow: bigint | undefined;
-    readonly store: SessionStore;
-}
-
-async function handleCommit(args: HandleCommitArgs): Promise<Receipt.Receipt> {
-    const receipt = await commitDelivery(args.store, {
-        deliveryId: args.payload.deliveryId,
-        settlementWindow: args.settlementWindow,
-        voucher: args.payload.voucher,
-    });
-    args.lifecycle?.touch(receipt.sessionId);
-
-    return Receipt.from({
-        method: 'solana',
-        ...(args.challengeId ? { challengeId: args.challengeId } : {}),
-        ...(args.externalId ? { externalId: args.externalId } : {}),
-        reference: `${receipt.sessionId}:${receipt.deliveryId}:${receipt.cumulative}`,
-        status: 'success',
-        timestamp: new Date().toISOString(),
-    });
-}
-
 interface HandleTopUpArgs {
-    readonly cap: bigint;
     readonly challengeId: string | undefined;
+    readonly channelProgram: string;
     readonly externalId: string | undefined;
     readonly lifecycle: Lifecycle | undefined;
     readonly payload: {
         readonly action: 'topUp';
+        readonly additionalAmount: string;
         readonly channelId: string;
-        readonly newDeposit: string;
-        readonly signature: string;
+        readonly transaction: string;
     };
-    readonly rpc: RpcLike | undefined;
+    readonly rpc: RpcLike;
     readonly store: SessionStore;
 }
 
 async function handleTopUp(args: HandleTopUpArgs): Promise<Receipt.Receipt> {
-    const newDeposit = parseU64String(args.payload.newDeposit, 'newDeposit');
-    if (newDeposit > args.cap) {
-        throw new Error(`newDeposit ${newDeposit} exceeds cap ${args.cap}`);
-    }
+    const additionalAmount = parseU64String(args.payload.additionalAmount, 'additionalAmount');
+    if (additionalAmount === 0n) throw new Error('additionalAmount must be positive');
 
     // Cheap pre-checks before touching the network.
     const existing = await args.store.getChannel(args.payload.channelId);
     if (!existing) throw new Error(`Channel ${args.payload.channelId} not found`);
+    // Idempotent replay: this exact transaction was already credited, so
+    // report success without re-broadcasting (a re-broadcast of a landed
+    // transaction fails at preflight).
+    const topUpSignature = transactionSignatureFromWire(args.payload.transaction) as unknown as string;
+    if (existing.processedTopUpSignatures?.includes(topUpSignature)) {
+        return Receipt.from({
+            method: 'solana',
+            ...(args.challengeId ? { challengeId: args.challengeId } : {}),
+            ...(args.externalId ? { externalId: args.externalId } : {}),
+            reference: topUpSignature,
+            status: 'success',
+            timestamp: new Date().toISOString(),
+        });
+    }
     if (existing.sealed) throw new Error('Channel is already sealed');
     if (existing.closeRequestedAt !== undefined) {
         throw new Error('Channel close is pending — no further top-ups accepted');
     }
 
-    // Confirm the top-up transaction on-chain before raising the deposit
-    // (parity with the open-signature verification).
-    if (args.rpc) {
-        await assertSignatureSucceeded(args.rpc as VerifyOpenRpc, args.payload.signature, 'topUp');
-    }
+    const signature = await submitTopUpTx({
+        additionalAmount,
+        channelId: args.payload.channelId,
+        channelProgram: args.channelProgram,
+        currentDeposit: existing.deposit,
+        payer: existing.payer,
+        rpc: args.rpc as SubmitOpenRpc,
+        transaction: args.payload.transaction,
+    });
 
     const result = await args.store.updateChannel(args.payload.channelId, current => {
         if (!current) throw new Error(`Channel ${args.payload.channelId} not found`);
+        // Signature dedupe must live inside the atomic mutator: two
+        // in-flight submissions of the same signed top-up both confirm the
+        // same landed transaction, so only the first check-and-record may
+        // credit the deposit.
+        if (current.processedTopUpSignatures?.includes(topUpSignature)) return current;
         if (current.sealed) throw new Error('Channel is already sealed');
         if (current.closeRequestedAt !== undefined) {
             throw new Error('Channel close is pending — no further top-ups accepted');
         }
-        if (newDeposit <= current.deposit) {
-            throw new Error(`newDeposit ${newDeposit} must exceed current deposit ${current.deposit}`);
-        }
-        return { ...current, deposit: newDeposit };
+        return {
+            ...current,
+            deposit: current.deposit + additionalAmount,
+            lastActivityAt: Date.now(),
+            processedTopUpSignatures: [...(current.processedTopUpSignatures ?? []), topUpSignature],
+        };
     });
-    args.lifecycle?.touch(result.channelId);
+    args.lifecycle?.touch(result.channelId, result.idleTimeoutSeconds);
 
     return Receipt.from({
         method: 'solana',
         ...(args.challengeId ? { challengeId: args.challengeId } : {}),
         ...(args.externalId ? { externalId: args.externalId } : {}),
-        reference: args.payload.signature,
+        reference: signature as unknown as string,
         status: 'success',
         timestamp: new Date().toISOString(),
     });
@@ -768,35 +924,68 @@ interface HandleCloseArgs {
     readonly merchantSigner: TransactionPartialSigner | undefined;
     readonly mint: string;
     readonly network: string;
-    /** Operator recorded as the channel `rentPayer` at open. */
-    readonly operator: string;
     readonly payload: {
         readonly action: 'close';
+        readonly authentication?: SessionAuthentication | undefined;
         readonly channelId: string;
         readonly voucher?: SignedVoucher | undefined;
     };
     readonly programId: Address;
     readonly recipient: string;
-    readonly rpc: RpcLike | undefined;
+    readonly rentPayer: string | undefined;
+    readonly rpc: RpcLike;
     readonly settlementWindow: bigint | undefined;
-    readonly splits: readonly SessionSplit[] | undefined;
+    readonly splits: readonly { readonly bps: number; readonly recipient: string }[] | undefined;
     readonly store: SessionStore;
     readonly tokenProgram: string;
 }
 
 async function handleClose(args: HandleCloseArgs): Promise<Receipt.Receipt> {
     const channelId = args.payload.channelId;
+    // Same routing-key invariant as the voucher action: a final voucher
+    // nested in a close must be bound to the channel being closed.
+    if (args.payload.voucher && args.payload.voucher.voucher.channelId !== channelId) {
+        throw new Error(
+            `invalid-voucher: close voucher channelId ${args.payload.voucher.voucher.channelId} does not match the close channelId ${channelId}`,
+        );
+    }
     const now = BigInt(Math.floor(Date.now() / 1000));
 
     // Accept the optional final voucher and flip close-pending atomically.
     await args.store.updateChannel(channelId, async current => {
         if (!current) throw new Error(`Channel ${channelId} not found`);
         if (current.sealed) throw new Error('Channel is already sealed');
+        // A close that presents authentication against a record with no proof
+        // binding (and no operator marker) is an operator-signed session whose
+        // record predates — or was stripped of — the binding fields.
+        if (
+            args.payload.authentication &&
+            current.voucherSigner !== 'operator' &&
+            !current.openingChallengeId &&
+            !current.authentication
+        ) {
+            throw new Error('session channel predates proof binding; the lifecycle worker will close it');
+        }
+        if (current.voucherSigner === 'operator') {
+            if (args.payload.voucher) throw new Error('operator-mode close must not include a voucher');
+            if (!args.payload.authentication) {
+                throw new Error('operator-mode close requires the bound authentication proof');
+            }
+            if (!current.authentication) {
+                throw new Error('session channel predates proof binding; the lifecycle worker will close it');
+            }
+            if (!sessionAuthenticationMatches(args.payload.authentication, current.authentication)) {
+                throw new Error('close authentication does not match the proof bound at open');
+            }
+            if (!(await verifySessionAuthentication(args.payload.authentication, channelId))) {
+                throw new Error('invalid close authentication signature');
+            }
+        } else {
+            if (args.payload.authentication) throw new Error('client-mode close must not include authentication');
+            if (!args.payload.voucher) throw new Error('client-mode close requires a voucher');
+        }
+
         if (current.closeRequestedAt !== undefined) {
-            // Re-drivable close: a prior close flipped the flag but the
-            // on-chain settle never recorded a signature — let the retry
-            // proceed (without mutating the watermark) so the channel is
-            // not stranded by a transient settlement failure.
             if (current.settledSignature === undefined) return current;
             throw new Error('Close already requested');
         }
@@ -839,7 +1028,7 @@ async function handleClose(args: HandleCloseArgs): Promise<Receipt.Receipt> {
     });
 
     let onChainSignature: string | undefined;
-    if (args.merchantSigner && args.rpc) {
+    if (args.merchantSigner) {
         const closed = await closeAndSettleChannel({
             channelId,
             currency: args.currency,
@@ -847,9 +1036,9 @@ async function handleClose(args: HandleCloseArgs): Promise<Receipt.Receipt> {
             merchantSigner: args.merchantSigner,
             mint: args.mint,
             network: args.network,
-            operator: args.operator,
             programId: args.programId,
             recipient: args.recipient,
+            rentPayer: args.rentPayer,
             rpc: args.rpc,
             splits: args.splits,
             store: args.store,
@@ -868,6 +1057,23 @@ async function handleClose(args: HandleCloseArgs): Promise<Receipt.Receipt> {
         status: 'success',
         timestamp: new Date().toISOString(),
     });
+}
+
+function sessionAuthenticationMatches(left: SessionAuthentication, right: SessionAuthentication): boolean {
+    return (
+        left.type === right.type &&
+        left.challengeId === right.challengeId &&
+        left.payer === right.payer &&
+        left.signature === right.signature
+    );
+}
+
+function optionalSessionAuthenticationMatches(
+    left: SessionAuthentication | undefined,
+    right: SessionAuthentication | undefined,
+): boolean {
+    if (left === undefined || right === undefined) return left === right;
+    return sessionAuthenticationMatches(left, right);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -945,8 +1151,8 @@ interface CommitDeliveryArgs {
 
 async function commitDelivery(store: SessionStore, args: CommitDeliveryArgs): Promise<CommitReceipt> {
     const signed = normalizeSignedVoucher(args.voucher);
-    const channelId = signed.data.channelId;
-    const newCumulative = parseU64String(signed.data.cumulativeAmount, 'cumulativeAmount');
+    const channelId = signed.voucher.channelId;
+    const newCumulative = parseU64String(signed.voucher.cumulativeAmount, 'cumulativeAmount');
     const now = BigInt(Math.floor(Date.now() / 1000));
 
     let outcome: { amount: bigint; cumulative: bigint; status: 'committed' | 'replayed' } | undefined;
@@ -1005,8 +1211,9 @@ async function commitDelivery(store: SessionStore, args: CommitDeliveryArgs): Pr
             ...current,
             committedDeliveries: [...current.committedDeliveries, committedDelivery],
             cumulative: newCumulative,
-            highestVoucherExpiresAt: BigInt(signed.data.expiresAt),
+            highestVoucherExpiresAt: BigInt(signed.voucher.expiresAt ?? 0),
             highestVoucherSignature: signed.signature,
+            lastActivityAt: Date.now(),
             pendingDeliveries: nextPending,
         };
     });
@@ -1032,12 +1239,11 @@ interface CloseAndSettleArgs {
     readonly merchantSigner: TransactionPartialSigner;
     readonly mint: string;
     readonly network: string;
-    /** Operator recorded as the channel `rentPayer` at open. */
-    readonly operator: string;
     readonly programId: Address;
     readonly recipient: string;
+    readonly rentPayer: string | undefined;
     readonly rpc: RpcLike;
-    readonly splits: readonly SessionSplit[] | undefined;
+    readonly splits: readonly { readonly bps: number; readonly recipient: string }[] | undefined;
     readonly store: SessionStore;
     readonly tokenProgram: string;
 }
@@ -1054,27 +1260,19 @@ async function closeAndSettleChannel(args: CloseAndSettleArgs): Promise<SubmitSe
     const state = await args.store.getChannel(args.channelId);
     if (!state) return undefined;
 
-    // The distribute refund goes to the channel payer (the program enforces
-    // `payer == channel.payer`). It is recorded as `state.operator` at open.
-    // Never fall back to the recipient: refunding the merchant would derive the
-    // wrong refund token account and the settlement would fail on-chain.
-    if (!state.operator) {
-        throw new Error(
-            `cannot settle channel ${args.channelId}: the channel payer (refund destination) was not recorded at open`,
-        );
-    }
-
     let voucher: { authorizedSigner: string; signed: SignedVoucher } | undefined;
     if (state.highestVoucherSignature && state.highestVoucherExpiresAt !== undefined && state.cumulative > 0n) {
         voucher = {
             authorizedSigner: state.authorizedSigner,
             signed: {
-                data: {
+                signature: state.highestVoucherSignature,
+                signatureType: 'ed25519',
+                signer: state.authorizedSigner,
+                voucher: {
                     channelId: args.channelId,
                     cumulativeAmount: state.cumulative.toString(),
                     expiresAt: Number(state.highestVoucherExpiresAt),
                 },
-                signature: state.highestVoucherSignature,
             },
         };
     }
@@ -1091,13 +1289,10 @@ async function closeAndSettleChannel(args: CloseAndSettleArgs): Promise<SubmitSe
         mint: args.mint,
         network: args.network,
         payee: args.recipient,
-        payer: state.operator,
+        payer: state.payer,
 
         programId: args.programId,
-        // rentPayer reclaims the channel/escrow rent at distribute; it is the
-        // operator recorded as the channel rentPayer at open (the fee payer),
-        // not the refund payer carried in state.operator.
-        rentPayer: args.operator,
+        rentPayer: state.rentPayer,
         rpc: args.rpc as unknown as {
             sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
         },
@@ -1109,7 +1304,12 @@ async function closeAndSettleChannel(args: CloseAndSettleArgs): Promise<SubmitSe
 
     await args.store.updateChannel(args.channelId, current => {
         if (!current) throw new Error(`Channel ${args.channelId} disappeared during settle`);
-        return { ...current, sealed: true, settledSignature: result.signature as unknown as string };
+        return {
+            ...current,
+            sealed: true,
+            settledOnChain: current.cumulative,
+            settledSignature: result.signature as unknown as string,
+        };
     });
     return result;
 }
@@ -1124,25 +1324,17 @@ function rejectIfVoucherRejected(result: VoucherVerifyResult): void {
     }
 }
 
-/** Throw unless `signature` exists on-chain and executed without error. */
-async function assertSignatureSucceeded(rpc: VerifyOpenRpc, signature: string, context: string): Promise<void> {
-    const [status] = (await rpc.getSignatureStatuses([signature as Signature]).send()).value;
-    if (!status) {
-        throw new Error(`${context}: tx ${signature} not found on-chain`);
-    }
-    if (status.err) {
-        throw new Error(`${context}: tx ${signature} failed on-chain: ${JSON.stringify(status.err)}`);
-    }
-}
-
 /** Throw unless the voucher's Ed25519 signature verifies against `authorizedSigner`. */
 async function assertVoucherSignature(signed: SignedVoucher, authorizedSigner: string): Promise<void> {
+    if (signed.signatureType !== 'ed25519' || signed.signer !== authorizedSigner) {
+        throw new Error('invalid-signature: voucher signer does not match the channel');
+    }
     let valid = false;
     try {
         valid = await verifyVoucherSignature({
             signatureBase58: signed.signature,
             signerBase58: authorizedSigner,
-            voucher: signed.data,
+            voucher: signed.voucher,
         });
     } catch (error) {
         throw new Error(`invalid-signature: ${errorMessage(error)}`);
@@ -1152,32 +1344,11 @@ async function assertVoucherSignature(signed: SignedVoucher, authorizedSigner: s
     }
 }
 
-function isMultiDelegateSubmitRpc(rpc: RpcLike | undefined): rpc is MultiDelegateSubmitRpc {
-    if (!rpc) return false;
-    const candidate = rpc as Partial<MultiDelegateSubmitRpc>;
-    return (
-        typeof candidate.getAccountInfo === 'function' &&
-        typeof candidate.sendTransaction === 'function' &&
-        typeof candidate.getSignatureStatuses === 'function'
-    );
-}
-
-function expectString(value: string | undefined, name: string): string {
-    if (!value) throw new Error(`${name} required`);
-    return value;
-}
-
 function parseU64String(value: string, name: string): bigint {
     if (!/^\d+$/.test(value)) throw new Error(`${name} is not an unsigned integer string: ${value}`);
     const parsed = BigInt(value);
     if (parsed < 0n || parsed > (1n << 64n) - 1n) throw new Error(`${name} outside u64 range`);
     return parsed;
-}
-
-/** Parse an optional u64 carried on the wire as a decimal string or number. */
-function parseOptionalU64(value: number | string | undefined, name: string): bigint | undefined {
-    if (value === undefined) return undefined;
-    return parseU64String(String(value), name);
 }
 
 function errorMessage(error: unknown): string {
@@ -1209,25 +1380,26 @@ export type VerifyOpenRpc = {
 
 /** Minimal RPC subset used to verify and submit open transactions. */
 export type SubmitOpenRpc = VerifyOpenRpc & {
+    getAccountInfo(address: Address, config?: unknown): { send(): Promise<unknown> };
+    /**
+     * Optional: lets a narrow RPC serve fresh-challenge issuance too. A
+     * new-channel 402 needs `recentBlockhash`/`recentSlot` from one
+     * `getLatestBlockhash` call; without this (or a `blockhashCache`) the
+     * challenge fails rather than degrade.
+     */
+    getLatestBlockhash?(config?: unknown): {
+        send(): Promise<{ context: { slot: bigint | number }; value: { blockhash: string } }>;
+    };
     sendTransaction(wire: string, config?: unknown): { send(): Promise<Signature> };
 };
 
 type CredentialPayload = {
     challenge: {
+        expires?: string;
         id?: string;
         request: SessionRequest;
     };
-    payload:
-        | {
-              readonly action: 'topUp';
-              readonly channelId: string;
-              readonly newDeposit: string;
-              readonly signature: string;
-          }
-        | { readonly action: 'close'; readonly channelId: string; readonly voucher?: SignedVoucher | undefined }
-        | { readonly action: 'commit'; readonly deliveryId: string; readonly voucher: SignedVoucher }
-        | { readonly action: 'voucher'; readonly voucher: SignedVoucher }
-        | (OpenPayload & { readonly action: 'open' });
+    payload: SessionAction;
 };
 
 interface DeliveryRequestBody {
@@ -1245,11 +1417,6 @@ interface CommitRequestBody {
 }
 
 export declare namespace session {
-    interface SessionPricing {
-        /** Default delivery price in base units. Optional — callers may price each delivery individually. */
-        readonly perDelivery?: bigint | undefined;
-    }
-
     interface RoutesHandlers {
         /** POST handler — commit a reserved delivery. */
         readonly commit: (request: Request) => Promise<Response>;
@@ -1257,41 +1424,64 @@ export declare namespace session {
         readonly deliveries: (request: Request) => Promise<Response>;
     }
 
+    /**
+     * One cached `getLatestBlockhash` observation: the blockhash from
+     * `result.value.blockhash` plus the slot from `result.context.slot`.
+     */
+    interface CachedBlockhash {
+        readonly blockhash: string;
+        readonly slot: bigint | number;
+    }
+
+    /**
+     * Host-refreshed recent-blockhash cache shared with challenge issuance,
+     * so the challenge's `recentBlockhash`/`recentSlot` come from one cached
+     * `getLatestBlockhash` instead of a blocking RPC round-trip per 402.
+     * Return `undefined` when empty or stale to fall back to a direct fetch.
+     * Mirrors `SessionServer::with_blockhash_cache` in the Rust SDK.
+     */
+    interface BlockhashCache {
+        get(): CachedBlockhash | undefined;
+    }
+
     interface Parameters {
-        /** Maximum session cap the server will offer (base units). */
-        readonly cap: bigint;
-        /** Idle-close delay in ms. 0 (default) disables the watchdog. */
-        readonly closeDelayMs?: number;
+        /** Price per unit of service, in base units. */
+        readonly amount: bigint;
+        /**
+         * Optional shared recent-blockhash cache consulted before the direct
+         * `getLatestBlockhash` fallback when issuing new-channel challenges.
+         */
+        readonly blockhashCache?: BlockhashCache;
+        /** Payment-channels program ID. */
+        readonly channelProgram?: Address | string;
         /** Currency identifier (e.g. 'USDC' or an SPL mint address). */
         readonly currency: string;
         /** Token decimals (default 6). */
         readonly decimals?: number;
+        /** Ordered split preimage proposed by the merchant. */
+        readonly distributionSplits?: readonly SessionSplit[];
+        /** Whether the server sponsors the open transaction fee. */
+        readonly feePayer?: boolean;
+        /** Signer that sponsors fees and channel rent when `feePayer` is true. */
+        readonly feePayerSigner?: TransactionPartialSigner;
+        /** Forced-close grace period written into new channels. */
+        readonly gracePeriodSeconds: number;
+        /** Inactivity thresholds offered to clients for a new channel. */
+        readonly idleTimeoutOptionsSeconds?: readonly number[];
+        /** Server-selected inactivity threshold in seconds. Defaults to 300. */
+        readonly idleTimeoutSeconds?: number;
         /** Minimum voucher increment in base units. Defaults to 0. */
         readonly minVoucherDelta?: bigint;
-        /** Funding modes. Defaults to ['push']. */
-        readonly modes?: readonly SessionMode[];
+        /** Minimum accepted initial deposit. */
+        readonly minimumDeposit?: bigint;
         /** Solana network. Defaults to 'mainnet'. */
         readonly network?: string;
-        /** Server submits the client's push-mode open tx itself. */
-        readonly openTxSubmitter?: 'client' | 'server';
-        /** Operator public key (base58). */
-        readonly operator: string;
-        /** Signer used when push-mode `openTxSubmitter='server'` requires a fee-payer signer. */
-        readonly paymentChannelPayerSigner?: TransactionPartialSigner;
-        /** Pricing hints surfaced to clients (Phase F+ will use these). */
-        readonly pricing: SessionPricing;
-        /** Payment-channels program ID override. */
-        readonly programId?: Address | string;
-        /** Voucher authority for pull-mode sessions. Required when modes includes 'pull'. */
-        readonly pullVoucherStrategy?: SessionPullVoucherStrategy;
+        /** Ed25519 signer used to create cumulative vouchers in operator mode. */
+        readonly operatorVoucherSigner?: MessagePartialSigner;
         /** Primary recipient (base58). */
         readonly recipient: string;
-        /** Optional RPC client used for on-chain checks + transactions. */
-        readonly rpc?: RpcLike;
-        /** RPC URL for blockhash prefetch. Defaults from `network`. */
-        readonly rpcUrl?: string;
-        /** Voucher signing authority advertised by this session. */
-        readonly settlementAuthority?: SessionSettlementAuthority;
+        /** RPC client used to submit, confirm, and verify channel transactions. */
+        readonly rpc: RpcLike;
         /**
          * Settlement window in seconds — the forced-close grace period a
          * non-zero voucher `expiresAt` must outlast. When set, a voucher
@@ -1304,12 +1494,16 @@ export declare namespace session {
          */
         readonly settlementWindowSeconds?: bigint;
         /** Merchant signer for settle_and_seal + distribute IXs. */
-        readonly signer?: TransactionPartialSigner;
-        /** Optional basis-point splits distributed at close. Max 8. */
-        readonly splits?: readonly SessionSplit[];
+        readonly signer: TransactionPartialSigner;
         /** Pluggable session store. Defaults to in-memory. */
         readonly store?: SessionStore;
+        /** Suggested initial deposit. */
+        readonly suggestedDeposit?: bigint;
         /** SPL token program (TOKEN_PROGRAM or TOKEN_2022_PROGRAM). Defaults from currency/network. */
         readonly tokenProgram?: string;
+        /** Unit priced by `amount`. */
+        readonly unitType?: string;
+        /** Voucher signing authority advertised by this session. */
+        readonly voucherSigner?: SessionVoucherSigner;
     }
 }

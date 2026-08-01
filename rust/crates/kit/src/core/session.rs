@@ -197,7 +197,7 @@ pub async fn accept_voucher(
 mod tests {
     use super::*;
     use crate::core::payment_channels::voucher_message_bytes;
-    use crate::core::store::MemoryChannelStore;
+    use crate::core::store::{MemoryChannelStore, CHANNEL_STATE_SCHEMA_VERSION};
     use ed25519_dalek::{Signer, SigningKey};
     use solana_pubkey::Pubkey;
 
@@ -231,11 +231,23 @@ mod tests {
                     highest_voucher_expires_at: None,
                     close_requested_at: None,
                     open_slot: None,
-                    operator: None,
+                    payer: String::new(),
+                    rent_payer: String::new(),
+                    opening_challenge_id: String::new(),
+                    authentication: None,
+                    voucher_signer: "client".to_string(),
+                    idle_timeout_seconds: None,
+                    last_activity_at: 0,
+                    spent_amount: 0,
+                    settled_on_chain: 0,
+                    processed_uses: vec![],
+                    processed_topup_signatures: vec![],
                     next_delivery_sequence: 0,
                     pending_deliveries: vec![],
                     committed_deliveries: vec![],
                     lifecycle: None,
+                    schema_version: CHANNEL_STATE_SCHEMA_VERSION,
+                    extra: Default::default(),
                 },
             )
             .await
@@ -292,11 +304,23 @@ mod tests {
             highest_voucher_expires_at: None,
             close_requested_at: None,
             open_slot: None,
-            operator: None,
+            payer: String::new(),
+            rent_payer: String::new(),
+            opening_challenge_id: String::new(),
+            authentication: None,
+            voucher_signer: "client".to_string(),
+            idle_timeout_seconds: None,
+            last_activity_at: 0,
+            spent_amount: 0,
+            settled_on_chain: 0,
+            processed_uses: vec![],
+            processed_topup_signatures: vec![],
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
             committed_deliveries: vec![],
             lifecycle: None,
+            schema_version: CHANNEL_STATE_SCHEMA_VERSION,
+            extra: Default::default(),
         }
     }
 

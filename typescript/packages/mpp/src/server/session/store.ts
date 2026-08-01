@@ -11,6 +11,8 @@
 // `store.updateChannel`. That keeps the verifier easy to test and lets
 // the integration layer pick its own consistency story (CAS, RMW, etc.).
 
+import type { SessionAuthentication, SessionVoucherSigner } from '../../client/Session.js';
+
 /**
  * One delivery that the server has reserved against a channel but not yet
  * received a signed voucher for. Mirrors Rust `PendingDelivery`.
@@ -33,20 +35,36 @@ export interface CommittedDelivery {
     readonly voucherSignature: string;
 }
 
+/** Cached operator-use result keyed by the HTTP idempotency key. */
+export interface ProcessedUse {
+    readonly challengeId: string;
+    readonly cumulative: bigint;
+    readonly idempotencyKey: string;
+    readonly voucherSignature: string;
+}
+
+/**
+ * Schema version stamped on every channel record this SDK writes.
+ *
+ * Durable store implementations MUST refuse to load a record whose
+ * `schemaVersion` is newer than this value (decoding it would drop the
+ * fields this SDK does not know, and a re-encode would destroy them for
+ * every reader), and MUST round-trip unknown fields verbatim when they
+ * serialize a record. Mirrors Rust `CHANNEL_STATE_SCHEMA_VERSION`.
+ */
+export const CHANNEL_STATE_SCHEMA_VERSION = 1;
+
 /**
  * Persisted state of a single payment channel from the server's POV.
  * Field-for-field mirror of Rust `ChannelState`. `bigint` is used for
  * every Rust `u64` so we don't lose precision on > 2^53 amounts.
  */
 export interface ChannelState {
+    /** Reusable payer proof bound at open for operator-signed vouchers. */
+    readonly authentication?: SessionAuthentication | undefined;
     /** Public key authorized to sign vouchers for this session (base58). */
     readonly authorizedSigner: string;
-    /**
-     * On-chain channel address (base58).
-     *
-     * - Push sessions: payment-channel address.
-     * - Pull sessions: FixedDelegation PDA address.
-     */
+    /** On-chain payment-channel address (base58). */
     readonly channelId: string;
     /** Unix seconds when cooperative close was requested. Vouchers blocked once set. */
     readonly closeRequestedAt?: bigint | undefined;
@@ -60,22 +78,50 @@ export interface ChannelState {
     readonly highestVoucherExpiresAt?: bigint | undefined;
     /** Signature of the highest accepted voucher (base58). For idempotent replay. */
     readonly highestVoucherSignature?: string | undefined;
+    /** Effective negotiated inactivity threshold, in seconds. */
+    readonly idleTimeoutSeconds?: number | undefined;
+    /** Unix milliseconds of the most recent accepted channel activity. */
+    readonly lastActivityAt?: number | undefined;
     /** Next server-side metered delivery sequence. */
     readonly nextDeliverySequence: bigint;
     /**
      * Slot the channel was opened at (a channel PDA seed). Needed to
      * re-derive the PDA and to gate reclaim (`slot > openSlot + 1500`).
-     * `undefined` for pull sessions and bare push opens that never carried it.
      */
     readonly openSlot?: bigint | undefined;
-    /** Pull-mode only: client wallet pubkey (base58). `undefined` for push. */
-    readonly operator?: string | undefined;
+    /** Challenge that was verified when the channel proof was bound. */
+    readonly openingChallengeId?: string | undefined;
+    /** On-chain channel payer and refund destination. */
+    readonly payer: string;
     /** Deliveries reserved but not yet committed. */
     readonly pendingDeliveries: readonly PendingDelivery[];
+    /**
+     * Transaction signatures of top-ups already credited to `deposit`
+     * (base58). Checked inside the atomic top-up mutator so a resubmitted or
+     * concurrently duplicated top-up transaction credits exactly once.
+     * `undefined` on records written before this field existed. Mirrors Rust
+     * `processed_topup_signatures`.
+     */
+    readonly processedTopUpSignatures?: readonly string[] | undefined;
+    /** Cached use results used to make retries exactly-once. */
+    readonly processedUses: readonly ProcessedUse[];
+    /** Account that funded and receives the channel rent. */
+    readonly rentPayer: string;
+    /**
+     * Schema version stamped by the last writer. `undefined`/`0` for records
+     * persisted before versioning. See `CHANNEL_STATE_SCHEMA_VERSION`.
+     */
+    readonly schemaVersion?: number | undefined;
     /** True once the channel has been sealed on-chain. */
     readonly sealed: boolean;
+    /** Highest cumulative amount confirmed settled on-chain. */
+    readonly settledOnChain: bigint;
     /** On-chain settle_and_seal transaction signature (base58), once submitted. */
     readonly settledSignature?: string | undefined;
+    /** Cumulative amount charged for delivered service. */
+    readonly spentAmount: bigint;
+    /** Party responsible for signing cumulative vouchers. */
+    readonly voucherSigner?: SessionVoucherSigner | undefined;
 }
 
 /**

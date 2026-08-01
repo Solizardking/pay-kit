@@ -49,7 +49,7 @@ class _RecordingTransport:
             delivery_id=directive.delivery_id,
             session_id=directive.session_id,
             amount=directive.amount,
-            cumulative=payload.voucher.data.cumulative,
+            cumulative=payload.voucher.data.cumulative_amount,
             status="committed",
         )
 
@@ -242,9 +242,9 @@ def test_http_commit_transport_success_and_errors() -> None:
                 200,
                 json={
                     "deliveryId": body["deliveryId"],
-                    "sessionId": body["voucher"]["data"]["channelId"],
-                    "amount": body["voucher"]["data"]["cumulativeAmount"],
-                    "cumulative": body["voucher"]["data"]["cumulativeAmount"],
+                    "sessionId": body["voucher"]["voucher"]["channelId"],
+                    "amount": body["voucher"]["voucher"]["cumulativeAmount"],
+                    "cumulative": body["voucher"]["voucher"]["cumulativeAmount"],
                     "status": "committed",
                 },
             )
@@ -286,7 +286,7 @@ def test_http_commit_transport_prefers_directive_commit_url() -> None:
                 "deliveryId": body["deliveryId"],
                 "sessionId": "chan",
                 "amount": "88",
-                "cumulative": body["voucher"]["data"]["cumulativeAmount"],
+                "cumulative": body["voucher"]["voucher"]["cumulativeAmount"],
                 "status": "committed",
             },
         )

@@ -1,18 +1,32 @@
+/**
+ * Behavioral coverage for `SessionFetchClient` watermark isolation and commit
+ * failure recovery: re-opening on a new channel flushes the old channel before
+ * the swap, a failed commit surfaces exactly once without poisoning the
+ * client, and retries re-sign the same cumulative instead of dropping deltas.
+ *
+ * Written against the reworked cascade session protocol: challenges carry
+ * `methodDetails.recentBlockhash`/`recentSlot`, open payloads echo `openSlot`,
+ * and commits POST the signed voucher in the JSON body.
+ */
 import { generateKeyPairSigner } from '@solana/kit';
-import { Challenge, Credential } from 'mppx';
+import { Challenge } from 'mppx';
 import { describe, expect, test } from 'vitest';
 
 import {
     ActiveSession,
     createSessionFetch,
-    DEFAULT_SESSION_EXPIRES_AT,
     type SessionChallenge,
     type SessionOpener,
     type SignedVoucher,
+    USDC,
 } from '../client/index.js';
 
 type FetchInit = Parameters<typeof globalThis.fetch>[1];
 
+const CHALLENGED_BLOCKHASH = 'EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N';
+const CHALLENGED_SLOT = '9042';
+const CHANNEL_PROGRAM = 'CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX';
+const DIRECTIVE_EXPIRES_AT = 4_102_444_800;
 const recipient = 'CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY';
 
 interface CommitAttempt {
@@ -45,14 +59,18 @@ function sessionChallenge(): SessionChallenge {
         method: 'solana',
         realm: 'test',
         request: {
-            cap: '1000000',
+            amount: '1',
             currency: 'USDC',
-            decimals: 6,
-            minVoucherDelta: '1',
-            modes: ['push'],
-            network: 'localnet',
-            operator: recipient,
+            methodDetails: {
+                channelProgram: CHANNEL_PROGRAM,
+                gracePeriodSeconds: 900,
+                minVoucherDelta: '1',
+                network: 'localnet',
+                recentBlockhash: CHALLENGED_BLOCKHASH,
+                recentSlot: CHALLENGED_SLOT,
+            },
             recipient,
+            suggestedDeposit: '1000000',
         },
     };
 }
@@ -93,7 +111,7 @@ function createGatewayMock(): GatewayMock {
                     commitUrl: 'https://api.test/session/commit',
                     currency: 'USDC',
                     deliveryId: delivery.deliveryId,
-                    expiresAt: DEFAULT_SESSION_EXPIRES_AT,
+                    expiresAt: DIRECTIVE_EXPIRES_AT,
                     sequence: deliveries.length,
                     sessionId: delivery.sessionId,
                 });
@@ -101,13 +119,12 @@ function createGatewayMock(): GatewayMock {
 
             if (url.pathname === '/session/commit') {
                 const body = parseJsonBody(init);
-                const credential = Credential.deserialize(headers.get('authorization') ?? '');
-                const voucher = (credential.payload as { voucher: SignedVoucher }).voucher;
+                const voucher = body.voucher as SignedVoucher;
                 const attempt: CommitAttempt = {
                     amount: expectString(body.amount),
                     deliveryId: expectString(body.deliveryId),
-                    voucherChannelId: voucher.data.channelId,
-                    voucherCumulative: voucher.data.cumulativeAmount,
+                    voucherChannelId: voucher.voucher.channelId,
+                    voucherCumulative: voucher.voucher.cumulativeAmount,
                 };
                 commitAttempts.push(attempt);
                 if (gateway.failNextCommits > 0) {
@@ -137,7 +154,16 @@ function makeOpener(sessions: ActiveSession[]): SessionOpener {
         const session = new ActiveSession({ channelId: channel.address, signer });
         sessions.push(session);
         return {
-            payload: session.openAction(challenge.request.cap, '1'.repeat(64)),
+            payload: session.openPaymentChannelAction({
+                depositAmount: challenge.request.suggestedDeposit ?? '0',
+                gracePeriodSeconds: challenge.request.methodDetails.gracePeriodSeconds ?? 900,
+                mint: USDC.mainnet!,
+                openSlot: challenge.request.methodDetails.recentSlot ?? '0',
+                payee: challenge.request.recipient,
+                payer: signer.address,
+                salt: '1',
+                transaction: 'wire',
+            }),
             session,
         };
     };

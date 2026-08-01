@@ -1,4 +1,12 @@
-import { createSignableMessage, getBase58Decoder, type MessagePartialSigner } from '@solana/kit';
+import {
+    type Address,
+    createSignableMessage,
+    getBase58Decoder,
+    getBase58Encoder,
+    getPublicKeyFromAddress,
+    type MessagePartialSigner,
+    verifySignature,
+} from '@solana/kit';
 import type { Challenge as MppxChallenge } from 'mppx';
 import { Credential, Method, z } from 'mppx';
 
@@ -11,27 +19,24 @@ const U64_MAX = (1n << 64n) - 1n;
  * Default voucher expiry timestamp, matching the Rust SDK and program tests.
  */
 export const DEFAULT_SESSION_EXPIRES_AT = 4_102_444_800;
+export const MAX_IDLE_TIMEOUT_SECONDS = 2_592_000;
+export const SESSION_AUTHENTICATION_DOMAIN = 'mpp-session-auth-v1';
 
 /**
  * Numeric input accepted by the session helpers.
  */
 export type AmountLike = bigint | number | string;
 
-/**
- * Funding mode used to open a Solana payment session.
- */
-export type SessionMode = 'pull' | 'push';
+/** Party that signs cumulative vouchers. */
+export type SessionVoucherSigner = 'client' | 'operator';
 
-/**
- * Voucher authority used when a challenge advertises pull-mode sessions.
- *
- * `clientVoucher` does not require multi-delegate setup; `operatedVoucher`
- * is the operator-signed path that uses delegated token movement.
- */
-export type SessionPullVoucherStrategy = 'clientVoucher' | 'operatedVoucher';
-
-/** Voucher signing authority advertised by a session challenge. */
-export type SessionSettlementAuthority = 'clientVoucher' | 'delegated';
+/** Reusable payer proof for an operator-signed channel. */
+export interface SessionAuthentication {
+    readonly challengeId: string;
+    readonly payer: string;
+    readonly signature: string;
+    readonly type: 'proof';
+}
 
 /**
  * Signer capable of Ed25519-signing exact voucher message bytes.
@@ -42,48 +47,65 @@ export type SessionSigner = MessagePartialSigner;
  * Basis-point split distributed when a session settles.
  */
 export interface SessionSplit {
-    /** Share of the settled amount, in basis points (100 = 1%). */
-    readonly bps: number;
     /** Base58 address receiving this share. */
     readonly recipient: string;
+    /** Share of the settled amount, in basis points (100 = 1%). */
+    readonly shareBps: number;
+}
+
+/** Solana-specific method details carried by a session challenge. */
+export interface SessionMethodDetails {
+    readonly channelId?: string | undefined;
+    readonly channelProgram: string;
+    readonly decimals?: number | undefined;
+    readonly distributionSplits?: SessionSplit[] | undefined;
+    readonly feePayer?: boolean | undefined;
+    readonly feePayerKey?: string | undefined;
+    readonly gracePeriodSeconds?: number | undefined;
+    readonly idleTimeoutOptionsSeconds?: number[] | undefined;
+    readonly idleTimeoutSeconds?: number | undefined;
+    readonly minVoucherDelta?: string | undefined;
+    readonly network: string;
+    readonly operator?: string | undefined;
+    /**
+     * Base58 blockhash the client MUST use as the open transaction's recent
+     * blockhash. Conditionally REQUIRED when `channelId` is absent (new
+     * channel); MUST be absent when resuming an existing channel.
+     */
+    readonly recentBlockhash?: string | undefined;
+    /**
+     * RPC context slot from the same `getLatestBlockhash` response as
+     * `recentBlockhash` — the client's default `openSlot`. A u64 decimal
+     * string on the wire; same conditionality as `recentBlockhash`.
+     */
+    readonly recentSlot?: string | undefined;
+    readonly tokenProgram?: string | undefined;
+    readonly ttlSeconds?: number | undefined;
+    readonly voucherSigner?: SessionVoucherSigner | undefined;
 }
 
 /**
  * Request embedded in a Solana `session` challenge.
  */
 export interface SessionRequest extends Record<string, unknown> {
-    /** Maximum the session may spend, in base units. */
-    readonly cap: string;
+    /** Price per unit of service, in base units. */
+    readonly amount: string;
     /** Currency identifier: a symbol like `'USDC'` or an SPL mint address. */
     readonly currency: string;
-    /** Token decimals (6 for the supported stablecoins). */
-    readonly decimals?: number | undefined;
     /** Human-readable description of what the session pays for. */
     readonly description?: string | undefined;
     /** Merchant correlation id echoed in receipts. */
     readonly externalId?: string | undefined;
-    /** Smallest voucher increment the server accepts, in base units. */
-    readonly minVoucherDelta?: string | undefined;
-    /** Funding modes the server supports. Omitted or empty means push only. */
-    readonly modes?: SessionMode[] | undefined;
-    /** Solana network slug (`mainnet`, `devnet`, `localnet`). */
-    readonly network?: string | undefined;
-    /** Operator public key vouchers are addressed to (base58). */
-    readonly operator: string;
-    /** Payment-channels program id override (base58). */
-    readonly programId?: string | undefined;
-    /** Voucher authority for pull-mode sessions. */
-    readonly pullVoucherStrategy?: SessionPullVoucherStrategy | undefined;
-    /** Server-provided recent blockhash, saving the client an RPC round-trip. */
-    readonly recentBlockhash?: string | undefined;
-    /** Server-provided current slot, used as the channel `openSlot` PDA seed (u64 as string). */
-    readonly recentSlot?: number | string | undefined;
+    /** Solana-specific channel policy. */
+    readonly methodDetails: SessionMethodDetails;
+    /** Hard floor for the initial deposit. */
+    readonly minimumDeposit?: string | undefined;
     /** Primary recipient of the settled amount (base58). */
     readonly recipient: string;
-    /** Voucher signing authority; absent challenges default to client vouchers. */
-    readonly settlementAuthority?: SessionSettlementAuthority | undefined;
-    /** Basis-point splits distributed at close. */
-    readonly splits?: SessionSplit[] | undefined;
+    /** Suggested initial deposit. */
+    readonly suggestedDeposit?: string | undefined;
+    /** Unit priced by `amount`. */
+    readonly unitType?: string | undefined;
 }
 
 /**
@@ -99,10 +121,8 @@ export interface VoucherData {
     readonly channelId: string;
     /** Cumulative amount authorized so far, in base units. */
     readonly cumulativeAmount: string;
-    /** Unix timestamp (seconds) at which the voucher expires. */
-    readonly expiresAt: number;
-    /** Optional client-side voucher counter. Not part of the signed bytes. */
-    readonly nonce?: number | undefined;
+    /** Unix timestamp (seconds) at which the voucher expires; omitted means no expiry. */
+    readonly expiresAt?: number | undefined;
 }
 
 /**
@@ -111,74 +131,83 @@ export interface VoucherData {
 export interface VoucherDataInput {
     /** Channel / session id the voucher is bound to (base58). */
     readonly channelId: string;
-    /** Legacy wire alias for `cumulativeAmount`. */
-    readonly cumulative?: AmountLike | undefined;
     /** Cumulative amount authorized so far, in base units. */
-    readonly cumulativeAmount?: AmountLike | undefined;
+    readonly cumulativeAmount: AmountLike;
     /** Unix timestamp (seconds) at which the voucher expires. */
     readonly expiresAt: AmountLike;
-    /** Optional client-side voucher counter. Not part of the signed bytes. */
-    readonly nonce?: number | undefined;
 }
 
 /**
  * Signed cumulative voucher.
  */
 export interface SignedVoucher {
-    /** The signed voucher fields. */
-    readonly data: VoucherData;
     /** Base58 Ed25519 signature over the canonical voucher bytes. */
     readonly signature: string;
+    /** Voucher signature algorithm. */
+    readonly signatureType: 'ed25519';
+    /** Base58 public key that signed the voucher. */
+    readonly signer: string;
+    /**
+     * The signed voucher fields, carried on the wire as `voucher` per the
+     * spec's Signed Voucher table (mpp-specs e702dd8).
+     */
+    readonly voucher: VoucherData;
 }
 
 /**
- * Open action payload for payment channels or delegated-token pull sessions.
+ * Open action payload for a payment channel.
  */
 export interface OpenPayload {
-    /** Pull mode: delegated amount approved by the wallet, in base units. */
-    readonly approvedAmount?: string | undefined;
+    /** Reusable payer proof required for operator-signed vouchers. */
+    readonly authentication?: SessionAuthentication | undefined;
+    /** Opaque server-scoped authorization policy echoed on the wire. */
+    readonly authorizationPolicy?: Record<string, unknown> | undefined;
     /** Public key authorized to sign vouchers for this session (base58). */
     readonly authorizedSigner: string;
-    /** Channel address (push) or delegated token account (pull), base58. */
-    readonly channelId?: string | undefined;
-    /** Push mode: deposit locked in the payment channel, in base units. */
-    readonly deposit?: string | undefined;
-    /** Push mode: close grace period in seconds. */
-    readonly gracePeriod?: number | undefined;
-    /** Pull mode: pre-signed multi-delegate init transaction (base64), when the PDA may not exist yet. */
-    readonly initMultiDelegateTx?: string | undefined;
+    /** Opaque capability map echoed on the wire. */
+    readonly capabilities?: Record<string, unknown> | undefined;
+    /** Channel address, base58. */
+    readonly channelId: string;
+    /** Deposit locked in the payment channel, in base units. */
+    readonly depositAmount: string;
+    /** Distribution split preimage bound by the open instruction. */
+    readonly distributionSplits?: readonly SessionSplit[] | undefined;
+    /** Close grace period in seconds. */
+    readonly gracePeriodSeconds: number;
+    /** Negotiated inactivity threshold in seconds. */
+    readonly idleTimeoutSeconds?: number | undefined;
     /** SPL mint of the funding asset (base58). */
-    readonly mint?: string | undefined;
-    /** Funding mode this open uses. */
-    readonly mode: SessionMode;
-    /** Pull mode: wallet that owns the delegated token account (base58). */
-    readonly owner?: string | undefined;
-    /** Push mode: channel payee (base58). */
-    readonly payee?: string | undefined;
-    /** Push mode: channel payer (base58). */
-    readonly payer?: string | undefined;
-    /** Push mode: slot the open was built against (decimal string); the channel `openSlot` PDA seed. */
-    readonly recentSlot?: number | string | undefined;
-    /** Push mode: channel-derivation salt (decimal string). */
-    readonly salt?: string | undefined;
-    /** Open transaction signature, or {@link PENDING_SERVER_SIGNATURE} when the server broadcasts. */
-    readonly signature: string;
-    /** Pull mode: delegated token account vouchers draw from (base58). */
-    readonly tokenAccount?: string | undefined;
-    /** Push mode: base64 signed open transaction for server-side submission. */
-    readonly transaction?: string | undefined;
-    /** Pull mode: pre-signed delegation update transaction (base64). */
-    readonly updateDelegationTx?: string | undefined;
+    readonly mint: string;
+    /** Slot the open was built against; the channel `openSlot` PDA seed. */
+    readonly openSlot: string;
+    /** Channel payee (base58). */
+    readonly payee: string;
+    /** Channel payer (base58). */
+    readonly payer: string;
+    /** Channel-derivation salt (decimal string). */
+    readonly salt: string;
+    /** Base64 signed or partially signed open transaction. */
+    readonly transaction: string;
 }
 
 /**
  * Client action sent as a Solana session credential payload.
  */
 export type SessionAction =
-    | { readonly action: 'close'; readonly channelId: string; readonly voucher?: SignedVoucher | undefined }
-    | { readonly action: 'commit'; readonly deliveryId: string; readonly voucher: SignedVoucher }
-    | { readonly action: 'topUp'; readonly channelId: string; readonly newDeposit: string; readonly signature: string }
-    | { readonly action: 'voucher'; readonly voucher: SignedVoucher }
+    | {
+          readonly action: 'close';
+          readonly authentication?: SessionAuthentication | undefined;
+          readonly channelId: string;
+          readonly voucher?: SignedVoucher | undefined;
+      }
+    | {
+          readonly action: 'topUp';
+          readonly additionalAmount: string;
+          readonly channelId: string;
+          readonly transaction: string;
+      }
+    | { readonly action: 'use'; readonly authentication: SessionAuthentication; readonly channelId: string }
+    | { readonly action: 'voucher'; readonly channelId: string; readonly voucher: SignedVoucher }
     | (OpenPayload & { readonly action: 'open' });
 
 /**
@@ -258,54 +287,44 @@ export interface CommitReceipt {
  * Context accepted by the `session()` MPP client method.
  */
 export interface SessionContext {
-    /** Session action to perform. Defaults to `open` until a session is active, then `voucher`. */
-    readonly action?: 'close' | 'commit' | 'open' | 'topUp' | 'voucher' | undefined;
+    /** Session action to perform. */
+    readonly action?: 'close' | 'open' | 'topUp' | 'use' | 'voucher' | undefined;
+    /** Top-up amount to add, in base units. */
+    readonly additionalAmount?: AmountLike | undefined;
     /** Incremental amount for `voucher` / `commit`, in base units. */
     readonly amount?: AmountLike | undefined;
-    /** Pull opens: delegated amount approved by the wallet, in base units. */
-    readonly approvedAmount?: AmountLike | undefined;
+    /** Reusable payer proof for operator-mode use and close. */
+    readonly authentication?: SessionAuthentication | undefined;
     /** Absolute cumulative amount for `voucher`, in base units. */
     readonly cumulativeAmount?: AmountLike | undefined;
     /** Delivery to commit. Defaults to `directive.deliveryId`. */
     readonly deliveryId?: string | undefined;
-    /** Push opens: channel deposit, in base units. Defaults to the challenge cap. */
-    readonly deposit?: AmountLike | undefined;
+    /** Initial channel deposit, in base units. */
+    readonly depositAmount?: AmountLike | undefined;
     /** Metering directive being committed. */
     readonly directive?: MeteringDirective | undefined;
     /** Close: last unsettled increment to sign into the closing voucher, in base units. */
     readonly finalIncrement?: AmountLike | undefined;
-    /** Push opens: channel close grace period in seconds. */
-    readonly gracePeriod?: number | undefined;
-    /** Pull opens: pre-signed multi-delegate init transaction (base64). */
-    readonly initMultiDelegateTx?: string | undefined;
-    /** Push opens: SPL mint of the deposit (base58). */
+    /** Channel close grace period in seconds. */
+    readonly gracePeriodSeconds?: number | undefined;
+    /** Selected inactivity threshold; must be one of the challenge's offered values. */
+    readonly idleTimeoutSeconds?: number | undefined;
+    /** SPL mint of the deposit (base58). */
     readonly mint?: string | undefined;
-    /** Funding mode for `open`. Defaults to the first server-advertised mode. */
-    readonly mode?: SessionMode | undefined;
-    /** TopUp: new total deposit, in base units. */
-    readonly newDeposit?: AmountLike | undefined;
-    /** Push opens: slot the open is built against (a channel PDA seed). Defaults to the challenge `recentSlot`. */
+    /** Slot the open is built against (a channel PDA seed). */
     readonly openSlot?: AmountLike | undefined;
-    /** Pull opens: wallet that owns the delegated token account (base58). */
-    readonly owner?: string | undefined;
-    /** Push opens: channel payee (base58). */
+    /** Channel payee (base58). */
     readonly payee?: string | undefined;
-    /** Push opens: channel payer (base58). */
+    /** Channel payer (base58). */
     readonly payer?: string | undefined;
-    /** Push opens: channel-derivation salt. */
+    /** Channel-derivation salt. */
     readonly salt?: AmountLike | undefined;
     /** Active session to act on, overriding the method-level session. */
     readonly session?: ActiveSession | undefined;
-    /** Open / topUp transaction signature (base58). */
-    readonly signature?: string | undefined;
     /** Optional client identifier serialized into the credential. */
     readonly source?: string | undefined;
-    /** Pull opens: delegated token account vouchers draw from (base58). */
-    readonly tokenAccount?: string | undefined;
-    /** Push opens: base64 signed open transaction for server-side submission. */
+    /** Base64 signed or partially signed transaction. */
     readonly transaction?: string | undefined;
-    /** Pull opens: pre-signed delegation update transaction (base64). */
-    readonly updateDelegationTx?: string | undefined;
     /** Pre-signed voucher for `voucher` / `close`, bypassing local signing. */
     readonly voucher?: SignedVoucher | undefined;
 }
@@ -315,12 +334,150 @@ export interface SessionContext {
  */
 export const sessionContextSchema = z.custom<SessionContext>();
 
+/** Validates the idle-timeout option list defined by the session draft. */
+export function validateIdleTimeoutOptions(options: readonly number[]): void {
+    if (options.length === 0) throw new Error('idleTimeoutOptionsSeconds must not be empty');
+    let previous = 0;
+    for (const value of options) {
+        if (!Number.isInteger(value) || value < 1 || value > MAX_IDLE_TIMEOUT_SECONDS) {
+            throw new Error(`idle timeout must be an integer between 1 and ${MAX_IDLE_TIMEOUT_SECONDS}`);
+        }
+        if (value <= previous) throw new Error('idleTimeoutOptionsSeconds must be strictly increasing');
+        previous = value;
+    }
+}
+
+/** Resolves an effective timeout while rejecting unsupported client selections. */
+export function resolveIdleTimeoutSeconds(parameters: {
+    readonly defaultSeconds: number;
+    readonly options?: readonly number[] | undefined;
+    readonly selected?: number | undefined;
+}): number {
+    const { defaultSeconds, options, selected } = parameters;
+    if (!Number.isInteger(defaultSeconds) || defaultSeconds < 1 || defaultSeconds > MAX_IDLE_TIMEOUT_SECONDS) {
+        throw new Error(`default idle timeout must be between 1 and ${MAX_IDLE_TIMEOUT_SECONDS}`);
+    }
+    if (options) validateIdleTimeoutOptions(options);
+    if (selected !== undefined) {
+        if (!options) throw new Error('idleTimeoutSeconds is not allowed when no options were advertised');
+        if (!options.includes(selected)) throw new Error('idleTimeoutSeconds was not one of the advertised options');
+        return selected;
+    }
+    return options && !options.includes(defaultSeconds)
+        ? requireValue(options[0], 'idle timeout option')
+        : defaultSeconds;
+}
+
 /**
- * Returns the funding modes advertised by a session request; an omitted or
- * empty `modes` list means the server only supports push.
+ * Resolves the open transaction's `openSlot` against the challenged
+ * `recentSlot`.
+ *
+ * An explicit override is allowed — but never later than the challenged
+ * `recentSlot` (an earlier slot is fine; the channel PDA derives from it and
+ * the server rejects anything ahead of its challenge). Without an override the
+ * challenged `recentSlot` is REQUIRED: a new-channel challenge must provide
+ * it, and the client never fetches a slot of its own.
+ *
+ * Mirrors the `open_slot` resolution in `rust/crates/kit/src/mpp/client/session.rs`.
  */
-export function sessionRequestModes(request: Pick<SessionRequest, 'modes'>): readonly SessionMode[] {
-    return request.modes && request.modes.length > 0 ? request.modes : ['push'];
+export function resolveOpenSlot(parameters: {
+    readonly challengedRecentSlot?: string | undefined;
+    readonly override?: AmountLike | undefined;
+}): bigint {
+    const { challengedRecentSlot, override } = parameters;
+    if (override !== undefined) {
+        const openSlot = parseAmount(override, 'openSlot');
+        if (challengedRecentSlot !== undefined) {
+            const recentSlot = parseAmount(challengedRecentSlot, 'methodDetails.recentSlot');
+            if (openSlot > recentSlot) {
+                throw new Error(
+                    `openSlot override ${openSlot.toString()} is ahead of the challenged recentSlot ${recentSlot.toString()}`,
+                );
+            }
+        }
+        return openSlot;
+    }
+    if (challengedRecentSlot === undefined) {
+        throw new Error('session challenge is missing recentSlot; a new-channel challenge must provide it');
+    }
+    return parseAmount(challengedRecentSlot, 'methodDetails.recentSlot');
+}
+
+/**
+ * Resolves the open transaction's blockhash: an explicit override wins,
+ * otherwise the challenged `recentBlockhash` is REQUIRED — the server verifies
+ * the compiled open message uses exactly this blockhash, so the client never
+ * fetches its own.
+ *
+ * Mirrors `resolve_open_blockhash` in `rust/crates/kit/src/mpp/client/session.rs`.
+ */
+export function resolveOpenBlockhash(override: string | undefined, request: SessionRequest): string {
+    if (override) return override;
+    const challenged = request.methodDetails.recentBlockhash;
+    if (!challenged) {
+        throw new Error('session challenge is missing recentBlockhash; a new-channel challenge must provide it');
+    }
+    return challenged;
+}
+
+/** Canonical JCS bytes signed by a reusable operator-mode proof. */
+export function sessionAuthenticationMessage(parameters: {
+    readonly challengeId: string;
+    readonly channelId: string;
+    readonly payer: string;
+}): Uint8Array {
+    return new TextEncoder().encode(
+        JSON.stringify({
+            channelId: parameters.channelId,
+            domain: SESSION_AUTHENTICATION_DOMAIN,
+            payer: parameters.payer,
+            sessionChallengeId: parameters.challengeId,
+        }),
+    );
+}
+
+/** Creates a reusable payer proof for an operator-signed channel. */
+export async function signSessionAuthentication(parameters: {
+    readonly challengeId: string;
+    readonly channelId: string;
+    readonly signer: MessagePartialSigner;
+}): Promise<SessionAuthentication> {
+    const message = sessionAuthenticationMessage({
+        challengeId: parameters.challengeId,
+        channelId: parameters.channelId,
+        payer: parameters.signer.address,
+    });
+    const [signatures] = await parameters.signer.signMessages([createSignableMessage(message)]);
+    const signature = signatures?.[parameters.signer.address];
+    if (!signature) throw new Error(`Signer ${parameters.signer.address} did not return a session proof`);
+    return {
+        challengeId: parameters.challengeId,
+        payer: parameters.signer.address,
+        signature: getBase58Decoder().decode(new Uint8Array(signature)),
+        type: 'proof',
+    };
+}
+
+/** Verifies a reusable payer proof against its bound channel. */
+export async function verifySessionAuthentication(
+    authentication: SessionAuthentication,
+    channelId: string,
+): Promise<boolean> {
+    try {
+        const publicKey = await getPublicKeyFromAddress(authentication.payer as Address);
+        const signature = getBase58Encoder().encode(authentication.signature);
+        return await verifySignature(
+            publicKey,
+            signature as Parameters<typeof verifySignature>[1],
+            sessionAuthenticationMessage({
+                challengeId: authentication.challengeId,
+                channelId,
+                payer: authentication.payer,
+            }),
+        );
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -363,7 +520,6 @@ export class ActiveSession {
     readonly #channelId: string;
     #cumulative: bigint;
     #expiresAt: number;
-    #nonce: number;
     readonly #signer: SessionSigner;
 
     constructor(channelId: string, signer: SessionSigner, options?: ActiveSession.Options);
@@ -386,7 +542,6 @@ export class ActiveSession {
         this.#signer = parameters.signer;
         this.#cumulative = parseAmount(parameters.cumulative ?? 0n, 'cumulative');
         this.#expiresAt = parseSafeInteger(parameters.expiresAt ?? DEFAULT_SESSION_EXPIRES_AT, 'expiresAt');
-        this.#nonce = parseSafeInteger(parameters.nonce ?? 0n, 'nonce');
     }
 
     /** Channel/session identifier used by all vouchers. */
@@ -407,11 +562,6 @@ export class ActiveSession {
     /** Expiry timestamp used for newly signed vouchers. */
     get expiresAt(): number {
         return this.#expiresAt;
-    }
-
-    /** Current local voucher nonce. */
-    get nonce(): number {
-        return this.#nonce;
     }
 
     /** Session key authorized to sign vouchers. */
@@ -444,11 +594,10 @@ export class ActiveSession {
             channelId: this.#channelId,
             cumulativeAmount: nextCumulative.toString(),
             expiresAt: this.#expiresAt,
-            nonce: this.#nonce + 1,
         };
 
         const [signatureDictionary] = await this.#signer.signMessages([
-            createSignableMessage(voucherMessageBytes(data)),
+            createSignableMessage(voucherMessageBytes({ ...data, expiresAt: data.expiresAt ?? 0 })),
         ]);
         const signatureBytes = signatureDictionary?.[this.#signer.address];
         if (!signatureBytes) {
@@ -456,8 +605,10 @@ export class ActiveSession {
         }
 
         return {
-            data,
             signature: getBase58Decoder().decode(new Uint8Array(signatureBytes)),
+            signatureType: 'ed25519',
+            signer: this.#signer.address,
+            voucher: data,
         };
     }
 
@@ -472,13 +623,13 @@ export class ActiveSession {
      * Records a prepared voucher as accepted by the server.
      */
     recordVoucher(voucher: SignedVoucher): void {
-        if (voucher.data.channelId !== this.#channelId) {
+        if (voucher.voucher.channelId !== this.#channelId) {
             throw new Error(
-                `Voucher channel ${voucher.data.channelId} does not match active session ${this.#channelId}`,
+                `Voucher channel ${voucher.voucher.channelId} does not match active session ${this.#channelId}`,
             );
         }
 
-        const cumulative = parseAmount(voucher.data.cumulativeAmount, 'cumulativeAmount');
+        const cumulative = parseAmount(voucher.voucher.cumulativeAmount, 'cumulativeAmount');
         if (cumulative <= this.#cumulative) {
             throw new Error(
                 `Voucher cumulative ${cumulative.toString()} must exceed current watermark ${this.#cumulative.toString()}`,
@@ -486,10 +637,6 @@ export class ActiveSession {
         }
 
         this.#cumulative = cumulative;
-        this.#nonce =
-            voucher.data.nonce === undefined
-                ? this.#nonce + 1
-                : Math.max(this.#nonce, parseSafeInteger(voucher.data.nonce, 'nonce'));
     }
 
     /**
@@ -512,36 +659,18 @@ export class ActiveSession {
      * Builds a `voucher` action for a freshly signed increment.
      */
     async voucherAction(amount: AmountLike): Promise<SessionAction> {
-        return { action: 'voucher', voucher: await this.signIncrement(amount) };
+        const voucher = await this.signIncrement(amount);
+        return { action: 'voucher', channelId: voucher.voucher.channelId, voucher };
     }
 
     /**
      * Builds a `commit` action for a delivery and freshly signed increment.
      */
-    async commitAction(delivery: MeteringDirective | string, amount?: AmountLike): Promise<SessionAction> {
+    async commitAction(delivery: MeteringDirective | string, amount?: AmountLike): Promise<CommitPayload> {
         const deliveryId = typeof delivery === 'string' ? delivery : delivery.deliveryId;
         const resolvedAmount =
             typeof delivery === 'string' ? requireValue(amount, 'amount') : (amount ?? delivery.amount);
-        return { action: 'commit', deliveryId, voucher: await this.signIncrement(resolvedAmount) };
-    }
-
-    /**
-     * Builds a payment-channel `open` action.
-     */
-    openAction(
-        deposit: AmountLike,
-        signature: string,
-        options: ActiveSession.OpenOptions = {},
-    ): OpenPayload & { readonly action: 'open' } {
-        return {
-            action: 'open',
-            authorizedSigner: options.authorizedSigner ?? this.authorizedSigner,
-            channelId: this.#channelId,
-            deposit: formatAmount(deposit, 'deposit'),
-            mode: options.mode ?? 'push',
-            signature,
-            ...(options.transaction ? { transaction: options.transaction } : {}),
-        };
+        return { deliveryId, voucher: await this.signIncrement(resolvedAmount) };
     }
 
     /**
@@ -554,54 +683,48 @@ export class ActiveSession {
             action: 'open',
             authorizedSigner: parameters.authorizedSigner ?? this.authorizedSigner,
             channelId: this.#channelId,
-            deposit: formatAmount(parameters.deposit, 'deposit'),
-            gracePeriod: parameters.gracePeriod,
+            depositAmount: formatAmount(parameters.depositAmount, 'depositAmount'),
+            ...(parameters.distributionSplits ? { distributionSplits: parameters.distributionSplits } : {}),
+            gracePeriodSeconds: parameters.gracePeriodSeconds,
             mint: parameters.mint,
-            mode: parameters.mode ?? 'push',
+            openSlot: formatAmount(parameters.openSlot, 'openSlot'),
             payee: parameters.payee,
             payer: parameters.payer,
-            recentSlot: formatAmount(parameters.openSlot, 'openSlot'),
             salt: formatAmount(parameters.salt, 'salt'),
-            signature: parameters.signature,
-            ...(parameters.transaction ? { transaction: parameters.transaction } : {}),
-        };
-    }
-
-    /**
-     * Builds a pull-mode `open` action after delegation is confirmed.
-     */
-    openPullAction(parameters: ActiveSession.PullOpenParameters): OpenPayload & { readonly action: 'open' } {
-        return {
-            action: 'open',
-            approvedAmount: formatAmount(parameters.approvedAmount, 'approvedAmount'),
-            authorizedSigner: parameters.authorizedSigner ?? this.authorizedSigner,
-            ...(parameters.initMultiDelegateTx ? { initMultiDelegateTx: parameters.initMultiDelegateTx } : {}),
-            mode: 'pull',
-            owner: parameters.owner,
-            signature: parameters.signature,
-            tokenAccount: parameters.tokenAccount ?? this.#channelId,
-            ...(parameters.updateDelegationTx ? { updateDelegationTx: parameters.updateDelegationTx } : {}),
+            transaction: parameters.transaction,
+            ...(parameters.authentication ? { authentication: parameters.authentication } : {}),
+            ...(parameters.idleTimeoutSeconds !== undefined
+                ? { idleTimeoutSeconds: parameters.idleTimeoutSeconds }
+                : {}),
         };
     }
 
     /**
      * Builds a `topUp` action after the top-up transaction is confirmed.
      */
-    topUpAction(newDeposit: AmountLike, signature: string): SessionAction {
+    topUpAction(additionalAmount: AmountLike, transaction: string): SessionAction {
         return {
             action: 'topUp',
+            additionalAmount: formatAmount(additionalAmount, 'additionalAmount'),
             channelId: this.#channelId,
-            newDeposit: formatAmount(newDeposit, 'newDeposit'),
-            signature,
+            transaction,
         };
+    }
+
+    /** Builds a billable request action for an operator-signed session. */
+    useAction(authentication: SessionAuthentication): SessionAction {
+        return { action: 'use', authentication, channelId: this.#channelId };
     }
 
     /**
      * Builds a cooperative `close` action, optionally signing a final increment.
      */
-    async closeAction(finalIncrement?: AmountLike): Promise<SessionAction> {
+    async closeAction(finalIncrement?: AmountLike, authentication?: SessionAuthentication): Promise<SessionAction> {
+        if (authentication) {
+            return { action: 'close', authentication, channelId: this.#channelId };
+        }
         if (finalIncrement === undefined || parseAmount(finalIncrement, 'finalIncrement') === 0n) {
-            return { action: 'close', channelId: this.#channelId };
+            throw new Error('client-mode close requires a voucher');
         }
 
         return {
@@ -618,31 +741,28 @@ export declare namespace ActiveSession {
         readonly cumulative?: AmountLike | undefined;
         /** Voucher expiry as a unix timestamp (seconds). Defaults to {@link DEFAULT_SESSION_EXPIRES_AT}. */
         readonly expiresAt?: AmountLike | undefined;
-        /** Starting voucher counter when resuming a session. */
-        readonly nonce?: AmountLike | undefined;
     }
 
     interface Parameters extends Options {
-        /** Channel address (push) or delegated token account (pull), base58. */
+        /** Channel address, base58. */
         readonly channelId: string;
         /** Key that signs vouchers for this session. */
         readonly signer: SessionSigner;
     }
 
-    interface OpenOptions {
-        /** Authorized voucher signer; delegated sessions use the advertised operator. */
+    interface PaymentChannelOpenParameters {
+        /** Reusable payer proof for an operator-signed session. */
+        readonly authentication?: SessionAuthentication | undefined;
+        /** Authorized voucher signer; operator sessions use the advertised operator. */
         readonly authorizedSigner?: string | undefined;
-        /** Funding mode. Defaults to `push`. */
-        readonly mode?: SessionMode | undefined;
-        /** Base64 signed open transaction for server-side submission. */
-        readonly transaction?: string | undefined;
-    }
-
-    interface PaymentChannelOpenParameters extends OpenOptions {
         /** Deposit locked in the channel, in base units. */
-        readonly deposit: AmountLike;
+        readonly depositAmount: AmountLike;
+        /** Distribution split preimage bound by the open transaction. */
+        readonly distributionSplits?: readonly SessionSplit[] | undefined;
         /** Close grace period in seconds. */
-        readonly gracePeriod: number;
+        readonly gracePeriodSeconds: number;
+        /** Selected inactivity threshold from the challenge's offered values. */
+        readonly idleTimeoutSeconds?: number | undefined;
         /** SPL mint of the deposit (base58). */
         readonly mint: string;
         /** Slot the open transaction was built against (a channel PDA seed). */
@@ -653,25 +773,8 @@ export declare namespace ActiveSession {
         readonly payer: string;
         /** Channel-derivation salt. */
         readonly salt: AmountLike;
-        /** Open transaction signature (base58). */
-        readonly signature: string;
-    }
-
-    interface PullOpenParameters {
-        /** Delegated amount approved by the wallet, in base units. */
-        readonly approvedAmount: AmountLike;
-        /** Authorized voucher signer; delegated sessions use the advertised operator. */
-        readonly authorizedSigner?: string | undefined;
-        /** Pre-signed multi-delegate init transaction (base64), when the PDA may not exist yet. */
-        readonly initMultiDelegateTx?: string | undefined;
-        /** Wallet that owns the delegated token account (base58). */
-        readonly owner: string;
-        /** Delegation transaction signature, or {@link PENDING_SERVER_SIGNATURE}. */
-        readonly signature: string;
-        /** Delegated token account vouchers draw from (base58). Defaults to the derived account. */
-        readonly tokenAccount?: string | undefined;
-        /** Pre-signed delegation update transaction (base64). */
-        readonly updateDelegationTx?: string | undefined;
+        /** Base64 signed or partially signed open transaction. */
+        readonly transaction: string;
     }
 }
 
@@ -707,18 +810,23 @@ export function session(parameters: session.Parameters = {}) {
 
         switch (context?.action) {
             case 'open':
-                return createOpenAction(getSession(context), challenge, context);
+                return await createOpenAction(getSession(context), challenge, context, parameters);
             case 'voucher':
                 return await createVoucherAction(getSession(context), context);
-            case 'commit':
-                return await createCommitAction(getSession(context), context);
             case 'topUp':
                 return getSession(context).topUpAction(
-                    requireValue(context.newDeposit ?? context.deposit, 'newDeposit'),
-                    requireString(context.signature, 'signature'),
+                    requireValue(context.additionalAmount, 'additionalAmount'),
+                    requireString(context.transaction, 'transaction'),
+                );
+            case 'use':
+                return getSession(context).useAction(
+                    requireValue(context.authentication ?? parameters.authentication, 'authentication'),
                 );
             case 'close':
-                return await getSession(context).closeAction(context.finalIncrement ?? context.amount);
+                return await getSession(context).closeAction(
+                    context.finalIncrement ?? context.amount,
+                    context.authentication ?? parameters.authentication,
+                );
             case undefined:
                 throw new Error(
                     'No session action provided. Pass context.action or configure session({ createAction }).',
@@ -750,6 +858,8 @@ export declare namespace session {
     }
 
     interface Parameters {
+        /** Reusable proof for an already-open operator-signed channel. */
+        readonly authentication?: SessionAuthentication | undefined;
         /** Channel id to resume. Requires `signer`; ignored when `session` is given. */
         readonly channelId?: string | undefined;
         /** Override that builds the session action for each challenge (custom wallet flows). */
@@ -767,84 +877,68 @@ export declare namespace session {
     }
 }
 
-function createOpenAction(
+async function createOpenAction(
     session_: ActiveSession,
     challenge: SessionChallenge,
     context: SessionContext,
-): SessionAction {
-    const signature = requireString(context.signature, 'signature');
-    const mode = context.mode ?? sessionRequestModes(challenge.request)[0] ?? 'push';
-
-    if (mode === 'pull' && shouldUseDelegatedPull(context, challenge)) {
-        return session_.openPullAction({
-            approvedAmount: context.approvedAmount ?? context.deposit ?? challenge.request.cap,
-            authorizedSigner: delegatedAuthorizedSigner(challenge),
-            initMultiDelegateTx: context.initMultiDelegateTx,
-            owner: requireString(context.owner, 'owner'),
-            signature,
-            tokenAccount: context.tokenAccount,
-            updateDelegationTx: context.updateDelegationTx,
+    parameters: session.Parameters,
+): Promise<SessionAction> {
+    const details = challenge.request.methodDetails;
+    const voucherSigner = details.voucherSigner ?? 'client';
+    const payer = requireString(context.payer, 'payer');
+    let authentication = context.authentication ?? parameters.authentication;
+    if (voucherSigner === 'operator' && !authentication) {
+        if (session_.signer.address !== payer) {
+            throw new Error('operator-mode open requires the payer signer to create authentication');
+        }
+        authentication = await signSessionAuthentication({
+            challengeId: challenge.id,
+            channelId: session_.channelId,
+            signer: session_.signer,
         });
     }
 
-    if (
-        context.payer !== undefined ||
-        context.payee !== undefined ||
-        context.mint !== undefined ||
-        context.salt !== undefined ||
-        context.openSlot !== undefined ||
-        context.gracePeriod !== undefined
-    ) {
-        return session_.openPaymentChannelAction({
-            authorizedSigner: delegatedAuthorizedSigner(challenge),
-            deposit: context.deposit ?? challenge.request.cap,
-            gracePeriod: requireValue(context.gracePeriod, 'gracePeriod'),
-            mint: requireString(context.mint, 'mint'),
-            mode,
-            openSlot: requireValue(context.openSlot ?? challenge.request.recentSlot, 'openSlot'),
-            payee: requireString(context.payee, 'payee'),
-            payer: requireString(context.payer, 'payer'),
-            salt: requireValue(context.salt, 'salt'),
-            signature,
-            transaction: context.transaction,
-        });
-    }
-
-    return session_.openAction(context.deposit ?? challenge.request.cap, signature, {
-        authorizedSigner: delegatedAuthorizedSigner(challenge),
-        mode,
-        transaction: context.transaction,
+    return session_.openPaymentChannelAction({
+        ...(authentication ? { authentication } : {}),
+        authorizedSigner:
+            voucherSigner === 'operator'
+                ? requireString(details.operator, 'methodDetails.operator')
+                : session_.authorizedSigner,
+        depositAmount: requireValue(context.depositAmount ?? challenge.request.suggestedDeposit, 'depositAmount'),
+        distributionSplits: details.distributionSplits,
+        gracePeriodSeconds: requireValue(
+            context.gracePeriodSeconds ?? details.gracePeriodSeconds,
+            'gracePeriodSeconds',
+        ),
+        ...(details.idleTimeoutOptionsSeconds
+            ? {
+                  idleTimeoutSeconds: resolveIdleTimeoutSeconds({
+                      defaultSeconds: details.idleTimeoutSeconds ?? 300,
+                      options: details.idleTimeoutOptionsSeconds,
+                      selected: context.idleTimeoutSeconds,
+                  }),
+              }
+            : {}),
+        mint: context.mint ?? challenge.request.currency,
+        // Explicit overrides stay allowed (never later than the challenged
+        // recentSlot); the default is the challenged recentSlot itself.
+        openSlot: resolveOpenSlot({ challengedRecentSlot: details.recentSlot, override: context.openSlot }),
+        payee: context.payee ?? challenge.request.recipient,
+        payer,
+        salt: requireValue(context.salt, 'salt'),
+        transaction: requireString(context.transaction, 'transaction'),
     });
 }
 
-function delegatedAuthorizedSigner(challenge: SessionChallenge): string | undefined {
-    return challenge.request.settlementAuthority === 'delegated' ? challenge.request.operator : undefined;
-}
-
-function shouldUseDelegatedPull(context: SessionContext, challenge: SessionChallenge): boolean {
-    if (context.mode !== 'pull' && sessionRequestModes(challenge.request)[0] !== 'pull') return false;
-    return (
-        challenge.request.pullVoucherStrategy === 'operatedVoucher' ||
-        context.approvedAmount !== undefined ||
-        context.initMultiDelegateTx !== undefined ||
-        context.owner !== undefined ||
-        context.tokenAccount !== undefined ||
-        context.updateDelegationTx !== undefined
-    );
-}
-
 async function createVoucherAction(session_: ActiveSession, context: SessionContext): Promise<SessionAction> {
-    if (context.voucher) return { action: 'voucher', voucher: context.voucher };
+    if (context.voucher) {
+        return { action: 'voucher', channelId: context.voucher.voucher.channelId, voucher: context.voucher };
+    }
     if (context.cumulativeAmount !== undefined) {
-        return { action: 'voucher', voucher: await session_.signVoucher(context.cumulativeAmount) };
+        const voucher = await session_.signVoucher(context.cumulativeAmount);
+        return { action: 'voucher', channelId: voucher.voucher.channelId, voucher };
     }
     return await session_.voucherAction(requireValue(context.amount, 'amount'));
-}
-
-async function createCommitAction(session_: ActiveSession, context: SessionContext): Promise<SessionAction> {
-    const deliveryId = context.deliveryId ?? context.directive?.deliveryId;
-    if (!deliveryId) throw new Error('deliveryId required for commit action');
-    return await session_.commitAction(deliveryId, context.amount ?? context.directive?.amount);
 }
 
 function formatAmount(value: AmountLike, name: string): string {

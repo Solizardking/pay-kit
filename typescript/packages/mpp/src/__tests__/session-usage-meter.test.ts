@@ -1,23 +1,40 @@
+/**
+ * Behavioral coverage for `SessionUsageMeter`: opening a session through the
+ * patched fetch, baseline capture, monotonic usage watermarks, throttled and
+ * trailing voucher commits, and price validation — all driven through
+ * `SessionFetchClient` against a mocked session gateway speaking the reworked
+ * cascade session protocol (open payload carries `openSlot`, commits carry the
+ * signed voucher in the JSON body).
+ */
+import { generateKeyPairSigner } from '@solana/kit';
 import { Challenge } from 'mppx';
+import { describe, expect, test } from 'vitest';
 
 import {
-    createEphemeralSessionOpener,
+    ActiveSession,
     createSessionFetch,
     createSessionUsageMeter,
-    DEFAULT_SESSION_EXPIRES_AT,
-    stripRequestHeaders,
     type SessionChallenge,
     type SessionFetchEvent,
+    type SessionOpener,
+    type SignedVoucher,
+    stripRequestHeaders,
+    USDC,
 } from '../client/index.js';
 
 type FetchInit = Parameters<typeof globalThis.fetch>[1];
 
+const CHALLENGED_BLOCKHASH = 'EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N';
+const CHALLENGED_SLOT = '9042';
+const CHANNEL_PROGRAM = 'CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX';
+const DIRECTIVE_EXPIRES_AT = 4_102_444_800;
 const recipient = 'CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY';
 
 interface CommitLog {
     readonly amount: string;
-    readonly authorization: string | null;
     readonly deliveryId: string;
+    readonly voucherCumulative: string;
+    readonly voucherSigner: string;
 }
 
 interface DeliveryLog {
@@ -31,26 +48,58 @@ interface SessionGatewayMock {
     readonly commits: CommitLog[];
     readonly deliveries: DeliveryLog[];
     readonly fetch: typeof globalThis.fetch;
+    lastAuthorization: string | null;
     retryCount: number;
+    sawStrippedHeader: boolean;
 }
 
-function sessionChallenge(overrides: Partial<SessionChallenge['request']> = {}): SessionChallenge {
+function sessionChallenge(): SessionChallenge {
     return {
         id: 'gemini-session',
         intent: 'session',
         method: 'solana',
         realm: 'test',
         request: {
-            cap: '1000000',
+            amount: '1',
             currency: 'USDC',
-            decimals: 6,
-            minVoucherDelta: '1',
-            modes: ['pull'],
-            network: 'localnet',
-            operator: recipient,
+            methodDetails: {
+                channelProgram: CHANNEL_PROGRAM,
+                gracePeriodSeconds: 900,
+                minVoucherDelta: '1',
+                network: 'localnet',
+                recentBlockhash: CHALLENGED_BLOCKHASH,
+                recentSlot: CHALLENGED_SLOT,
+            },
             recipient,
-            ...overrides,
+            suggestedDeposit: '1000000',
         },
+    };
+}
+
+/**
+ * Test-only opener: fabricates a fresh local channel and answers the challenge
+ * with an `open` action shaped like the reworked wire payload. The `openSlot`
+ * echoes the challenged `recentSlot`, matching the real openers.
+ */
+function makeSessionOpener(sessions: ActiveSession[] = []): SessionOpener {
+    return async ({ challenge }) => {
+        const signer = await generateKeyPairSigner();
+        const channel = await generateKeyPairSigner();
+        const session = new ActiveSession({ channelId: channel.address, signer });
+        sessions.push(session);
+        return {
+            payload: session.openPaymentChannelAction({
+                depositAmount: challenge.request.suggestedDeposit ?? '0',
+                gracePeriodSeconds: challenge.request.methodDetails.gracePeriodSeconds ?? 900,
+                mint: USDC.mainnet!,
+                openSlot: challenge.request.methodDetails.recentSlot ?? '0',
+                payee: challenge.request.recipient,
+                payer: signer.address,
+                salt: '1',
+                transaction: 'wire',
+            }),
+            session,
+        };
     };
 }
 
@@ -66,6 +115,7 @@ function createSessionGatewayMock(): SessionGatewayMock {
             const headers = new Headers(init?.headers);
 
             if (url.pathname === '/v1/generate') {
+                gateway.sawStrippedHeader ||= headers.has('x-goog-api-key');
                 if (!headers.has('authorization')) {
                     return new Response(null, {
                         headers: {
@@ -75,6 +125,7 @@ function createSessionGatewayMock(): SessionGatewayMock {
                     });
                 }
 
+                gateway.lastAuthorization = headers.get('authorization');
                 gateway.retryCount += 1;
                 return new Response('ok', { status: 200 });
             }
@@ -93,7 +144,7 @@ function createSessionGatewayMock(): SessionGatewayMock {
                     commitUrl: 'https://api.test/session/commit',
                     currency: 'USDC',
                     deliveryId: delivery.deliveryId,
-                    expiresAt: DEFAULT_SESSION_EXPIRES_AT,
+                    expiresAt: DIRECTIVE_EXPIRES_AT,
                     sequence: deliveries.length,
                     sessionId: delivery.sessionId,
                 });
@@ -102,24 +153,28 @@ function createSessionGatewayMock(): SessionGatewayMock {
             if (url.pathname === '/session/commit') {
                 const body = parseJsonBody(init);
                 const amount = expectString(body.amount);
+                const voucher = body.voucher as SignedVoucher;
                 committedCumulative += BigInt(amount);
                 commits.push({
                     amount,
-                    authorization: headers.get('authorization'),
                     deliveryId: expectString(body.deliveryId),
+                    voucherCumulative: voucher.voucher.cumulativeAmount,
+                    voucherSigner: voucher.signer,
                 });
                 return Response.json({
                     amount,
                     cumulative: committedCumulative.toString(),
                     deliveryId: expectString(body.deliveryId),
-                    sessionId: deliveries.at(-1)?.sessionId ?? 'unknown',
+                    sessionId: voucher.voucher.channelId,
                     status: 'committed',
                 });
             }
 
             return new Response(`unexpected ${url.href}`, { status: 500 });
         },
+        lastAuthorization: null,
         retryCount: 0,
+        sawStrippedHeader: false,
     };
 
     return gateway;
@@ -128,12 +183,13 @@ function createSessionGatewayMock(): SessionGatewayMock {
 describe('SessionUsageMeter', () => {
     test('opens a session through patched fetch and commits throttled cumulative usage', async () => {
         const gateway = createSessionGatewayMock();
+        const sessions: ActiveSession[] = [];
         const events: SessionFetchEvent[] = [];
         const client = createSessionFetch({
             fetch: gateway.fetch,
             liveCommitIntervalMs: 60_000,
             onEvent: event => events.push(event),
-            opener: createEphemeralSessionOpener({ mode: 'pull' }),
+            opener: makeSessionOpener(sessions),
             prepareRequest: stripRequestHeaders(['x-goog-api-key']),
         });
         const meter = createSessionUsageMeter<number>({
@@ -155,6 +211,10 @@ describe('SessionUsageMeter', () => {
 
         expect(response.status).toBe(200);
         expect(gateway.retryCount).toBe(1);
+        // The gateway never saw the stripped header, and the paid retry
+        // carried a serialized session credential.
+        expect(gateway.sawStrippedHeader).toBe(false);
+        expect(gateway.lastAuthorization?.startsWith('Payment ')).toBe(true);
         expect(meter.baselineCumulativeAmount).toBeUndefined();
         expect(meter.recordUsage(10)).toBe(true);
         expect(meter.recordUsage(10)).toBe(false);
@@ -165,7 +225,9 @@ describe('SessionUsageMeter', () => {
         expect(receipt).toMatchObject({ amount: '15', cumulative: '25', status: 'committed' });
         expect(gateway.deliveries.map(delivery => delivery.amount)).toEqual(['10', '15']);
         expect(gateway.commits.map(commit => commit.amount)).toEqual(['10', '15']);
-        expect(gateway.commits.every(commit => commit.authorization?.startsWith('Payment '))).toBe(true);
+        // Commits carry cumulative vouchers signed by the session key.
+        expect(gateway.commits.map(commit => commit.voucherCumulative)).toEqual(['10', '25']);
+        expect(gateway.commits.every(commit => commit.voucherSigner === sessions[0]!.authorizedSigner)).toBe(true);
         expect(events.map(event => event.type)).toEqual([
             'challenge',
             'open',
@@ -185,7 +247,7 @@ describe('SessionUsageMeter', () => {
             fetch: gateway.fetch,
             liveCommitIntervalMs: 100,
             onEvent: event => events.push(event),
-            opener: createEphemeralSessionOpener({ mode: 'pull' }),
+            opener: makeSessionOpener(),
         });
         const meter = createSessionUsageMeter<number>({
             client,
@@ -223,7 +285,7 @@ describe('SessionUsageMeter', () => {
         const gateway = createSessionGatewayMock();
         const client = createSessionFetch({
             fetch: gateway.fetch,
-            opener: createEphemeralSessionOpener({ mode: 'pull' }),
+            opener: makeSessionOpener(),
         });
         const meter = createSessionUsageMeter<number>({
             client,
@@ -247,7 +309,7 @@ describe('SessionUsageMeter', () => {
         const gateway = createSessionGatewayMock();
         const client = createSessionFetch({
             fetch: gateway.fetch,
-            opener: createEphemeralSessionOpener({ mode: 'pull' }),
+            opener: makeSessionOpener(),
         });
         const meter = createSessionUsageMeter<number>({
             client,
@@ -265,7 +327,7 @@ describe('SessionUsageMeter', () => {
         const gateway = createSessionGatewayMock();
         const client = createSessionFetch({
             fetch: gateway.fetch,
-            opener: createEphemeralSessionOpener({ mode: 'pull' }),
+            opener: makeSessionOpener(),
         });
         const meter = createSessionUsageMeter<number>({
             client,
