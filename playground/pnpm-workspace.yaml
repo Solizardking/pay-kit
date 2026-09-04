@@ -5,5 +5,5 @@ allowBuilds:
   esbuild: true
 
 overrides:
-  '@x402/core': 'file:../typescript/.x402-vendor/x402-core-2.16.0.tgz'
-  '@x402/svm': 'file:../typescript/.x402-vendor/x402-svm-2.16.0-paykit.1.tgz'
+  '@x402/core': 'file:../typescript/.x402-vendor/x402-core-2.23.0.tgz'
+  '@x402/svm': 'file:../typescript/.x402-vendor/x402-svm-2.23.0.tgz'
